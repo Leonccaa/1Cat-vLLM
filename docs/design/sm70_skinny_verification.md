@@ -57,67 +57,65 @@ Host-side, on the dev box:
 Frozen model `QuantTrio/Qwen3.6-27B-AWQ` rev `9b507bdc`, 4096-token input /
 256 output, `max_num_seqs=3`, no MTP, `gpu_memory_utilization=0.87`,
 `max_model_len=8192`, CUDA graphs on. Prefill and decode separated by timing a
-`max_tokens=1` run against the full run; min of 3 reps per arm.
+`max_tokens=1` run against the full run.
 
-| arm | kernels | residency | decode tok/s | e2e tok/s | KV cache tokens |
+Run-to-run precision is about **0.15%**: three independent loads of the gated
+arm gave 65.79 / 65.87 / 65.84 tok/s, and prefill held 2340-2348 tok/s across
+every arm. Differences below ~0.3% are not meaningful; differences above ~1%
+are.
+
+| arm | kernels | residency | decode tok/s | KV tokens | overlay GiB/card |
 | --- | --- | --- | ---: | ---: | ---: |
-| off | new | none | 58.28 | 710.83 | 992,987 |
-| oldoff | base | none | 58.26 | 710.73 | 992,987 |
-| roi | new | MIN_ROI=1.0 | 66.56 | 780.47 | 947,346 |
-| full | new | all shapes | 67.84 | 790.45 | 853,138 |
-| oldfull | base | all shapes | 68.56 | 795.89 | 853,138 |
-| noldcs | new, no `__ldcs` | all shapes | 68.73 | 797.18 | 853,138 |
+| off | shipped | none | 58.28 | 992,987 | 0 |
+| oldoff | baseline | none | 58.26 | 992,987 | 0 |
+| gated | shipped | MIN_ROI=1.0 | 65.83 | 946,176 | 0.93 |
+| full | shipped | all shapes | **68.73** | 853,138 | 2.86 |
+| oldfull | baseline | all shapes | 68.56 | 853,138 | 2.86 |
+| full+ldcs | with `__ldcs` | all shapes | 67.84 | 853,138 | 2.86 |
 
-Prefill was 2342-2348 tok/s in every arm, confirming the overlay does not touch
-it and that run-to-run precision is about 0.2%. The two `off` arms agreeing to
-0.03% across separately built extensions is the control for cross-build
-comparability.
+What this establishes:
 
-What this says:
+- **The overlay is worth +17.9% decode** (58.28 -> 68.73) for 2.86 GiB/card.
+  That 2.86 GiB, derived from the KV-cache delta against the full arm's
+  reported 17.45 GiB / 853,138 tokens, matches the independent hand accounting
+  of 2.82 GiB to within 1.5%.
+- **The ROI gate returns 1.93 GiB/card** (2.86 -> 0.93) for 4.2% of decode
+  (68.73 -> 65.83). It keeps 72% of the overlay's benefit for 33% of its
+  memory.
+- **This branch's kernels are level with the baseline on this workload**:
+  68.73 vs 68.56, i.e. +0.25%, inside noise. That is the expected result and
+  not a disappointment: the workload is single-request with no MTP, so M is
+  always 1 and the split-K QPN path never executes. Its 1.9-2.5x applies to
+  MTP and multi-sequence decode, which this A/B does not exercise and which
+  remains unmeasured end to end.
+- **`__ldcs` was reverted.** It scored +6-21% in the standalone harness and
+  measured 1.3% *slower* here (67.84 vs 68.73). See that commit; the general
+  lesson is recorded in the harness README.
 
-- **The overlay is worth +17.9% decode** (58.28 -> 68.73 with the shipped
-  kernels), costing 2.86 GiB/card.
-- **`__ldcs` cost 1.3%** and was reverted; see that commit.
-- **Split-K contributed nothing here and was expected not to.** This workload
-  is single-request with no MTP, so M is always 1 and QPN never runs. Its
-  1.9-2.5x applies to MTP and multi-sequence decode, still unmeasured
-  end to end.
-- **The ROI gate returns 1.93 GiB/card for 1.9% of decode.** Dropping the two
-  low-ROI shapes (68% of the overlay bytes) keeps 86.6% of the decode gain.
+### Measured ROI table (L2-cold timing)
 
-Overlay memory, derived from the KV-cache deltas against the full arm's
-reported 17.45 GiB / 853,138 tokens:
+Per layer instance, per rank; this is what the loader logs. Numbers from the
+corrected gate - the earlier hot-loop timing understated the base backend's
+cost by up to 40% on the large shapes.
 
-| residency | overlay GiB/card | decode tok/s |
-| --- | ---: | ---: |
-| none | 0 | 58.28 |
-| MIN_ROI=1.0 | 0.93 | 66.56 |
-| all shapes | 2.86 | 67.84 |
+| shape | role | base us | skinny us | overlay MiB | ROI us/MiB | at 1.0 |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| N=5120 K=1536 | o_proj | 23.0 | 12.1 | 4.0 | 4.626 | keep |
+| N=5120 K=4352 | down | 44.2 | 23.7 | 11.3 | 2.268 | keep |
+| N=4096 K=5120 | linear-attn | 52.2 | 44.0 | 10.6 | 0.771 | drop |
+| N=8704 K=5120 | gate_up | 66.6 | 56.3 | 22.6 | 0.408 | drop |
 
-The 2.86 GiB matches the independent hand accounting of 2.82 GiB to within
-1.5%.
-
-### Measured ROI table
-
-Per layer instance, per rank. This is what the loader logs.
-
-| shape | role | base us | skinny us | saved us | overlay MiB | ROI us/MiB |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| N=5120 K=1536 | o_proj | 23.0 | 12.1 | 11.0 | 4.0 | 2.750 |
-| N=5120 K=4352 | down | 44.2 | 23.7 | 20.5 | 11.3 | 1.814 |
-| N=4096 K=5120 | linear-attn | 26.8 | 23.7 | 3.1 | 10.6 | 0.279 |
-| N=8704 K=5120 | gate_up | 39.7 | 35.9 | 3.8 | 22.6 | 0.170 |
-
-The bottom two shapes hold 68% of the overlay bytes and deliver 18% of the
-saving. `MIN_ROI=1.0` sits in the gap between the clusters.
+The bottom two shapes hold 68% of the overlay bytes. `MIN_ROI=1.0` sits in the
+gap between the two clusters; `0.5` would additionally keep the linear-attn
+projection at roughly 1.6 GiB/card if more decode is wanted.
 
 ### Not reproduced
 
 At `gpu_memory_utilization=0.90` with `max_model_len=131072`, both the full and
 the gated arm loaded and ran without OOM, so the prefill-workspace OOM recorded
 against the earlier overlay did not reproduce in this configuration (no MTP, no
-multimodal, `max_num_seqs=3`). The KV-cache gain at 0.90 was still real:
-1,302,288 tokens gated versus 1,178,881 full.
+multimodal, `max_num_seqs=3`). The KV gain at 0.90 was still real: 1,302,288
+tokens gated versus 1,178,881 full.
 
 ## Fixed along the way
 
