@@ -41,20 +41,23 @@ The two controls are deliberately orthogonal:
   the SM70 quantized base-backend selector;
 - `VLLM_SM70_SKINNY=auto|on|off` controls only the small-`M` overlay.
 
-Both default to `auto`. On exact SM70, `SKINNY=auto` enables only a validated
-Dense format/shape/operator route. `on` is a fail-closed test mode: correctness
-self-checks still run, but a failure aborts instead of silently falling back
-and the performance residency gate is bypassed. `off` is the one-variable
-rollback to the unmodified selected base. The historical
+Both default to `auto`. On exact SM70, `SKINNY=auto` enables only a validated,
+memory-accepted Dense format/shape/operator route. Dense AWQ currently meets
+that contract. Dense NVFP4 does not: a real Qwen3.6-27B TP4 run retained
+4.54 GiB/card even at `MIN_ROI=1`, so NVFP4 stays on the selected base in
+`auto` and requires explicit `on` for research. `on` is a fail-closed test
+mode: correctness self-checks still run, but a failure aborts instead of
+silently falling back and the performance residency gate is bypassed. `off`
+is the one-variable rollback to the unmodified selected base. The historical
 `VLLM_SM70_QUANT_BACKEND=skinny` spelling remains a compatibility alias for
 base `auto` plus `VLLM_SM70_SKINNY=on`, but new launch scripts should use the
 two controls above.
 
 | Format/path | Rows | Route |
 | --- | ---: | --- |
-| Dense NVFP4 | 1-3 | Skinny SIMT |
-| Dense NVFP4 | 4-16 | Skinny QPN |
-| Dense NVFP4 | 17+ | selected base backend |
+| Dense NVFP4, explicit `on` | 1-3 | Skinny SIMT |
+| Dense NVFP4, explicit `on` | 4-16 | Skinny QPN |
+| Dense NVFP4, `auto` or rows 17+ | any | selected base backend |
 | Dense AWQ, SIMT resident | 1-3 | Skinny SIMT |
 | Dense AWQ, QPN resident | 4-16 | Skinny QPN |
 | Dense AWQ | unsupported shape/rows | selected base backend |

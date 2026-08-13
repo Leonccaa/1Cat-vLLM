@@ -852,7 +852,11 @@ def init_nvfp4_linear_kernel() -> NvFp4LinearKernel:
         raise ValueError("VLLM_SM70_SKINNY=on requires exact CUDA capability 7.0.")
 
     def maybe_overlay(base_kernel: NvFp4LinearKernel) -> NvFp4LinearKernel:
-        if envs.VLLM_BATCH_INVARIANT or skinny_mode == "off" or not exact_sm70:
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            or not envs.use_sm70_skinny_nvfp4()
+            or not exact_sm70
+        ):
             return base_kernel
         supported, reason = SkinnyNvFp4LinearKernel.is_supported()
         if not supported:

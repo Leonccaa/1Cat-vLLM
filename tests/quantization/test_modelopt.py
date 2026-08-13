@@ -6,6 +6,7 @@ Run `pytest tests/quantization/test_modelopt.py`.
 """
 
 import os
+from types import SimpleNamespace
 from typing import Any, NoReturn
 from unittest.mock import MagicMock, Mock, patch
 
@@ -124,6 +125,102 @@ def test_modelopt_mixed_precision_quantizes_parallel_lm_head():
         method = config.get_quant_method(_mock_lm_head(), prefix="lm_head")
 
     assert isinstance(method, ModelOptNvFp4LinearMethod)
+
+
+def test_modelopt_mixed_precision_min_capability_follows_nvfp4_route(monkeypatch):
+    monkeypatch.delenv("VLLM_SM70_QUANT_BACKEND", raising=False)
+    monkeypatch.delenv("VLLM_SM70_SKINNY", raising=False)
+    monkeypatch.delenv("VLLM_SM70_NVFP4_TURBOMIND", raising=False)
+    assert ModelOptMixedPrecisionConfig.get_min_capability() == 70
+
+    monkeypatch.setenv("VLLM_SM70_SKINNY", "off")
+    monkeypatch.setenv("VLLM_SM70_NVFP4_TURBOMIND", "0")
+    assert ModelOptMixedPrecisionConfig.get_min_capability() == 75
+
+    monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "marlin")
+    assert ModelOptMixedPrecisionConfig.get_min_capability() == 70
+
+
+def test_modelopt_fp8_selects_existing_sm70_turbomind_path(monkeypatch):
+    from vllm.model_executor.layers.quantization import modelopt as modelopt_mod
+
+    monkeypatch.setattr(
+        modelopt_mod,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(dtype=torch.float16)),
+    )
+    monkeypatch.setattr(
+        modelopt_mod.sm70_tm, "is_exact_sm70_cuda_platform", lambda: True
+    )
+    monkeypatch.setattr(modelopt_mod.sm70_tm, "use_turbomind", lambda enabled: True)
+
+    config = ModelOptFp8Config(
+        quant_method="FP8",
+        is_checkpoint_fp8_serialized=True,
+        kv_cache_quant_method=None,
+        exclude_modules=[],
+    )
+    method = modelopt_mod.ModelOptFp8LinearMethod(config)
+
+    assert method.use_sm70_turbomind
+
+
+def test_modelopt_fp8_sm70_prepare_uses_standard_turbomind_state(monkeypatch):
+    from vllm.model_executor.layers.quantization import modelopt as modelopt_mod
+
+    monkeypatch.setattr(
+        modelopt_mod,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(dtype=torch.float16)),
+    )
+    monkeypatch.setattr(
+        modelopt_mod.sm70_tm, "is_exact_sm70_cuda_platform", lambda: True
+    )
+    monkeypatch.setattr(modelopt_mod.sm70_tm, "use_turbomind", lambda enabled: True)
+
+    prepared_weight = torch.zeros((128, 8), dtype=torch.uint8)
+    prepared_scales = torch.full((1, 1), 0.25, dtype=torch.float16)
+    prepared_meta = torch.tensor([128, 8], dtype=torch.int32)
+
+    def fake_prepare(weight, scales, group_size, gated_silu):
+        assert weight.shape == (8, 128)
+        torch.testing.assert_close(scales, torch.full((1, 1), 0.25))
+        assert group_size == 128
+        assert not gated_silu
+        return prepared_weight, prepared_scales, prepared_meta
+
+    monkeypatch.setattr(modelopt_mod.sm70_ops, "fp8_sm70_prepare", fake_prepare)
+
+    config = ModelOptFp8Config(
+        quant_method="FP8",
+        is_checkpoint_fp8_serialized=True,
+        kv_cache_quant_method=None,
+        exclude_modules=[],
+    )
+    method = modelopt_mod.ModelOptFp8LinearMethod(config)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.zeros((8, 128), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.tensor([0.25], dtype=torch.float32), requires_grad=False
+    )
+    layer.input_scale = torch.nn.Parameter(
+        torch.tensor([0.5], dtype=torch.float32), requires_grad=False
+    )
+    layer.logical_widths = [8]
+    layer.orig_dtype = torch.float16
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.sm70_fp8_turbomind
+    assert layer.sm70_fp8_k_ld == 128
+    assert layer.sm70_fp8_q_ld == 8
+    assert not hasattr(layer, "weight_scale")
+    assert not hasattr(layer, "input_scale")
+    assert layer.weight.data_ptr() == prepared_weight.data_ptr()
+    assert layer.weight_scale_inv.data_ptr() == prepared_scales.data_ptr()
+    assert layer.sm70_fp8_meta is prepared_meta
 
 
 def test_vocab_parallel_embedding_weight_loader_accepts_scalar_scale():
@@ -481,7 +578,13 @@ def test_modelopt_mixed_precision_dispatches_w4a16_layer(
     config = m.ModelOptMixedPrecisionConfig.from_config(hf_quant_config)
 
     fake_layer = MagicMock(spec=LinearBase)
-    method = config.get_quant_method(fake_layer, "model.layers.0.fake_proj")
+    # This is a dispatch-only test. Avoid requiring a platform NVFP4 kernel
+    # merely to instantiate the selected LinearMethod on a CPU test host.
+    with (
+        patch.object(m, "init_nvfp4_linear_kernel", return_value=MagicMock()),
+        patch.object(m, "MarlinNvFp4LinearKernel", return_value=MagicMock()),
+    ):
+        method = config.get_quant_method(fake_layer, "model.layers.0.fake_proj")
 
     expected_cls = getattr(m, expected_linear_cls_name)
     assert isinstance(method, expected_cls), (

@@ -39,9 +39,11 @@ def _cpu_vllm_config(linear_backend: str) -> VllmConfig:
 
 def test_sm70_quant_backend_auto_respects_route_default(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_QUANT_BACKEND", raising=False)
+    monkeypatch.delenv("VLLM_SM70_SKINNY", raising=False)
 
     assert envs.use_sm70_turbomind(True)
     assert not envs.use_sm70_turbomind(False)
+    assert not envs.use_sm70_skinny_nvfp4()
 
     monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "turbomind")
     assert envs.use_sm70_turbomind(False)
@@ -52,6 +54,10 @@ def test_sm70_quant_backend_auto_respects_route_default(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "skinny")
     assert not envs.use_sm70_turbomind(False)
     assert envs.get_sm70_quant_base_backend() == "auto"
+    assert envs.use_sm70_skinny_nvfp4()
+
+    monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "auto")
+    monkeypatch.setenv("VLLM_SM70_SKINNY", "on")
     assert envs.use_sm70_skinny_nvfp4()
 
 

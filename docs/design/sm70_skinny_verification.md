@@ -212,6 +212,56 @@ and integration gate, not a paired performance claim.
 Evidence:
 `/mnt/llm_hfs/skinny-closeout-20260813/logs/qwen35-122b-nvfp4-mtp3.log`.
 
+## Qwen3.6-27B native ModelOpt correction (2026-08-13)
+
+The NVIDIA checkpoint at revision `0893e160...` is mixed ModelOpt, not an
+all-NVFP4 artifact: its quantization map contains 208 FP8 and 193
+W4A16_NVFP4 projections. An earlier test re-quantized the FP8 projections to
+NVFP4 as a loader workaround. That artifact is excluded from acceptance: its
+fixed-token output mechanically repeated the input material, so its 94.44%
+MTP acceptance and all derived performance comparisons were quality-invalid.
+
+The corrected route loads the original checkpoint directly. The mixed-config
+SM89 gate was lowered to the capability of its concrete SM70 layer routes, and
+the ModelOpt FP8 adapter now reuses the existing TurboMind W8A16 kernel instead
+of selecting an N=4120-incompatible FP8 Marlin repack. Full VLM loading,
+TileLang 0.1.10 original prefill, compile/CUDA graph, encoder warmup, and the
+fixed text request passed. An explicit image request remains a separate gate.
+
+The paired contract below is TP4, FP16 activation, FP8 KV,
+`max_model_len=8192`, `max_num_seqs=1`, 4096 input tokens, 256 forced output
+tokens, one warmup, and three repeats. `auto` here records the pre-guard
+implementation with `VLLM_SM70_SKINNY_MIN_ROI=1`; it is retained as evidence
+of why NVFP4 was removed from default auto eligibility.
+
+| Profile | Prefill tok/s | Decode tok/s | Total tok/s | Model GiB/GPU | KV GiB/GPU | MTP acceptance |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| no MTP, Skinny off | 2333.65 | 53.70 | 669.16 | 5.33 | 20.89 | - |
+| no MTP, pre-guard auto ROI=1 | 2344.66 | 59.72 | 723.29 | 9.87 | 16.38 | - |
+| MTP4, Skinny off | 2258.66 | 67.39 | 777.49 | 5.89 | 20.32 | 36.67% |
+| MTP4, pre-guard auto ROI=1 | 2260.17 | 67.54 | 776.60 | 10.43 | 15.81 | 36.08% |
+
+Without MTP, the overlay gained 11.20% decode while adding 4.54 GiB/GPU of
+model residency (+85.18%) and removing 21.55% of KV-token capacity. With
+MTP4, it gained only 0.22% decode, lost 0.11% end-to-end throughput, and paid
+the same 4.54 GiB/GPU. ROI=1 dropped both `lm_head` layouts, but retained SIMT
+and QPN for both MLP shapes across all layers; a local ROI threshold therefore
+did not enforce an acceptable global memory budget.
+
+The direct-source output is a coherent answer rather than input echo. Three of
+the four direct profiles produced the same deterministic completion; the
+no-MTP base profile chose a different but coherent continuation. This is a
+functional smoke, not a full model-quality acceptance. Evidence is under
+`/mnt/llm_hfs/logs/sm70-nvfp4-27b-native-modelopt-roi-20260813/`.
+
+After adding the memory guard, a final real-model `SKINNY=auto` run retained no
+NVFP4 overlay: model residency returned to 5.33 GiB/GPU, available KV to
+20.89 GiB/GPU, and the warmup enumerated three FP8 plus three FP4 TurboMind
+base shapes. It measured 2338.93 prefill, 53.65 decode, and 669.08 total tok/s,
+within +0.23%, -0.10%, and -0.01% of the off baseline. Its fatal scan was
+empty. This is the accepted auto behavior until a bounded/one-copy overlay is
+implemented.
+
 ## Frozen release matrix (2026-08-13)
 
 The final closeout used one fixed serving contract on CT252: TP4, FP16 model

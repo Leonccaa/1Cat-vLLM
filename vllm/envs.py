@@ -843,10 +843,14 @@ def force_sm70_marlin() -> bool:
 def use_sm70_skinny_nvfp4() -> bool:
     """Use the skinny small-M overlay for SM70 NVFP4 dense layers.
 
-    ``auto`` is eligible because dense NVFP4 has completed its V100 gates.
-    Platform, format, shape, and operator checks remain at the call site.
+    NVFP4 currently retains both a SIMT-native and a QPN-prepacked copy in
+    addition to the selected base layout.  Real Qwen3.6-27B TP4 testing showed
+    that the per-shape ROI gate can still retain 4.54 GiB/card at ROI=1, so
+    ``auto`` must not opt into that residency contract.  Keep the route
+    available through explicit ``on`` (and the legacy ``backend=skinny``
+    alias) until the overlay has a bounded or one-copy memory policy.
     """
-    return get_sm70_skinny_mode() in ("auto", "on")
+    return get_sm70_skinny_mode() == "on"
 
 
 def use_sm70_skinny_awq() -> bool:

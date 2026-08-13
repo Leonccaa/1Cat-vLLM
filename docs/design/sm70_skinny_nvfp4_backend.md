@@ -7,7 +7,7 @@ SM70 GPUs. It is model-agnostic: selection depends on the quantization layout
 and GEMM shape, not on a Qwen model class. The wrapped base kernel remains
 responsible for larger batches and unsupported shapes.
 
-The preferred controls are:
+The safe production controls are:
 
 ```bash
 VLLM_SM70_QUANT_BACKEND=auto \
@@ -19,7 +19,9 @@ vllm serve ... --dtype half
 `marlin`; `VLLM_SM70_SKINNY` independently selects `auto`, `on`, or `off`.
 The old `VLLM_SM70_QUANT_BACKEND=skinny` value is accepted only as a
 compatibility alias for base `auto` plus overlay `on`. NVFP4 uses this runtime
-frontier:
+frontier only when the overlay is explicitly enabled. `auto` currently keeps
+NVFP4 on the selected base because the duplicate-layout residency is not
+bounded; this is a deliberate memory guard, not a kernel-availability failure.
 
 | Condition | Route |
 | --- | --- |
@@ -50,11 +52,11 @@ The backend consumes the standard native NVFP4 W4A16 representation:
 
 Both compressed-tensors and ModelOpt NVFP4 linear adapters can use the backend.
 W4A4 checkpoints use it as a weight-only W4A16 fallback on SM70; their
-activation scales are not consumed on Volta. A mixed ModelOpt checkpoint may
-still have a higher device-capability requirement because its non-NVFP4 layers
-need their own SM70 conversion or fallback. Converting such a checkpoint to an
-SM70-compatible compressed-tensors artifact remains a separate checkpoint-build
-step.
+activation scales are not consumed on Volta. Mixed ModelOpt FP8 +
+W4A16_NVFP4 checkpoints load directly on exact SM70: their FP8 projections use
+the existing TurboMind W8A16 path, while NVFP4 projections use the selected
+NVFP4 base. Re-quantizing the FP8 projections to NVFP4 is neither required nor
+accepted as part of runtime loading.
 
 ## Memory and fallback
 
@@ -65,9 +67,17 @@ For dense models the load-time representation contains:
 3. the selected base kernel's own prepared state.
 
 The overlay owns its copy because a base kernel may replace or repack the
-checkpoint tensors in place. This profile is appropriate for dense 27B-class
-models under tensor parallelism, but it must not be applied wholesale to a
-large MoE expert bank.
+checkpoint tensors in place. The original assumption that this profile was
+acceptable for a dense 27B model was disproved on Qwen3.6-27B TP4: the base
+used 5.33 GiB/card, while `auto + MIN_ROI=1` used 9.87 GiB/card. The gate
+dropped the 170.5 MiB-per-layout `lm_head`, but retained both layouts for every
+MLP layer, adding 4.54 GiB/card and reducing KV-token capacity by 21.55%.
+
+That is why NVFP4 `auto` now remains on the selected base. Re-enabling it by
+default requires either a one-copy kernel that consumes the base prepared
+layout, or an aggregate per-card byte budget plus workload-specific single
+layout selection. A per-shape microsecond-per-MiB threshold alone is not a
+memory bound.
 
 MoE is a separate selector. The experimental AWQ expert adapter uses one
 replacement-layout SIMT bank and remains default-off; it does not change this

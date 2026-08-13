@@ -8,6 +8,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
@@ -453,6 +454,10 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.out_dtype = torch.get_default_dtype()
         self.input_dtype = get_current_vllm_config().model_config.dtype
+        self.use_sm70_turbomind = (
+            sm70_tm.is_exact_sm70_cuda_platform()
+            and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+        )
 
     def create_weights(
         self,
@@ -470,6 +475,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
         weight_dtype = (
             torch.float8_e4m3fn
             if self.quant_config.is_checkpoint_fp8_serialized
@@ -502,6 +508,14 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             scale[:] = torch.finfo(torch.float32).min
             layer.register_parameter("input_scale", scale)
 
+        if self.use_sm70_turbomind:
+            if not hasattr(torch.ops._C, "fp8_sm70_prepare"):
+                raise RuntimeError(
+                    "ModelOpt FP8 on SM70 requires a build with the "
+                    "TurboMind FP8 extension."
+                )
+            return
+
         self.fp8_linear = init_fp8_linear_kernel(
             activation_quant_key=kFp8StaticTensorSym,
             weight_quant_key=kFp8StaticTensorSym,
@@ -518,6 +532,41 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             max_w_scale, weight = requantize_with_max_scale(
                 layer.weight, layer.weight_scale, layer.logical_widths
             )
+
+        if self.use_sm70_turbomind:
+            if layer.orig_dtype != torch.float16:
+                raise RuntimeError(
+                    "ModelOpt FP8 TurboMind on SM70 requires float16 model "
+                    f"weights, got {layer.orig_dtype}."
+                )
+            n, k = weight.shape
+            group_size = 128
+            block_scales = (
+                max_w_scale.to(torch.float32)
+                .expand(
+                    (n + group_size - 1) // group_size,
+                    (k + group_size - 1) // group_size,
+                )
+                .contiguous()
+            )
+            tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
+                weight.contiguous(), block_scales, group_size, False
+            )
+            layer.weight = Parameter(tm_weight, requires_grad=False)
+            del layer.weight_scale
+            layer.register_parameter(
+                "weight_scale_inv", Parameter(tm_scales, requires_grad=False)
+            )
+            del layer.input_scale
+            layer.sm70_fp8_turbomind = True
+            layer.register_buffer("sm70_fp8_meta", meta, persistent=False)
+            layer.sm70_fp8_k_ld = int(meta[0].item())
+            layer.sm70_fp8_q_ld = int(meta[1].item())
+            logger.info_once(
+                "ModelOpt FP8 uses the existing SM70 TurboMind W8A16 path."
+            )
+            return
+
         layer.weight = Parameter(weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
@@ -529,6 +578,27 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.use_sm70_turbomind:
+            original_dtype = x.dtype
+            x_2d = x.reshape(-1, x.shape[-1]).to(torch.float16)
+            out = torch.empty(
+                (x_2d.shape[0], layer.output_size_per_partition),
+                dtype=torch.float16,
+                device=x.device,
+            )
+            sm70_ops.fp8_gemm_sm70_out_meta(
+                out,
+                x_2d,
+                layer.weight,
+                layer.weight_scale_inv,
+                layer.sm70_fp8_meta,
+                False,
+            )
+            if bias is not None:
+                out.add_(bias.to(out.dtype))
+            return out.to(original_dtype).reshape(
+                *x.shape[:-1], layer.output_size_per_partition
+            )
         return self.fp8_linear.apply_weights(layer, x, bias)
 
 
@@ -2233,7 +2303,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 89
+        # A mixed ModelOpt checkpoint does not require native FP8 hardware
+        # when every FP8 projection can use an existing W8A16 fallback.
+        # Its minimum capability is therefore governed by the NVFP4 sibling:
+        # exact SM70 uses TurboMind for the validated FP8 route and has a
+        # TurboMind/Marlin NVFP4 base, while the regular fallback starts at
+        # SM75. Keeping this at 89 made
+        # otherwise supported FP8 + W4A16_NVFP4 checkpoints fail before
+        # per-layer kernel selection could run.
+        return max(70, ModelOptNvFp4Config.get_min_capability())
 
     @classmethod
     def override_quantization_method(

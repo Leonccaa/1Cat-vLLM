@@ -19,6 +19,19 @@ following `quantization.quant_algo` values:
 - `NVFP4`: ModelOpt NVFP4 checkpoints (use `quantization="modelopt_fp4"`).
 - `MXFP8`: ModelOpt MXFP8 checkpoints (use `quantization="modelopt_mxfp8"`).
 
+### Mixed ModelOpt checkpoints on SM70
+
+Exact-SM70 builds with the 1Cat TurboMind extension can load mixed ModelOpt
+checkpoints containing per-tensor `FP8` and `W4A16_NVFP4` projections without
+rewriting the checkpoint. FP8 projections run as weight-only W8A16 through the
+SM70 TurboMind path; W4A16_NVFP4 projections retain their native E2M1/FP8-scale
+representation and use the selected SM70 NVFP4 base backend.
+
+This route requires FP16 model activations. It intentionally ignores the
+checkpoint's static activation scale because Volta has no native FP8 tensor
+core path. `VLLM_SM70_SKINNY=auto` does not add the duplicate NVFP4 Skinny
+layouts; use explicit `on` only for memory-measured kernel research.
+
 ## Quantizing HuggingFace Models with PTQ
 
 You can quantize HuggingFace models using the example scripts provided in the Model Optimizer repository. The primary script for LLM PTQ is typically found within the `examples/llm_ptq` directory.
