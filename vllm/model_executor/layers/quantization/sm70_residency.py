@@ -11,7 +11,7 @@ keep/drop decision loop.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, MutableMapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -20,7 +20,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-ResidencyKey = tuple[int, int, str]
+ResidencyKey = tuple[str, int, int, str]
 ApplyFn = Callable[[], torch.Tensor]
 
 
@@ -180,7 +180,7 @@ def apply_route_policy(
         return retained
 
     for route in routes:
-        key = (output_size, input_size, route)
+        key = (format_name, output_size, input_size, route)
         decision = decisions.get(key)
 
         # A mixed cache hit/miss would otherwise send only some ranks into the
@@ -251,3 +251,37 @@ def apply_route_policy(
         retained.remove(route)
 
     return retained
+
+
+def log_residency_summary(
+    *,
+    decisions: Mapping[ResidencyKey, ResidencyDecision],
+    format_name: str,
+    min_roi: float,
+) -> None:
+    """Log one ranked residency table for the requested quantization format."""
+    format_decisions = [
+        (key, decision) for key, decision in decisions.items() if key[0] == format_name
+    ]
+    if not format_decisions:
+        return
+
+    kept = sum(decision.mib for _, decision in format_decisions if decision.keep)
+    dropped = sum(decision.mib for _, decision in format_decisions if not decision.keep)
+    lines = [
+        f"  {key[3]:<4} N={key[1]:>6} K={key[2]:>6}  "
+        f"roi={decision.roi:8.3f}us/MiB  "
+        f"saved={decision.saved_us:7.1f}us  overlay={decision.mib:8.1f}MiB  "
+        f"{'keep' if decision.keep else 'drop'}"
+        for key, decision in sorted(format_decisions, key=lambda item: -item[1].roi)
+    ]
+    logger.info_once(
+        "SM70 Skinny %s residency summary (per distinct shape, per layer "
+        "instance; threshold VLLM_SM70_SKINNY_MIN_ROI=%.3f):\n%s\n"
+        "  kept %.1f MiB/layer-set, dropped %.1f MiB/layer-set",
+        format_name,
+        min_roi,
+        "\n".join(lines),
+        kept,
+        dropped,
+    )

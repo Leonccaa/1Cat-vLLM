@@ -945,9 +945,9 @@ def apply_residency_policy(
     independent residency decisions: a shape can be worth keeping for decode
     and not worth keeping for MTP verification, or the reverse.
 
-    Decisions are cached per (N, K, route), so the cost is a few timed GEMMs
-    per distinct shape rather than per layer, and each measurement is reduced
-    across the TP group so every rank reaches the same verdict.
+    Decisions are cached per (format, N, K, route), so the cost is a few timed
+    GEMMs per distinct shape rather than per layer, and each measurement is
+    reduced across the TP group so every rank reaches the same verdict.
 
     Returns True while any Skinny route is still resident.
     """
@@ -1022,24 +1022,10 @@ def apply_residency_policy(
 
 def log_residency_summary() -> None:
     """One ranked table so a real threshold can be chosen from real numbers."""
-    if not _residency_decisions:
-        return
-    kept = sum(d.mib for d in _residency_decisions.values() if d.keep)
-    dropped = sum(d.mib for d in _residency_decisions.values() if not d.keep)
-    lines = [
-        f"  {key[2]:<4} N={key[0]:>6} K={key[1]:>6}  roi={d.roi:8.3f}us/MiB  "
-        f"saved={d.saved_us:7.1f}us  overlay={d.mib:8.1f}MiB  "
-        f"{'keep' if d.keep else 'drop'}"
-        for key, d in sorted(_residency_decisions.items(), key=lambda kv: -kv[1].roi)
-    ]
-    logger.info_once(
-        "SM70 Skinny AWQ residency summary (per distinct shape, per layer "
-        "instance; threshold VLLM_SM70_SKINNY_MIN_ROI=%.3f):\n%s\n"
-        "  kept %.1f MiB/layer-set, dropped %.1f MiB/layer-set",
-        envs.get_sm70_skinny_min_roi(),
-        "\n".join(lines),
-        kept,
-        dropped,
+    sm70_residency.log_residency_summary(
+        decisions=_residency_decisions,
+        format_name="AWQ",
+        min_roi=envs.get_sm70_skinny_min_roi(),
     )
 
 

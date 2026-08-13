@@ -449,6 +449,15 @@ _residency_decisions: dict[
 ] = {}
 
 
+def log_residency_summary() -> None:
+    """Log the ranked NVFP4 keep/drop table shared with the AWQ policy."""
+    sm70_residency.log_residency_summary(
+        decisions=_residency_decisions,
+        format_name="NVFP4",
+        min_roi=envs.get_sm70_skinny_min_roi(),
+    )
+
+
 def _release_route(layer: torch.nn.Module, route: str) -> None:
     """Release a disabled NVFP4 layout immediately."""
     empty = layer.skinny_codes.data.new_empty(0)
@@ -681,7 +690,9 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
         self.base_kernel.process_weights_after_loading(layer)
 
         self._validate_shape(layer)
-        if not self._apply_residency_policy(layer):
+        retained = self._apply_residency_policy(layer)
+        log_residency_summary()
+        if not retained:
             return
         logger.info_once(
             "SM70 Skinny NVFP4 dense overlay enabled: SIMT M<=3, QPN M=4..16, base=%s.",

@@ -565,6 +565,91 @@ def test_residency_decision_is_cached_per_shape(monkeypatch):
     assert len(calls) == 2
 
 
+def test_residency_cache_key_includes_format(monkeypatch):
+    """The same shape and route in AWQ and NVFP4 must be measured separately."""
+    decisions: dict[sm70_residency.ResidencyKey, sm70_residency.ResidencyDecision] = {}
+    calls = []
+    timings = iter([500.0, 10.0, 10.0, 10.0])
+
+    def timer(fn, iterations=12, device=None):
+        del fn, iterations, device
+        calls.append(1)
+        return next(timings)
+
+    monkeypatch.setattr(sm70_residency, "time_apply", timer)
+
+    def benchmark(route: str) -> sm70_residency.RouteBenchmark:
+        del route
+        return sm70_residency.RouteBenchmark(
+            lambda: torch.empty(0), lambda: torch.empty(0)
+        )
+
+    awq_released = []
+    nvfp4_released = []
+    common = dict(
+        output_size=32,
+        input_size=128,
+        routes=["simt"],
+        device=torch.device("cpu"),
+        overlay_mib=1.0,
+        min_roi=1.0,
+        force_on=False,
+        decisions=decisions,
+        make_benchmark=benchmark,
+    )
+    sm70_residency.apply_route_policy(
+        format_name="AWQ",
+        release_route=awq_released.append,
+        **common,
+    )
+    sm70_residency.apply_route_policy(
+        format_name="NVFP4",
+        release_route=nvfp4_released.append,
+        **common,
+    )
+
+    assert len(calls) == 4
+    assert set(decisions) == {
+        ("AWQ", 32, 128, "simt"),
+        ("NVFP4", 32, 128, "simt"),
+    }
+    assert awq_released == []
+    assert nvfp4_released == ["simt"]
+
+
+def test_residency_summary_is_ranked_and_format_scoped(monkeypatch):
+    decisions = {
+        ("AWQ", 999, 128, "simt"): sm70_residency.ResidencyDecision(
+            roi=9.0, mib=1.0, saved_us=9.0, keep=True
+        ),
+        ("NVFP4", 64, 256, "simt"): sm70_residency.ResidencyDecision(
+            roi=1.0, mib=2.0, saved_us=2.0, keep=True
+        ),
+        ("NVFP4", 32, 128, "qpn"): sm70_residency.ResidencyDecision(
+            roi=2.0, mib=3.0, saved_us=6.0, keep=False
+        ),
+    }
+    messages = []
+    monkeypatch.setattr(
+        sm70_residency.logger,
+        "info_once",
+        lambda message, *args: messages.append(message % args),
+    )
+
+    sm70_residency.log_residency_summary(
+        decisions=decisions,
+        format_name="NVFP4",
+        min_roi=1.5,
+    )
+
+    assert len(messages) == 1
+    summary = messages[0]
+    assert "SM70 Skinny NVFP4 residency summary" in summary
+    assert "N=   999" not in summary
+    assert summary.index("qpn") < summary.index("simt")
+    assert "kept 2.0 MiB/layer-set, dropped 3.0 MiB/layer-set" in summary
+
+
 def test_residency_scores_simt_and_qpn_independently(monkeypatch):
     """SIMT and QPN serve different M and must be kept or dropped separately.
 
