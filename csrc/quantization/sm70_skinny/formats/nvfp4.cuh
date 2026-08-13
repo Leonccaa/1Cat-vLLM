@@ -87,13 +87,11 @@ struct Nvfp4SimtPolicy {
     const uint8_t* scale_row =
         params.scales +
         static_cast<size_t>(output_col) * (params.input_size / kSegmentK);
-    // See AwqG128SimtPolicy::load_segment for why codes stream with __ldcs
-    // while metadata takes the normal read-only path.
-    segment.codes =
-        __ldcs(reinterpret_cast<const uint2*>(code_row + absolute_k / 2));
-    segment.scale =
-        __hmul2(fp8e4m3_to_half2(__ldg(scale_row + absolute_k / kSegmentK)),
-                state.global_scale);
+    // Plain loads: see AwqG128SimtPolicy::load_segment for the end-to-end
+    // measurement that rejected __ldcs here.
+    segment.codes = *reinterpret_cast<const uint2*>(code_row + absolute_k / 2);
+    segment.scale = __hmul2(fp8e4m3_to_half2(scale_row[absolute_k / kSegmentK]),
+                            state.global_scale);
   }
 
   SM70_SKINNY_INLINE static void decode_word(const Segment& segment, int word,

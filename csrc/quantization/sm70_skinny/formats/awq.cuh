@@ -109,15 +109,16 @@ struct AwqG128SimtPolicy {
     const int group = absolute_k / kGroupSize;
     const size_t metadata_index =
         static_cast<size_t>(output_col) * group_count + group;
-    // Codes are pure streaming: every byte is consumed once and never
-    // revisited, so evict-first keeps the ~MB-scale weight stream from flushing
-    // L2, which the activation and metadata do rely on. Metadata is a 32-lane
-    // broadcast of four consecutive halves, so it wants the normal read-only
-    // path instead.
-    segment.codes =
-        __ldcs(reinterpret_cast<const uint2*>(code_row + absolute_k / 2));
-    segment.scale = __half2half2(__ldg(params.scales + metadata_index));
-    segment.bias = __half2half2(__ldg(params.biases + metadata_index));
+    // Deliberately plain loads. Marking the weight stream __ldcs (evict-first)
+    // looked like a 6-21% win in the standalone harness, but cost 1.3% of
+    // end-to-end decode on Qwen3.6-27B AWQ TP4 (68.73 -> 67.84 tok/s, same
+    // build otherwise). The harness rotates weight buffers past L2 and still
+    // failed to predict this: in the real model these GEMMs interleave with
+    // attention and norms, so the cache state they see is nothing like a
+    // back-to-back GEMM loop. Do not reintroduce without an end-to-end A/B.
+    segment.codes = *reinterpret_cast<const uint2*>(code_row + absolute_k / 2);
+    segment.scale = __half2half2(params.scales[metadata_index]);
+    segment.bias = __half2half2(params.biases[metadata_index]);
   }
 
   SM70_SKINNY_INLINE static void decode_word(const Segment& segment, int word,
