@@ -109,6 +109,71 @@ The bottom two shapes hold 68% of the overlay bytes. `MIN_ROI=1.0` sits in the
 gap between the two clusters; `0.5` would additionally keep the linear-attn
 projection at roughly 1.6 GiB/card if more decode is wanted.
 
+### QPN at M=8 (batched decode)
+
+The single-request A/B never leaves M=1, so it cannot see QPN at all. Driving
+8 concurrent sequences (1024 in / 128 out, `max_num_seqs=8`, prefix caching
+off, `layout=both`) puts the decode batch at M=7..8, which routes to QPN.
+
+Batched decode is far noisier than single-request - about 5% run to run against
+0.15% for M=1 - so this is three interleaved repeats per arm:
+
+| arm | decode tok/s (3 reps) | mean |
+| --- | --- | ---: |
+| overlay off | 158.27 / 165.75 / 161.71 | 161.91 |
+| QPN resident | 149.56 / 142.18 / 140.86 | 144.20 |
+
+**QPN costs 10.9% of batched decode throughput.** The ranges do not overlap, so
+this survives the noise.
+
+That is the opposite of what the operator-level measurement says. The same
+L2-cold timing the residency gate uses reports QPN *beating* the TurboMind base
+at M=8 on these shapes:
+
+| shape | base us | QPN us | speedup |
+| --- | ---: | ---: | ---: |
+| N=5120 K=1536 | 42.0 | 30.7 | 1.37x |
+| N=4096 K=5120 | 55.3 | 50.2 | 1.10x |
+
+So an isolated-kernel win of 1.1-1.4x turns into a 10.9% end-to-end loss. This
+is the second time in this branch that a kernel-level measurement pointed the
+wrong way (the first was `__ldcs`), and it is the more important instance,
+because **the ROI gate is built on exactly this kind of isolated measurement**.
+The gate scores QPN at roi 2.827 and 0.482 us/MiB and would happily keep it.
+
+Consequences:
+
+- `VLLM_SM70_SKINNY_AWQ_LAYOUT` stays `simt` by default. QPN residency must
+  remain an explicit opt-in and must not be enabled on the strength of the ROI
+  table alone.
+- The ROI gate is trustworthy for *which SIMT shapes to keep* - that is a
+  comparison between two ways of running the same M=1 call, and the full-model
+  A/B confirms the SIMT overlay is worth +17.9%. It is not trustworthy as
+  evidence for turning a whole route on.
+
+### Why split-K did not help here
+
+Split-K fixes a launch-geometry problem that this checkpoint does not have.
+`qpn_choose_k_splits` targets ~2 blocks/SM on 80 SMs, and the grid is N/32
+blocks, so a shape only splits when N < 5120:
+
+| shape | tiles = N/32 | splits chosen |
+| --- | ---: | ---: |
+| N=5120 K=1536 | 160 | 1 |
+| N=5120 K=4352 | 160 | 1 |
+| N=8704 K=5120 | 272 | 1 |
+| N=4096 K=5120 | 128 | 2 |
+
+Three of the four AWQ shapes already fill the GPU. Measured end to end at M=8,
+new kernels 147.34 tok/s versus base kernels 147.76 - no difference, as the
+table predicts.
+
+The harness shape that showed 1.91-2.48x was qkv at N=1792, and this checkpoint
+excludes `self_attn.q_proj/k_proj/v_proj` from quantization entirely, so that
+shape does not exist here. Split-K remains correct for deployments whose AWQ
+set does contain small-N projections - higher TP degree, or a checkpoint that
+quantizes qkv - but it buys nothing on this model.
+
 ### Not reproduced
 
 At `gpu_memory_utilization=0.90` with `max_model_len=131072`, both the full and
