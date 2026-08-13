@@ -1,7 +1,7 @@
-# SM70 Skinny: what is verified, and what still needs a V100 build
+# SM70 Skinny: verification status
 
-Companion to `sm70_skinny_execution_layer.md`. Records the state of the
-optimization/robustness pass so the remaining gates are explicit rather than
+Companion to `sm70_skinny_execution_layer.md`. Records what has been measured on real
+V100 hardware and what has not, so the remaining gates are explicit rather than
 assumed.
 
 ## Verified
