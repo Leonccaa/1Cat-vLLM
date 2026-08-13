@@ -596,25 +596,37 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
                 except Exception as exc:
                     local_ok = False
                     local_error = exc
-                    logger.exception(
-                        "SM70 Skinny NVFP4 %s local self-check failed for "
-                        "N=%d K=%d against base=%s.",
-                        route,
-                        n,
-                        k,
-                        type(self.base_kernel).__name__,
-                    )
+                    if envs.get_sm70_skinny_mode() == "on":
+                        logger.exception(
+                            "SM70 Skinny NVFP4 %s local self-check failed for "
+                            "N=%d K=%d against base=%s.",
+                            route,
+                            n,
+                            k,
+                            type(self.base_kernel).__name__,
+                        )
+                    else:
+                        logger.warning_once(
+                            "SM70 Skinny NVFP4 %s self-check rejected "
+                            "N=%d K=%d against base=%s; auto mode falls back "
+                            "for every layer with this route and shape.",
+                            route,
+                            n,
+                            k,
+                            type(self.base_kernel).__name__,
+                        )
 
             if not _all_ranks_succeeded(local_ok):
                 _release_route(layer, route)
                 if local_error is None:
-                    logger.error(
+                    message = (
                         "SM70 Skinny NVFP4 %s self-check failed on another TP "
-                        "rank for N=%d K=%d; disabling it on every rank.",
-                        route,
-                        n,
-                        k,
+                        "rank for N=%d K=%d; disabling it on every rank."
                     )
+                    if envs.get_sm70_skinny_mode() == "on":
+                        logger.error(message, route, n, k)
+                    else:
+                        logger.warning(message, route, n, k)
                 if envs.get_sm70_skinny_mode() == "on":
                     raise RuntimeError(
                         "VLLM_SM70_SKINNY=on requires the NVFP4 "

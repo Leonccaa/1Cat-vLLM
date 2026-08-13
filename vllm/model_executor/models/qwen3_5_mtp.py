@@ -446,6 +446,17 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
 
     @staticmethod
     def _mtp_quant_disabled_in_hf_config(*hf_configs: object) -> bool:
+        def excludes_mtp(module: object) -> bool:
+            pattern = str(module).strip().lower()
+            return (
+                pattern == "mtp"
+                or pattern.startswith("mtp.")
+                or pattern.startswith("mtp*")
+                or ".mtp." in pattern
+                or ".mtp*" in pattern
+                or pattern.endswith(".mtp")
+            )
+
         for cfg in hf_configs:
             if cfg is None:
                 continue
@@ -453,18 +464,17 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
             if quant_cfg is None:
                 continue
 
-            modules_to_not_convert = None
             if isinstance(quant_cfg, dict):
                 modules_to_not_convert = quant_cfg.get("modules_to_not_convert")
+                ignore = quant_cfg.get("ignore")
             else:
                 modules_to_not_convert = getattr(
                     quant_cfg, "modules_to_not_convert", None
                 )
+                ignore = getattr(quant_cfg, "ignore", None)
 
-            if modules_to_not_convert and any(
-                str(module) in ("mtp", "model.mtp")
-                for module in modules_to_not_convert
-            ):
+            excluded_modules = list(modules_to_not_convert or ()) + list(ignore or ())
+            if any(excludes_mtp(module) for module in excluded_modules):
                 return True
 
         return False
@@ -501,7 +511,7 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
             mtp_vllm_config.quant_config = None
             logger.info(
                 "Qwen3_5MTP: disabling quantization for MTP branch based on "
-                "config.quantization_config.modules_to_not_convert."
+                "the checkpoint quantization exclusion list."
             )
 
         super().__init__()

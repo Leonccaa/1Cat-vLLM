@@ -114,3 +114,37 @@ def test_qwen3_5_mtp_lm_head_receives_quant_config():
         MockLMHead.assert_called_once()
         call_kwargs = MockLMHead.call_args.kwargs
         assert call_kwargs["quant_config"] is mock_quant_config
+
+
+def test_qwen3_5_mtp_quant_disabled_by_compressed_tensors_ignore():
+    from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
+
+    hf_config = Mock()
+    hf_config.quantization_config = {
+        "quant_method": "compressed-tensors",
+        "ignore": ["mtp*", "mtp.layers.0*"],
+    }
+
+    assert Qwen3_5MTP._mtp_quant_disabled_in_hf_config(hf_config)
+
+
+def test_qwen3_5_mtp_quant_disabled_by_qualified_ignore():
+    from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
+
+    hf_config = Mock()
+    hf_config.quantization_config = {
+        "ignore": ["model.language_model.mtp.layers.0*"],
+    }
+
+    assert Qwen3_5MTP._mtp_quant_disabled_in_hf_config(hf_config)
+
+
+def test_qwen3_5_mtp_quant_not_disabled_by_unrelated_ignore():
+    from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MTP
+
+    hf_config = Mock()
+    hf_config.quantization_config = {
+        "ignore": ["model.visual*", "model.language_model.lm_head"],
+    }
+
+    assert not Qwen3_5MTP._mtp_quant_disabled_in_hf_config(hf_config)
