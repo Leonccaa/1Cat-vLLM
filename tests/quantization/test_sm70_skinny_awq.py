@@ -7,7 +7,14 @@ import pytest
 import torch
 
 from vllm import _sm70_ops, envs
-from vllm.model_executor.layers.quantization import sm70_residency, sm70_skinny
+from vllm.model_executor.layers.quantization import (
+    awq as awq_module,
+)
+from vllm.model_executor.layers.quantization import (
+    awq_triton,
+    sm70_residency,
+    sm70_skinny,
+)
 
 
 def _pack_awq_rows(logical: torch.Tensor) -> torch.Tensor:
@@ -51,6 +58,44 @@ def _native_awq(n: int, k: int, device: torch.device | None = None):
 def _unpack_code(codes: torch.Tensor, row: int, column: int) -> int:
     packed = int(codes[row, column // 2])
     return (packed >> (4 * (column & 1))) & 0xF
+
+
+@pytest.mark.parametrize("m", [1, 300])
+def test_sm70_classic_awq_fallback_uses_triton_dequant(monkeypatch, m):
+    n, k = 32, 128
+    qweight, scales, qzeros = _native_awq(n, k)
+    layer = SimpleNamespace(qweight=qweight, scales=scales, qzeros=qzeros)
+    method = awq_module.AWQLinearMethod(awq_module.AWQConfig(4, 128, True))
+    x = torch.arange(m * k, dtype=torch.float16).view(m, k) / 1024
+    dequantized = torch.arange(k * n, dtype=torch.float16).view(k, n) / 2048
+
+    monkeypatch.setattr(awq_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        awq_module.current_platform, "has_device_capability", lambda capability: False
+    )
+    monkeypatch.setattr(
+        awq_triton,
+        "awq_dequantize_triton",
+        lambda *args, **kwargs: dequantized,
+    )
+    monkeypatch.setattr(
+        awq_module.ops,
+        "awq_gemm",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("classic AWQ GEMM must not run on SM70")
+        ),
+    )
+    monkeypatch.setattr(
+        awq_module.ops,
+        "awq_dequantize",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("classic AWQ dequant must not run on SM70")
+        ),
+    )
+
+    actual = method.apply(layer, x)
+
+    torch.testing.assert_close(actual, x @ dequantized)
 
 
 def test_unpack_awq_dense_restores_logical_values_and_bias():

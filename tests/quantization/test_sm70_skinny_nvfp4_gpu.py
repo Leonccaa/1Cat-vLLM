@@ -10,8 +10,12 @@ from vllm.model_executor.kernels.linear.nvfp4 import (
     SkinnyNvFp4LinearKernel,
     TurboMindNvFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.nvfp4 import skinny as nvfp4_skinny
 from vllm.model_executor.kernels.linear.nvfp4.marlin import (
     MarlinNvFp4LinearKernel,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+    compressed_tensors_w4a16_nvfp4 as ct_w4a16,
 )
 
 
@@ -187,3 +191,48 @@ def test_sm70_skinny_adapter_decorates_real_marlin_base(monkeypatch):
             assert route_calls["simt"] == before["simt"]
         else:
             assert route_calls == before
+
+
+@pytest.mark.skipif(not _is_exact_sm70(), reason="requires an exact SM70 GPU")
+@torch.inference_mode()
+def test_ct_native_block_scale_loading_matches_fp32_reference(monkeypatch):
+    """Exercise the Medium/TC compressed-tensors contract through a real kernel."""
+    monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "turbomind")
+    monkeypatch.setenv("VLLM_SM70_SKINNY", "off")
+    torch.manual_seed(20260813)
+    device = torch.device("cuda:0")
+    n, k = 512, 512
+    layer = torch.nn.Module()
+    layer.logical_widths = [n]
+    layer.input_size_per_partition = k
+    layer.output_size_per_partition = n
+    layer.weight_packed = torch.nn.Parameter(
+        torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=device),
+        requires_grad=False,
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        (
+            torch.randint(2, 9, (n, k // 16), dtype=torch.float32, device=device)
+            * 0.015625
+        ).to(torch.float8_e4m3fn),
+        requires_grad=False,
+    )
+    layer.weight_global_scale = torch.nn.Parameter(
+        torch.tensor([6048.0], dtype=torch.float32, device=device),
+        requires_grad=False,
+    )
+    raw_codes = layer.weight_packed.detach().clone()
+    raw_scales = layer.weight_scale.detach().clone()
+    x = (torch.randn(3, k, device=device) * 0.1).half()
+
+    scheme = ct_w4a16.CompressedTensorsW4A16Fp4()
+    scheme.process_weights_after_loading(layer)
+    actual = scheme.apply_weights(layer, x)
+    reference = nvfp4_skinny.nvfp4_fp32_reference(raw_codes, raw_scales, 1.0, x)
+
+    rms_error = (actual.float() - reference.float()).square().mean().sqrt()
+    rms_reference = reference.float().square().mean().sqrt().clamp(min=1e-6)
+    assert layer._sm70_nvfp4_scale_convention == "native-block"
+    assert float(layer.weight_global_scale) == 1.0
+    assert torch.isfinite(actual).all()
+    assert float(rms_error / rms_reference) < 3e-2

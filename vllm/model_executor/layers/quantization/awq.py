@@ -571,6 +571,21 @@ class AWQLinearMethod(LinearMethodBase):
                     .transpose(1, 2)
                     .reshape(reshaped_x.shape[0], out_shape[-1])
                 )
+        elif current_platform.is_cuda() and not current_platform.has_device_capability(
+            75
+        ):
+            # The classic AWQ CUDA kernels are not valid on Volta. The small-M
+            # GEMM compiles an empty pre-SM75 body in release builds, while the
+            # legacy dequant path can produce NaNs. This branch is reachable
+            # when a forced Marlin configuration encounters an ineligible
+            # layer and deliberately falls back to AWQLinearMethod.
+            from vllm.model_executor.layers.quantization.awq_triton import (
+                awq_dequantize_triton,
+            )
+
+            out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
+            dequantized = awq_dequantize_triton(qweight, scales, qzeros)
+            out = torch.matmul(reshaped_x, dequantized)
         elif FP16_MATMUL_HEURISTIC_CONDITION or envs.VLLM_BATCH_INVARIANT:
             # Batch invariant mode requires torch.matmul path for Triton override.
             out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)

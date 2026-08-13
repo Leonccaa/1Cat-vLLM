@@ -85,10 +85,16 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
         # Rename weight_packed to weight that marlin expects
         layer.weight = Parameter(layer.weight_packed.data, requires_grad=False)
         del layer.weight_packed
-        # ct stores the inverse of what is expected by the marlin kernel
-        layer.weight_global_scale = Parameter(
-            1.0 / layer.weight_global_scale.max().to(torch.float32), requires_grad=False
-        )
+        # CT has two scale conventions under the same schema. Exact SM70
+        # classifies them at the format boundary and fails closed on invalid or
+        # mixed metadata; other platforms retain the existing reciprocal path.
+        if sm70_tm.is_exact_sm70_cuda_platform():
+            sm70_tm.normalize_nvfp4_ct_global_scale_for_sm70(layer)
+        else:
+            layer.weight_global_scale = Parameter(
+                1.0 / layer.weight_global_scale.max().to(torch.float32),
+                requires_grad=False,
+            )
 
         # This on-disk scheme is weight-only W4A16. Preserve its existing
         # Marlin behavior away from V100: the generic NVFP4 registry also

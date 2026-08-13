@@ -7,6 +7,7 @@ from typing import Literal
 import torch
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 U4_GROUP_SIZES = (32, 64, 128)
@@ -16,6 +17,14 @@ MXFP4_GROUP_SIZE = 32
 NVFP4_GROUP_SIZE = 16
 STATE_ATTR = "_sm70_turbomind_linear"
 SM70QuantBackend = Literal["auto", "marlin", "turbomind", "skinny"]
+
+logger = init_logger(__name__)
+
+# Compressed-tensors NVFP4 checkpoints use two scale contracts under the same
+# W4A16/W4A4 schema. Folded-block exports keep O(1) or larger FP8 block scales
+# and store a divisor as the global value. Native-block exports keep the full
+# sub-unit scale in each block, so applying the disk global again corrupts it.
+_NVFP4_CT_NATIVE_BLOCK_SCALE_MAX = 1.0
 
 
 @dataclass
@@ -80,6 +89,76 @@ def should_prepare_turbomind_or_marlin(
     default_enabled: bool,
 ) -> bool:
     return is_exact_sm70_cuda(tensor, use_turbomind(default_enabled) or forces_marlin())
+
+
+def normalize_nvfp4_ct_global_scale_for_sm70(layer: torch.nn.Module) -> str:
+    """Normalize the compressed-tensors NVFP4 weight-scale convention.
+
+    Invalid metadata and mixed conventions inside one fused layer fail model
+    loading instead of returning coherent-looking garbage. This helper is
+    intentionally CT-specific: ModelOpt ``weight_scale_2`` is already the
+    multiplicative global scale and must not pass through this conversion.
+    """
+    if not hasattr(layer, "weight_scale") or not hasattr(layer, "weight_global_scale"):
+        raise RuntimeError(
+            "SM70 NVFP4 compressed-tensors scale normalization requires "
+            "weight_scale and weight_global_scale."
+        )
+
+    block_scales = layer.weight_scale.detach().to(torch.float32)
+    disk_global = layer.weight_global_scale.detach().to(torch.float32).reshape(-1)
+    if block_scales.numel() == 0 or disk_global.numel() == 0:
+        raise RuntimeError("SM70 NVFP4 compressed-tensors scale metadata is empty.")
+    if not torch.isfinite(block_scales).all() or not torch.isfinite(disk_global).all():
+        raise RuntimeError(
+            "SM70 NVFP4 compressed-tensors scale metadata contains NaN or Inf."
+        )
+    if not torch.all(disk_global > 0):
+        raise RuntimeError(
+            "SM70 NVFP4 compressed-tensors global scale must be positive."
+        )
+
+    logical_widths = getattr(layer, "logical_widths", None)
+    if logical_widths is None:
+        partition_maxima = [float(block_scales.abs().max().item())]
+    else:
+        widths = [int(width) for width in logical_widths]
+        if any(width <= 0 for width in widths) or sum(widths) != block_scales.shape[0]:
+            raise RuntimeError(
+                "SM70 NVFP4 compressed-tensors fused scale metadata does not "
+                "match logical_widths."
+            )
+        partition_maxima = []
+        start = 0
+        for width in widths:
+            stop = start + width
+            partition_maxima.append(float(block_scales[start:stop].abs().max().item()))
+            start = stop
+
+    native_partitions = [
+        maximum < _NVFP4_CT_NATIVE_BLOCK_SCALE_MAX for maximum in partition_maxima
+    ]
+    if any(native_partitions) and not all(native_partitions):
+        raise RuntimeError(
+            "SM70 NVFP4 compressed-tensors fused layer mixes native-block and "
+            "folded-block scale conventions."
+        )
+
+    convention = "native-block" if all(native_partitions) else "folded-block"
+    device = layer.weight_global_scale.device
+    if convention == "native-block":
+        normalized = torch.ones((), dtype=torch.float32, device=device)
+    else:
+        normalized = 1.0 / disk_global.max().to(device=device)
+    layer.weight_global_scale = torch.nn.Parameter(normalized, requires_grad=False)
+    layer._sm70_nvfp4_scale_convention = convention
+    logger.info_once(
+        "SM70 NVFP4 compressed-tensors scale convention=%s; "
+        "partition max |weight_scale|=%s.",
+        convention,
+        tuple(round(value, 7) for value in partition_maxima),
+    )
+    return convention
 
 
 def _get_u4_slices(x: torch.Tensor, dtype: torch.dtype) -> list[torch.Tensor]:

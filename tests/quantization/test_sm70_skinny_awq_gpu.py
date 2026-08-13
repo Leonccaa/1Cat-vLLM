@@ -258,3 +258,44 @@ def test_sm70_skinny_awq_grouped_moe_matches_per_expert_turbomind():
     ).item()
     assert torch.isfinite(actual).all()
     assert relative_error < 3e-2
+
+
+@pytest.mark.skipif(not _is_exact_sm70(), reason="requires an exact SM70 GPU")
+@pytest.mark.parametrize("m", [1, 300])
+@torch.inference_mode()
+def test_sm70_awq_fallback_is_finite_and_matches_native_fp32(monkeypatch, m):
+    from vllm.model_executor.layers.quantization.awq import (
+        AWQConfig,
+        AWQLinearMethod,
+    )
+
+    torch.manual_seed(20260813 + m)
+    monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "marlin")
+    device = torch.device("cuda:0")
+    n, k, group_size = 512, 512, 128
+    qweight = torch.randint(0, 256, (k, n // 2), dtype=torch.uint8, device=device).view(
+        torch.int32
+    )
+    qzeros = torch.randint(
+        0, 256, (k // group_size, n // 2), dtype=torch.uint8, device=device
+    ).view(torch.int32)
+    scales = (
+        torch.rand((k // group_size, n), dtype=torch.float16, device=device) * 0.03
+        + 0.002
+    )
+    layer = torch.nn.Module()
+    layer.qweight = torch.nn.Parameter(qweight, requires_grad=False)
+    layer.qzeros = torch.nn.Parameter(qzeros, requires_grad=False)
+    layer.scales = torch.nn.Parameter(scales, requires_grad=False)
+    x = (torch.randn(m, k, device=device) * 0.02).half()
+
+    method = AWQLinearMethod(AWQConfig(4, group_size, True))
+    actual = method.apply(layer, x)
+    reference = sm70_skinny.awq_native_fp32_reference(
+        qweight, scales, qzeros, group_size, x
+    )
+
+    assert torch.isfinite(actual).all()
+    rms_reference = reference.square().mean().sqrt().clamp(min=1e-8)
+    rms_relative = (actual.float() - reference).square().mean().sqrt() / rms_reference
+    assert float(rms_relative) < 1e-3
