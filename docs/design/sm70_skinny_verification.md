@@ -212,6 +212,123 @@ and integration gate, not a paired performance claim.
 Evidence:
 `/mnt/llm_hfs/skinny-closeout-20260813/logs/qwen35-122b-nvfp4-mtp3.log`.
 
+## Frozen release matrix (2026-08-13)
+
+The final closeout used one fixed serving contract on CT252: TP4, FP16 model
+activations, FP8 KV, CUDA Graph enabled, `max_model_len=8192`,
+`max_num_seqs=1`, a 4096-token prompt, 256 forced output tokens, one warmup,
+and three measured repeats. Prefill is the prompt-token/TTFT proxy; decode
+excludes TTFT. Every row used the same frozen checkpoint within its table.
+
+The stages separate three independent changes:
+
+- `stock`: installed 1Cat 1.2.2 image source, TileLang 0.1.9, and the issue
+  #105 prefill workaround;
+- `final-old`: source commit `99e8ac6be8` on that same image and workaround;
+- `final-new`: the same source with the pinned TileLang/TVM-FFI 0.1.10 image
+  and original FlashQLA prefill enabled.
+
+There is no valid BF16-speed arm on V100. All rows deliberately use FP16. The
+BF16-to-FP16 changes are compatibility boundaries that make the SM70 route
+runnable; issue #105 was a separate TileLang header-generation failure. They
+must not be presented as an isolated throughput step.
+
+### Qwen3.6-27B AWQ
+
+`QuantTrio/Qwen3.6-27B-AWQ` revision `9b507bdc...`; the selected base is
+TurboMind. `ROI=1` means `VLLM_SM70_SKINNY_MIN_ROI=1.0`.
+
+| Stage/profile | MTP4 | Prefill tok/s | Decode tok/s | Total tok/s | Model GiB/GPU | Acceptance |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| stock / off | no | 2087.52 | 50.30 | 618.90 | 5.65 | - |
+| final-old / off | no | 2086.26 | 50.43 | 619.92 | 5.65 | - |
+| final-old / full | no | 2080.62 | 57.70 | 681.32 | 8.52 | - |
+| final-old / ROI=1 | no | 2084.67 | 55.63 | 664.53 | 6.64 | - |
+| final-new / off | no | 2346.40 | 50.38 | 639.32 | 5.65 | - |
+| final-new / ROI=1 | no | 2347.12 | 55.61 | 687.44 | 6.64 | - |
+| stock / off | yes | 1982.56 | 101.86 | 952.44 | 6.21 | 76.98% |
+| final-old / off | yes | 1984.11 | 101.00 | 948.24 | 6.21 | 76.98% |
+| final-old / full | yes | 1984.47 | 101.09 | 950.28 | 9.08 | 76.98% |
+| final-old / ROI=1 | yes | 1981.90 | 101.90 | 952.47 | 7.20 | 76.98% |
+| final-new / off | yes | 2223.87 | 101.31 | 999.46 | 6.21 | 76.98% |
+| final-new / ROI=1 | yes | 2221.01 | 101.63 | 999.95 | 7.20 | 76.98% |
+
+The source-backed off arm is transparent to stock: -0.06% prefill and +0.25%
+decode. With no MTP, the full overlay adds 14.42% decode; ROI=1 adds 10.30%
+for 0.99 GiB/GPU. Relative to full residency, ROI=1 returns 1.88 GiB/GPU for
+3.60% decode. TileLang 0.1.10 adds 12.47% prefill without moving decode. The
+final memory profile is +12.44% prefill, +10.55% decode, and +11.07% total
+throughput relative to stock.
+
+MTP4 itself doubles decode on this prompt (+102.50%). Once MTP is active, the
+ROI=1 overlay changes decode by only +0.32% while retaining 0.99 GiB/GPU, so
+it has no measured value in this single-request verifier profile. All 12 arms
+and all three repeats produced one byte-identical completion hash.
+
+### Qwen3.5-122B-A10B NVFP4 MoE
+
+`OptimizeLLM/Qwen3.5-122B-A10B-heretic-MTP-NVFP4` revision `07b7c210...`.
+Skinny wraps only Dense NVFP4 projections; routed experts independently remain
+on Marlin. The selected Dense base is TurboMind.
+
+| Stage/profile | MTP3 | Prefill tok/s | Decode tok/s | Total tok/s | Model GiB/GPU | Acceptance |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| stock / off | no | 3384.68 | 36.11 | 526.16 | 18.00 | - |
+| final-old / off | no | 3377.30 | 36.06 | 525.32 | 18.00 | - |
+| final-old / auto | no | 3381.97 | 37.73 | 546.12 | 18.44 | - |
+| final-new / off | no | 3940.69 | 35.97 | 535.38 | 18.00 | - |
+| final-new / auto | no | 3946.11 | 37.81 | 559.20 | 18.44 | - |
+| stock / off | yes | 2999.44 | 64.38 | 817.71 | 19.24 | 77.49% |
+| final-old / off | yes | 2989.79 | 62.68 | 800.52 | 19.24 | 75.11% |
+| final-old / auto | yes | 2991.23 | 64.32 | 815.85 | 19.67 | 76.50% |
+| final-new / off | yes | 3425.20 | 62.53 | 826.08 | 19.24 | 75.11% |
+| final-new / auto | yes | 3431.60 | 65.45 | 854.89 | 19.67 | 77.49% |
+
+The no-MTP, same-output `final-old` pair isolates a 4.64% Dense-overlay decode
+gain for 0.44 GiB/GPU. The final no-MTP combination is +16.59% prefill,
++4.70% decode, and +6.28% total throughput versus stock. With MTP3, the final
+combination is +14.41% prefill and +1.65% decode versus the stock MTP3 arm at
+the same acceptance and output hash. The direct final-new off/on pair is
++4.66% decode, but its acceptance also changes from 75.11% to 77.49%; that
+number is an end-to-end prompt result, not a pure kernel attribution.
+
+Each 122B arm was internally deterministic across its three repeats, but the
+full matrix contains three completion hashes. The variants make the same
+semantic analysis and first diverge after 356 or 447 output characters; they
+are not byte-identical. This is a real numerical-path caveat, not request
+noise. Kernel self-checks and fixed-length performance therefore remain
+necessary but are not substitutes for task-level quality gates.
+
+The final combination then passed a separate 262K acceptance at
+`max_model_len=262144`, `gpu_memory_utilization=0.90`, and
+`max_num_seqs=1`. It exposed 988,226 KV tokens, reported 19.67 GiB/GPU model
+residency, used 29,590 MiB/GPU when ready, and peaked at 30,314 MiB/GPU. The
+text arithmetic, required tool call, and image-count gates all passed. A
+261,996-token prompt returned the exact marker with 262,024 total tokens;
+TTFT was 1236.89 seconds, or 211.82 derived prefill tok/s. A post-request
+smoke also passed. This final-new run used the original TileLang path and did
+not carry the issue #105 workaround.
+
+All successful runs have empty fatal scans. No final-new arm reproduced
+`common.h:778` or a BF16-to-half error. Raw evidence and the generated CSV/JSON
+summary are under
+`/mnt/llm_hfs/logs/sm70-release-matrix-20260813/`.
+
+### Source-backed bundle gate
+
+One initial 122B final-source launch is intentionally excluded: a Git archive
+shadowed the installed `vllm` package without carrying `_moe_C.abi3.so`, so
+`_moe_C.topk_softmax` was absent. The model and Skinny dispatch were not the
+cause. The repaired bundle contains `_C`, `_C_stable_libtorch`, `_moe_C`,
+`cumem_allocator`, and `spinloop`; every measured source-backed launch checks
+their pinned hashes and the required MoE/Skinny torch ops before loading a
+model.
+
+`benchmarks/verify_sm70_runtime_bundle.py` makes that file/hash/op gate
+reusable. A source archive alone is not a release artifact; either build the
+native extensions into it or copy them from the exact ABI-compatible image and
+verify them inside that image.
+
 ## Fixed along the way
 
 `test_awq_overlay_dispatches_simt_qpn_then_delegates_base` fed CPU tensors to
