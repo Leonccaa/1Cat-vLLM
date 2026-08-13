@@ -68,6 +68,11 @@ class SM70SkinnyAwqState:
     output_size: int
     disabled_routes: set[str]
     validated_routes: set[tuple[str, str]]
+    # Checkpoint-native (qweight, scales, qzeros), retained only while the
+    # strict self-check needs them so the FP32 ground truth can start from the
+    # on-disk format and therefore also cover the prepack. Released by
+    # validate_awq_state; None when the strict check is off.
+    native: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     @property
     def has_simt(self) -> bool:
@@ -227,6 +232,9 @@ def prepare_awq_state(
         output_size=qweight.shape[1] * 8,
         disabled_routes=set(),
         validated_routes=set(),
+        native=(
+            (qweight, scales, qzeros) if envs.use_sm70_skinny_strict_check() else None
+        ),
     )
 
 
@@ -636,6 +644,10 @@ def awq_fp32_reference(
     ``codes`` is uint8 [N, K/2] with the low nibble at even k, ``scales`` and
     ``biases`` are FP16 [N, K/128], and ``x`` is [M, K]. Chunked over N so a
     vocabulary-sized projection does not materialize an N*K FP32 weight.
+
+    Scope: this starts from the Skinny layout, so it validates the kernel but
+    not the native-AWQ to Skinny prepack that produced that layout. Use
+    :func:`awq_native_fp32_reference` to cover the prepack as well.
     """
     n, packed_k = codes.shape
     k = packed_k * 2
@@ -651,6 +663,57 @@ def awq_fp32_reference(
             k // groups, dim=1
         ) + biases[start:stop].float().repeat_interleave(k // groups, dim=1)
         out[:, start:stop] = x32 @ weight.t()
+    return out
+
+
+def awq_native_fp32_reference(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int,
+    x: torch.Tensor,
+    chunk: int = 1024,
+) -> torch.Tensor:
+    """FP32 ground truth computed from the checkpoint-native AWQ tensors.
+
+    Starts one step earlier than :func:`awq_fp32_reference`: from the int32
+    tensors as they appear on disk, so it covers the native-to-Skinny prepack
+    (nibble de-interleave, transpose to N-major, byte repack, ``bias = -z*s``)
+    in addition to the kernel. It also works for any resident layout, since it
+    never touches the Skinny buffers.
+
+    It performs the shifts, transpose and group expansion independently; it
+    necessarily shares the AWQ nibble-order convention, because that
+    convention *is* the on-disk format definition rather than an implementation
+    choice.
+
+    ``qweight`` is int32 [K, N/8], ``qzeros`` int32 [G, N/8], ``scales``
+    FP16 [G, N], ``x`` is [M, K]. Returns [M, N] in FP32. Chunked over K to
+    bound the dequantized weight.
+    """
+    # Logical index j lives at nibble slot AWQ_SLOT[j] inside each int32.
+    awq_slot = torch.tensor(
+        [0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.long, device=qweight.device
+    )
+    shifts = (awq_slot * 4).to(torch.int32)
+
+    def unpack(packed: torch.Tensor) -> torch.Tensor:
+        # [rows, cols] int32 -> [rows, cols * 8] uint8, logical order.
+        wide = (packed.unsqueeze(-1) >> shifts.view(1, 1, 8)) & 0xF
+        return wide.reshape(packed.shape[0], -1)
+
+    k, n = qweight.shape[0], qweight.shape[1] * 8
+    zeros = unpack(qzeros).float()  # [G, N]
+    scales32 = scales.float()  # [G, N]
+
+    out = x.new_zeros((x.shape[0], n), dtype=torch.float32)
+    x32 = x.float()
+    for start in range(0, k, chunk):
+        stop = min(start + chunk, k)
+        q = unpack(qweight[start:stop]).float()  # [chunk, N]
+        rows = torch.arange(start, stop, device=qweight.device) // group_size
+        weight = (q - zeros[rows]) * scales32[rows]  # [chunk, N]
+        out += x32[:, start:stop] @ weight
     return out
 
 
@@ -709,12 +772,24 @@ def validate_awq_state(
                     f"{route} relative error {relative_error:.3e} exceeds "
                     f"{_SELF_CHECK_TOL:.3e}"
                 )
-            if envs.use_sm70_skinny_strict_check():
+            if envs.use_sm70_skinny_strict_check() and state.native is not None:
                 # The comparison above is circular: it checks Skinny against a
                 # backend that consumes the same checkpoint through similar
                 # unpack logic, so a shared misreading of the format passes.
                 # Compare against an independent FP32 dequant as well.
-                truth = awq_fp32_reference(state.codes, state.scales, state.biases, x)
+                #
+                # Start from the checkpoint-native tensors rather than the
+                # Skinny buffers. That covers the prepack as well as the
+                # kernel, and - unlike reading state.codes - it works when the
+                # resident layout is QPN-only, where the SIMT buffers are
+                # deliberately empty.
+                truth = awq_native_fp32_reference(
+                    state.native[0],
+                    state.native[1],
+                    state.native[2],
+                    state.group_size,
+                    x,
+                )
                 stats = _error_stats(actual, truth)
                 logger.info(
                     "SM70 Skinny AWQ %s FP32 ground truth N=%d K=%d: "
@@ -756,6 +831,10 @@ def validate_awq_state(
             base_backend,
         )
 
+    # The native tensors exist only for the strict check; the caller frees the
+    # originals right after loading, so do not keep a second reference alive.
+    state.native = None
+
 
 @dataclass
 class _ResidencyDecision:
@@ -770,41 +849,179 @@ class _ResidencyDecision:
 _residency_decisions: dict[tuple[int, int], _ResidencyDecision] = {}
 
 
-def _time_apply(fn: Callable[[], torch.Tensor], iterations: int = 20) -> float:
-    """Median-of-three timing of a single GEMM, in microseconds."""
+# Volta's L2 is 6 MiB; 24 MiB of dirty traffic evicts it comfortably.
+_L2_FLUSH_BYTES = 24 << 20
+_l2_flush_buffer: torch.Tensor | None = None
+
+
+def _flush_l2(device: torch.device) -> None:
+    """Evict L2 so the next timed call streams its weights from HBM.
+
+    Without this, a layer whose overlay is smaller than L2 gets cache hits on
+    every iteration after the first, which is not what decode does - decode
+    walks the whole model before returning to this layer. Worse, the hits are
+    asymmetric: Skinny loads codes with __ldcs (evict-first) while the base
+    backend does not, so the base backend collects the free hits and the shape
+    is scored against Skinny. That is exactly the artifact the standalone
+    harness rotates buffers to avoid.
+    """
+    global _l2_flush_buffer
+    if _l2_flush_buffer is None or _l2_flush_buffer.device != device:
+        _l2_flush_buffer = torch.empty(
+            _L2_FLUSH_BYTES // 4, dtype=torch.float32, device=device
+        )
+    _l2_flush_buffer.zero_()
+
+
+def _time_apply(
+    fn: Callable[[], torch.Tensor],
+    iterations: int = 12,
+    device: torch.device | None = None,
+) -> float:
+    """Median wall time of one L2-cold GEMM call, in microseconds.
+
+    Each call is timed on its own with an L2 flush outside the timing window,
+    so the measurement reflects a cold weight stream rather than a hot loop.
+    """
+    if device is None:
+        device = torch.cuda.current_device()
     for _ in range(3):
         fn()
     torch.cuda.synchronize()
     samples: list[float] = []
-    for _ in range(3):
+    for _ in range(iterations):
+        _flush_l2(
+            torch.device(device) if not isinstance(device, torch.device) else device
+        )
+        torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         stop = torch.cuda.Event(enable_timing=True)
         start.record()
-        for _ in range(iterations):
-            fn()
+        fn()
         stop.record()
         stop.synchronize()
-        samples.append(start.elapsed_time(stop) * 1000.0 / iterations)
+        samples.append(start.elapsed_time(stop) * 1000.0)
     samples.sort()
-    return samples[1]
+    return samples[len(samples) // 2]
 
 
-def overlay_mib(output_size: int, input_size: int, has_qpn: bool) -> float:
+def _agree_across_tp(value: float) -> float:
+    """Reduce a per-rank measurement to one value shared by the whole TP group.
+
+    Each rank runs its own timing, so without this the four ranks of a TP4
+    deployment can reach different keep/drop verdicts on the same shape when
+    their measurements straddle the threshold. That would leave inconsistent
+    memory per card while the slowest rank still sets decode speed.
+
+    Take the minimum: decode waits for the slowest rank, so the least
+    optimistic measurement is the one that describes the deployment.
+    """
+    try:
+        from vllm.distributed import get_tp_group
+
+        group = get_tp_group()
+        if group is None or group.world_size <= 1:
+            return value
+        tensor = torch.tensor(
+            [value], dtype=torch.float64, device=torch.cuda.current_device()
+        )
+        torch.distributed.all_reduce(
+            tensor, op=torch.distributed.ReduceOp.MIN, group=group.device_group
+        )
+        return float(tensor.item())
+    except Exception:
+        # No TP group yet, or a backend that cannot reduce here: fall back to
+        # the local value rather than failing the load.
+        return value
+
+
+def overlay_mib(output_size: int, input_size: int, layouts: int = 1) -> float:
     """Resident overlay bytes for one dense layer, in MiB.
 
     AWQ g128 costs 0.5 byte/weight of codes plus an FP16 scale and an FP16 bias
-    per 128 weights, i.e. 0.53125 byte/weight. QPN residency adds a second copy
-    of the same payload in fragment order.
+    per 128 weights, i.e. 0.53125 byte/weight, per resident layout.
     """
-    per_weight = 0.53125 * (2.0 if has_qpn else 1.0)
-    return output_size * input_size * per_weight / (1024.0 * 1024.0)
+    return output_size * input_size * 0.53125 * layouts / (1024.0 * 1024.0)
+
+
+def _measure_route_roi(
+    state: SM70SkinnyAwqState,
+    reference_apply: Callable[[torch.Tensor], torch.Tensor],
+    route: str,
+) -> _ResidencyDecision | None:
+    """Time one resident route against the base backend at its own M."""
+    from vllm import _sm70_ops as sm70_ops
+
+    rows = 1 if route == "simt" else 8
+    device = state.codes.device if route == "simt" else state.qpn_codes.device
+    values = torch.arange(rows * state.input_size, device=device, dtype=torch.int32)
+    x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(
+        rows, state.input_size
+    )
+    if route == "simt":
+
+        def skinny():
+            return sm70_ops.skinny_awq_gemm_simt(
+                x, state.codes, state.scales, state.biases, state.group_size
+            )
+
+    else:
+
+        def skinny():
+            return sm70_ops.skinny_awq_gemm_qpn(
+                x,
+                state.qpn_codes,
+                state.qpn_scales,
+                state.qpn_biases,
+                state.group_size,
+                state.output_size,
+            )
+
+    try:
+        base_us = _time_apply(lambda: reference_apply(x), device=device)
+        skinny_us = _time_apply(skinny, device=device)
+    except Exception:
+        # Never let a timing failure cost correctness: report None so the
+        # caller keeps the route and lets the self-check own validity.
+        logger.exception(
+            "SM70 Skinny AWQ %s residency measurement failed for N=%d K=%d; "
+            "keeping the overlay.",
+            route,
+            state.output_size,
+            state.input_size,
+        )
+        return None
+
+    saved = _agree_across_tp(base_us - skinny_us)
+    mib = overlay_mib(state.output_size, state.input_size)
+    roi = saved / mib if mib > 0 else 0.0
+    decision = _ResidencyDecision(
+        roi=roi,
+        mib=mib,
+        saved_us=saved,
+        keep=roi >= envs.get_sm70_skinny_min_roi(),
+    )
+    logger.info(
+        "SM70 Skinny AWQ residency %s N=%d K=%d: base=%.1fus skinny=%.1fus "
+        "saved=%.1fus overlay=%.1fMiB roi=%.3fus/MiB -> %s",
+        route,
+        state.output_size,
+        state.input_size,
+        base_us,
+        skinny_us,
+        saved,
+        mib,
+        roi,
+        "keep" if decision.keep else "drop",
+    )
+    return decision
 
 
 def apply_residency_policy(
     state: SM70SkinnyAwqState,
     reference_apply: Callable[[torch.Tensor], torch.Tensor],
 ) -> bool:
-    """Keep the overlay for this layer only if it earns its memory.
+    """Release the overlay layouts that do not earn their memory.
 
     The overlay holds a second full copy of every weight it covers, so on a
     32 GiB V100 it trades directly against KV cache and context length. That
@@ -812,83 +1029,48 @@ def apply_residency_policy(
     saturates HBM there is no latency left to win, but the memory cost is the
     same as anywhere else.
 
-    Measure this shape once against the selected base backend at M=1 (the
-    dominant decode case), express the result as microseconds saved per MiB of
-    overlay, and drop the overlay when it falls below the configured floor.
-    The decision is cached per (N, K), so the cost is a few timed GEMMs per
-    distinct shape rather than per layer.
+    SIMT and QPN are scored separately, each at the M it actually serves (M=1
+    and M=8) and each charged only its own copy of the weights. They are
+    independent residency decisions: a shape can be worth keeping for decode
+    and not worth keeping for MTP verification, or the reverse.
 
-    Returns True when the overlay stays resident. On False the Skinny tensors
-    have been released and the caller must fall back to the base backend.
+    Decisions are cached per (N, K, route), so the cost is a few timed GEMMs
+    per distinct shape rather than per layer, and each measurement is reduced
+    across the TP group so every rank reaches the same verdict.
+
+    Returns True while any Skinny route is still resident.
     """
-    key = (state.output_size, state.input_size)
-    decision = _residency_decisions.get(key)
-    if decision is None:
-        if not state.has_simt or "simt" in state.disabled_routes:
-            # Nothing measurable resident; leave the state alone and let the
-            # normal route selection handle it.
-            return state.has_simt or state.has_qpn
-        from vllm import _sm70_ops as sm70_ops
+    routes = []
+    if state.has_simt and "simt" not in state.disabled_routes:
+        routes.append("simt")
+    if state.has_qpn and "qpn" not in state.disabled_routes:
+        routes.append("qpn")
+    if not routes:
+        return False
 
-        values = torch.arange(
-            state.input_size, device=state.codes.device, dtype=torch.int32
-        )
-        x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(
-            1, state.input_size
-        )
-        try:
-            base_us = _time_apply(lambda: reference_apply(x))
-            skinny_us = _time_apply(
-                lambda: sm70_ops.skinny_awq_gemm_simt(
-                    x, state.codes, state.scales, state.biases, state.group_size
-                )
-            )
-        except Exception:
-            # Never let a timing failure cost correctness; keep the overlay and
-            # let the self-check own validity.
-            logger.exception(
-                "SM70 Skinny AWQ residency measurement failed for N=%d K=%d; "
-                "keeping the overlay.",
-                state.output_size,
-                state.input_size,
-            )
-            return True
-        mib = overlay_mib(state.output_size, state.input_size, state.has_qpn)
-        saved = base_us - skinny_us
-        roi = saved / mib if mib > 0 else 0.0
-        decision = _ResidencyDecision(
-            roi=roi,
-            mib=mib,
-            saved_us=saved,
-            keep=roi >= envs.get_sm70_skinny_min_roi(),
-        )
-        _residency_decisions[key] = decision
-        logger.info(
-            "SM70 Skinny AWQ residency N=%d K=%d: base=%.1fus skinny=%.1fus "
-            "saved=%.1fus overlay=%.1fMiB roi=%.3fus/MiB -> %s",
-            state.output_size,
-            state.input_size,
-            base_us,
-            skinny_us,
-            saved,
-            mib,
-            roi,
-            "keep" if decision.keep else "drop",
-        )
+    for route in routes:
+        key = (state.output_size, state.input_size, route)
+        decision = _residency_decisions.get(key)
+        if decision is None:
+            decision = _measure_route_roi(state, reference_apply, route)
+            if decision is None:
+                continue  # measurement failed; keep this route
+            _residency_decisions[key] = decision
+        if decision.keep:
+            continue
+        empty_codes = state.codes.new_empty(0)
+        empty_meta = state.scales.new_empty(0)
+        if route == "simt":
+            state.codes = empty_codes
+            state.scales = empty_meta
+            state.biases = empty_meta
+        else:
+            state.qpn_codes = empty_codes
+            state.qpn_scales = empty_meta
+            state.qpn_biases = empty_meta
+        state.disabled_routes.add(route)
 
-    if decision.keep:
-        return True
-
-    empty_codes = state.codes.new_empty(0)
-    empty_meta = state.scales.new_empty(0)
-    state.codes = empty_codes
-    state.scales = empty_meta
-    state.biases = empty_meta
-    state.qpn_codes = empty_codes
-    state.qpn_scales = empty_meta
-    state.qpn_biases = empty_meta
-    state.disabled_routes.update({"simt", "qpn"})
-    return False
+    return state.has_simt or state.has_qpn
 
 
 def log_residency_summary() -> None:
@@ -898,7 +1080,7 @@ def log_residency_summary() -> None:
     kept = sum(d.mib for d in _residency_decisions.values() if d.keep)
     dropped = sum(d.mib for d in _residency_decisions.values() if not d.keep)
     lines = [
-        f"  N={key[0]:>6} K={key[1]:>6}  roi={d.roi:8.3f}us/MiB  "
+        f"  {key[2]:<4} N={key[0]:>6} K={key[1]:>6}  roi={d.roi:8.3f}us/MiB  "
         f"saved={d.saved_us:7.1f}us  overlay={d.mib:8.1f}MiB  "
         f"{'keep' if d.keep else 'drop'}"
         for key, d in sorted(_residency_decisions.items(), key=lambda kv: -kv[1].roi)

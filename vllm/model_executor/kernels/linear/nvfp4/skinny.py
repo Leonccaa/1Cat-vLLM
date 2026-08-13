@@ -457,25 +457,6 @@ class _ResidencyDecision:
 _residency_decisions: dict[tuple[int, int], _ResidencyDecision] = {}
 
 
-def _time_apply(fn, iterations: int = 20) -> float:
-    """Median-of-three timing of a single GEMM, in microseconds."""
-    for _ in range(3):
-        fn()
-    torch.cuda.synchronize()
-    samples: list[float] = []
-    for _ in range(3):
-        start = torch.cuda.Event(enable_timing=True)
-        stop = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iterations):
-            fn()
-        stop.record()
-        stop.synchronize()
-        samples.append(start.elapsed_time(stop) * 1000.0 / iterations)
-    samples.sort()
-    return samples[1]
-
-
 class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
     """SM70 small-M NVFP4 decorator over a selected base kernel."""
 
@@ -666,77 +647,125 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
         )
 
     def _apply_residency_policy(self, layer: torch.nn.Module) -> bool:
-        """Release the overlay for shapes where it does not earn its VRAM.
+        """Release the overlay layouts that do not earn their VRAM.
 
         NVFP4 keeps a second copy of every covered weight at 0.5625 byte each
         (plus another for QPN), which on a 32 GiB V100 comes straight out of
         KV cache. Where the base backend already saturates HBM there is no
-        latency left to win, so the copy is pure cost. Measure once per
-        (N, K) at M=1 and drop the shapes below the configured floor.
+        latency left to win, so the copy is pure cost.
+
+        SIMT and QPN are scored separately at the M each actually serves and
+        charged only their own copy, because a shape can be worth keeping for
+        decode and not for MTP verification, or the reverse. Timing is L2-cold
+        and reduced across the TP group so every rank agrees - see
+        sm70_skinny._time_apply and _agree_across_tp for why both matter.
         """
+        from vllm.model_executor.layers.quantization.sm70_skinny import (
+            _agree_across_tp,
+            _time_apply,
+        )
+
         n = layer.output_size_per_partition
         k = layer.input_size_per_partition
-        key = (n, k)
-        decision = _residency_decisions.get(key)
-        if decision is None:
-            if "simt" in layer.skinny_disabled_routes:
-                return True
-            values = torch.arange(
-                k, device=layer.skinny_codes.device, dtype=torch.int32
-            )
-            x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(1, k)
-            try:
-                base_us = _time_apply(lambda: self.base_kernel.apply_weights(layer, x))
-                skinny_us = _time_apply(
-                    lambda: torch.ops._C.skinny_nvfp4_gemm_simt(
-                        x,
-                        layer.skinny_codes,
-                        layer.skinny_scales,
-                        layer.skinny_global_scale,
+        per_layout_mib = n * k * 0.5625 / (1024.0 * 1024.0)
+
+        routes = []
+        if (
+            layer.skinny_codes.numel() > 0
+            and "simt" not in layer.skinny_disabled_routes
+        ):
+            routes.append("simt")
+        if (
+            layer.skinny_qpn_codes.numel() > 0
+            and "qpn" not in layer.skinny_disabled_routes
+        ):
+            routes.append("qpn")
+        if not routes:
+            layer.skinny_enabled = False
+            return False
+
+        device = layer.skinny_codes.device
+        for route in routes:
+            key = (n, k, route)
+            decision = _residency_decisions.get(key)
+            if decision is None:
+                rows = 1 if route == "simt" else 8
+                values = torch.arange(rows * k, device=device, dtype=torch.int32)
+                x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(rows, k)
+                if route == "simt":
+
+                    def skinny(x=x):
+                        return torch.ops._C.skinny_nvfp4_gemm_simt(
+                            x,
+                            layer.skinny_codes,
+                            layer.skinny_scales,
+                            layer.skinny_global_scale,
+                        )
+
+                else:
+
+                    def skinny(x=x):
+                        return torch.ops._C.skinny_nvfp4_gemm_qpn(
+                            x,
+                            layer.skinny_qpn_codes,
+                            layer.skinny_qpn_scales,
+                            layer.skinny_global_scale,
+                            n,
+                        )
+
+                try:
+                    base_us = _time_apply(
+                        lambda x=x: self.base_kernel.apply_weights(layer, x),
+                        device=device,
                     )
+                    skinny_us = _time_apply(skinny, device=device)
+                except Exception:
+                    logger.exception(
+                        "SM70 Skinny NVFP4 %s residency measurement failed for "
+                        "N=%d K=%d; keeping the overlay.",
+                        route,
+                        n,
+                        k,
+                    )
+                    continue
+                saved = _agree_across_tp(base_us - skinny_us)
+                roi = saved / per_layout_mib if per_layout_mib > 0 else 0.0
+                decision = _ResidencyDecision(
+                    roi=roi,
+                    mib=per_layout_mib,
+                    saved_us=saved,
+                    keep=roi >= envs.get_sm70_skinny_min_roi(),
                 )
-            except Exception:
-                logger.exception(
-                    "SM70 Skinny NVFP4 residency measurement failed for N=%d "
-                    "K=%d; keeping the overlay.",
+                _residency_decisions[key] = decision
+                logger.info(
+                    "SM70 Skinny NVFP4 residency %s N=%d K=%d: base=%.1fus "
+                    "skinny=%.1fus saved=%.1fus overlay=%.1fMiB "
+                    "roi=%.3fus/MiB -> %s",
+                    route,
                     n,
                     k,
+                    base_us,
+                    skinny_us,
+                    saved,
+                    per_layout_mib,
+                    roi,
+                    "keep" if decision.keep else "drop",
                 )
-                return True
-            has_qpn = layer.skinny_qpn_codes.numel() > 0
-            mib = n * k * 0.5625 * (2.0 if has_qpn else 1.0) / (1024.0 * 1024.0)
-            saved = base_us - skinny_us
-            roi = saved / mib if mib > 0 else 0.0
-            decision = _ResidencyDecision(
-                roi=roi,
-                mib=mib,
-                saved_us=saved,
-                keep=roi >= envs.get_sm70_skinny_min_roi(),
-            )
-            _residency_decisions[key] = decision
-            logger.info(
-                "SM70 Skinny NVFP4 residency N=%d K=%d: base=%.1fus "
-                "skinny=%.1fus saved=%.1fus overlay=%.1fMiB roi=%.3fus/MiB -> %s",
-                n,
-                k,
-                base_us,
-                skinny_us,
-                saved,
-                mib,
-                roi,
-                "keep" if decision.keep else "drop",
-            )
-        if decision.keep:
-            return True
+            if decision.keep:
+                continue
+            empty = layer.skinny_codes.data.new_empty(0)
+            if route == "simt":
+                layer.skinny_codes = Parameter(empty, requires_grad=False)
+                layer.skinny_scales = Parameter(empty, requires_grad=False)
+            else:
+                layer.skinny_qpn_codes = Parameter(empty, requires_grad=False)
+                layer.skinny_qpn_scales = Parameter(empty, requires_grad=False)
+            layer.skinny_disabled_routes.add(route)
 
-        empty = layer.skinny_codes.data.new_empty(0)
-        layer.skinny_codes = Parameter(empty, requires_grad=False)
-        layer.skinny_scales = Parameter(empty, requires_grad=False)
-        layer.skinny_qpn_codes = Parameter(empty, requires_grad=False)
-        layer.skinny_qpn_scales = Parameter(empty, requires_grad=False)
-        layer.skinny_disabled_routes.update({"simt", "qpn"})
-        layer.skinny_enabled = False
-        return False
+        layer.skinny_enabled = (
+            layer.skinny_codes.numel() > 0 or layer.skinny_qpn_codes.numel() > 0
+        )
+        return layer.skinny_enabled
 
     def apply_weights(
         self,

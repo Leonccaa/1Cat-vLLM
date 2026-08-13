@@ -376,9 +376,9 @@ def test_residency_policy_drops_shape_below_roi_threshold(monkeypatch):
     assert state.has_simt
 
     monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
-    # Base and Skinny take the same time -> zero saving -> negative ROI floor
-    # is the only thing that could keep it.
-    monkeypatch.setattr(sm70_skinny, "_time_apply", lambda fn, iterations=20: 10.0)
+    monkeypatch.setattr(
+        sm70_skinny, "_time_apply", lambda fn, iterations=12, device=None: 10.0
+    )
     monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "1.0")
 
     kept = sm70_skinny.apply_residency_policy(state, lambda x: x)
@@ -386,7 +386,7 @@ def test_residency_policy_drops_shape_below_roi_threshold(monkeypatch):
     assert kept is False
     assert state.codes.numel() == 0
     assert state.scales.numel() == 0
-    assert state.disabled_routes == {"simt", "qpn"}
+    assert "simt" in state.disabled_routes
     assert sm70_skinny.select_awq_route(state, 1) is None
 
 
@@ -397,7 +397,9 @@ def test_residency_policy_keeps_shape_that_earns_its_memory(monkeypatch):
     monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
     timings = iter([500.0, 10.0])  # base slow, skinny fast
     monkeypatch.setattr(
-        sm70_skinny, "_time_apply", lambda fn, iterations=20: next(timings)
+        sm70_skinny,
+        "_time_apply",
+        lambda fn, iterations=12, device=None: next(timings),
     )
     monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "0")
 
@@ -413,7 +415,7 @@ def test_residency_decision_is_cached_per_shape(monkeypatch):
     monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
     monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "0")
 
-    def _timer(fn, iterations=20):
+    def _timer(fn, iterations=12, device=None):
         calls.append(1)
         return 500.0 if len(calls) % 2 else 10.0
 
@@ -424,3 +426,90 @@ def test_residency_decision_is_cached_per_shape(monkeypatch):
 
     # Two timed measurements for the first layer, none for the repeats.
     assert len(calls) == 2
+
+
+def test_residency_scores_simt_and_qpn_independently(monkeypatch):
+    """SIMT and QPN serve different M and must be kept or dropped separately.
+
+    Coupling them means an MTP-only win pays for a decode layout that earns
+    nothing, or the reverse.
+    """
+    qweight, scales, qzeros = _native_awq(32, 128)
+    monkeypatch.setenv("VLLM_SM70_SKINNY_AWQ_LAYOUT", "both")
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+    assert state.has_simt and state.has_qpn
+
+    monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
+    monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "0.001")
+
+    # simt: base 10 vs skinny 10 -> no gain.  qpn: base 500 vs skinny 10 -> big.
+    seq = iter([10.0, 10.0, 500.0, 10.0])
+    monkeypatch.setattr(
+        sm70_skinny, "_time_apply", lambda fn, iterations=12, device=None: next(seq)
+    )
+
+    assert sm70_skinny.apply_residency_policy(state, lambda x: x) is True
+    assert state.codes.numel() == 0, "SIMT should have been released"
+    assert state.qpn_codes.numel() != 0, "QPN earned its memory and must stay"
+    assert state.disabled_routes == {"simt"}
+    assert sm70_skinny.select_awq_route(state, 1) is None
+    assert sm70_skinny.select_awq_route(state, 8) == "qpn"
+
+
+def test_residency_measures_qpn_when_simt_is_not_resident(monkeypatch):
+    """With layout=qpn there is no SIMT buffer; the gate must still apply."""
+    qweight, scales, qzeros = _native_awq(32, 128)
+    monkeypatch.setenv("VLLM_SM70_SKINNY_AWQ_LAYOUT", "qpn")
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+    assert not state.has_simt and state.has_qpn
+
+    monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
+    monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "1.0")
+    calls = []
+
+    def _timer(fn, iterations=12, device=None):
+        calls.append(1)
+        return 10.0  # no gain -> must drop
+
+    monkeypatch.setattr(sm70_skinny, "_time_apply", _timer)
+
+    kept = sm70_skinny.apply_residency_policy(state, lambda x: x)
+
+    assert calls, "QPN-only layout was silently skipped instead of measured"
+    assert kept is False
+    assert state.qpn_codes.numel() == 0
+    assert state.disabled_routes == {"qpn"}
+
+
+def test_awq_native_fp32_reference_matches_skinny_layout_reference():
+    """The native-tensor ground truth must agree with the Skinny-layout one.
+
+    They start from different representations - int32 checkpoint packing vs the
+    prepacked N-major bytes - so agreement exercises the prepack itself.
+
+    They are not bit-identical by construction: the Skinny layout folds the
+    zero point into an FP16 ``bias = -z*s`` computed at prepack time, whereas
+    the native form evaluates ``(q - z) * s`` directly, so they differ by the
+    FP16 rounding of that bias. Use a random fixture rather than the correlated
+    arange one, which drives the output to near-zero and lets that 1-ulp term
+    dominate a relative comparison.
+    """
+    torch.manual_seed(0)
+    n, k = 32, 256
+    logical_weight = torch.randint(0, 16, (k, n), dtype=torch.uint8)
+    logical_zeros = torch.randint(0, 4, (k // 128, n), dtype=torch.uint8)
+    scales = (torch.rand(k // 128, n) * 0.02 + 0.01).to(torch.float16)
+    qweight = _pack_awq_rows(logical_weight)
+    qzeros = _pack_awq_rows(logical_zeros)
+
+    codes, logical_scales, biases = sm70_skinny.unpack_awq_dense(
+        qweight, scales, qzeros, 128
+    )
+    x = (torch.rand(2, k) - 0.5).to(torch.float16)
+
+    from_native = sm70_skinny.awq_native_fp32_reference(qweight, scales, qzeros, 128, x)
+    from_skinny = sm70_skinny.awq_fp32_reference(codes, logical_scales, biases, x)
+
+    scale = from_native.abs().max().clamp(min=1e-6)
+    relative = (from_native - from_skinny).abs().max() / scale
+    assert relative < 1e-3, f"references disagree by {relative:.3e}"
