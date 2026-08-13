@@ -16,7 +16,18 @@ def _pack_awq_rows(logical: torch.Tensor) -> torch.Tensor:
     return byte_view.contiguous().view(logical.shape[0], -1).view(torch.int32)
 
 
-def _native_awq(n: int, k: int):
+def _overlay_device() -> torch.device:
+    """Device the graph-safe overlay ops can actually dispatch on.
+
+    ``direct_register_custom_op`` registers these ops for CUDA and Meta only,
+    so feeding them CPU tensors raises NotImplementedError on any machine that
+    has a GPU. Tests that go through ``torch.ops.vllm.*`` must therefore follow
+    the available device rather than assume CPU.
+    """
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _native_awq(n: int, k: int, device: torch.device | None = None):
     logical_weight = (
         torch.arange(k * n, dtype=torch.int64).remainder(16).to(torch.uint8)
     )
@@ -27,7 +38,13 @@ def _native_awq(n: int, k: int):
         torch.arange((k // 128) * n, dtype=torch.float16).view(k // 128, n) / 1024
         + 0.125
     )
-    return _pack_awq_rows(logical_weight), scales, _pack_awq_rows(logical_zeros)
+    qweight = _pack_awq_rows(logical_weight)
+    qzeros = _pack_awq_rows(logical_zeros)
+    if device is not None:
+        qweight = qweight.to(device)
+        scales = scales.to(device)
+        qzeros = qzeros.to(device)
+    return qweight, scales, qzeros
 
 
 def _unpack_code(codes: torch.Tensor, row: int, column: int) -> int:
@@ -128,7 +145,10 @@ def test_prepare_awq_moe_bank_is_one_n_major_layout():
 
 def test_awq_overlay_dispatches_simt_qpn_then_delegates_base(monkeypatch):
     n, k = 32, 128
-    qweight, scales, qzeros = _native_awq(n, k)
+    # Goes through torch.ops.vllm.sm70_skinny_awq_linear, which is registered
+    # for CUDA/Meta only.
+    device = _overlay_device()
+    qweight, scales, qzeros = _native_awq(n, k, device)
     monkeypatch.setenv("VLLM_SM70_SKINNY_AWQ_LAYOUT", "both")
     state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
     calls: list[str] = []
@@ -148,7 +168,7 @@ def test_awq_overlay_dispatches_simt_qpn_then_delegates_base(monkeypatch):
 
     for m in (1, 8, 17):
         out = sm70_skinny.try_apply_awq_state(
-            state, torch.ones((m, k), dtype=torch.float16)
+            state, torch.ones((m, k), dtype=torch.float16, device=device)
         )
         if out is None:
             calls.append("selected_base")

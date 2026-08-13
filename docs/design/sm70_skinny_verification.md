@@ -6,7 +6,35 @@ assumed.
 
 ## Verified
 
-Standalone kernel harness on CT252 (`llm252.lan`, 4x V100-PCIE-32GB), see
+Real `_C` build on CT252 (`llm252.lan`, 4x V100-PCIE-32GB). The extension was
+built for `compute_70/sm_70` only, inside the
+`1cat-vllm:1.2.2-cu128-responses-thinking-budget-tilelang010-skinny-v1` image
+with the workspace on `/mnt/llm_hfs` (CT252's root filesystem is still at 96%).
+48 targets, 10m10s wall on 32 jobs.
+
+- `_C.abi3.so` SHA-256
+  `fad4b2997fe8201253b10d48331a13a4e85e2cb82c7d0434d95e18464f89880f`
+  (43,960,168 bytes). Note this is an `_C`-target-only build, so it is not
+  comparable to a full release artifact's hash.
+- All five skinny ops register: `skinny_awq_gemm_simt`, `skinny_awq_gemm_qpn`,
+  `skinny_awq_moe_gemm_simt_out`, `skinny_nvfp4_gemm_simt`,
+  `skinny_nvfp4_gemm_qpn`.
+- GPU operator tests: **5 passed**.
+- CPU tests run against the real build: **35 passed**.
+
+Split-K, CUDA Graph and MoE verification on the same build
+(`verify_splitk.py`, N=1792 K=5120 -> 4 splits):
+
+| check | result |
+| --- | --- |
+| split-K vs independent FP32 reference | max_rel 3.635e-04 |
+| 20 eager repeats bit-identical | yes (fixed split order is deterministic) |
+| CUDA Graph capture + 10 replays vs eager | identical |
+| replay tracks an updated input | yes (graph is live, not frozen) |
+| non-split shape vs FP32 reference | max_rel 4.140e-04 |
+| MoE invalid expert id | zeroed, no stale buffer contents |
+
+Standalone kernel harness on the same host, see
 `benchmarks/sm70_skinny_harness/`:
 
 - Both SIMT and QPN compile clean for `sm_70` under CUDA 12.8.
@@ -24,29 +52,25 @@ Host-side, on the dev box:
 - `ruff check` / `ruff format` clean on every touched file; `clang-format`
   applied to all CUDA sources; `compileall` and `git diff --check` clean.
 
-## Not yet verified — needs a real extension build
+## Fixed along the way
 
-The dev box has no `nvcc` and no GPU, and CT252's root filesystem is at 96%
-(~5.5 GiB free), which is not enough for a full `_C` build. Everything below
-is therefore untested end to end:
+`test_awq_overlay_dispatches_simt_qpn_then_delegates_base` fed CPU tensors to
+`torch.ops.vllm.sm70_skinny_awq_linear`, which `direct_register_custom_op`
+registers for CUDA and Meta only. It therefore passed on a CPU-only torch and
+raised `NotImplementedError` on any machine with a GPU — confirmed by running
+the unmodified base commit `e9264c2f` on CT252, which fails identically. The
+one test covering the M=1/8/17 routing decision had consequently never
+executed on GPU hardware. It now follows the available device.
 
-1. **Build the extension** for `compute_70/sm_70` on CUDA 12.8 and record the
-   new `_C.abi3.so` SHA-256. Free disk on CT252 first.
-2. **GPU operator tests**: `tests/quantization/test_sm70_skinny_nvfp4_gpu.py`
-   and `test_sm70_skinny_awq_gpu.py` (5 test functions).
-3. **Split-K under CUDA Graph.** The `k_splits > 1` path allocates an FP32
-   workspace per call and runs a second reduction kernel. Both should be fine
-   under capture — the allocation comes from the graph pool — but this has only
-   been exercised outside vLLM. Verify capture and repeated replay, and
-   interleave M=1/8/17 in one compiled callable as the existing gate does.
-4. **Determinism of the split-K reduction.** The reduction sums splits in fixed
-   order and should be bit-reproducible; confirm run-to-run equality rather
-   than assuming it.
-5. **MoE zero-fill.** The invalid-expert path now writes zeros instead of
-   leaving the previous step's values in the reused output buffer. Covered by
-   no test; the MoE path is default-off.
-6. **Residency policy on a real model.** This is the one that needs judgement,
-   not just a pass/fail — see below.
+## Not yet verified
+
+1. **Residency policy on a real model.** Needs judgement rather than a
+   pass/fail — see below.
+2. **Full-model paired A/B** at the chosen threshold.
+3. **Concurrency.** The GPU gate is single-stream; concurrent requests sharing
+   the split-K workspace allocation have not been exercised.
+4. **A full release build.** Only the `_C` target was built here; `_moe_C` and
+   friends were reused from the existing image.
 
 ## Calibrating the residency threshold
 
@@ -77,5 +101,6 @@ plus roughly another 0.96 GiB of surrendered headroom.
 
 ## Known-good ordering for the gates
 
-Run 3 and 4 before 6: a residency policy that silently disables the overlay
-would make a broken split-K path look fine.
+Run the split-K and graph checks before the residency calibration: a residency
+policy that silently disables the overlay would make a broken split-K path
+look fine. (Done in that order above.)
