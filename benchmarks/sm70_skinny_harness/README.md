@@ -59,8 +59,9 @@ Measured on V100-PCIE-32GB, min of 3 interleaved rounds, application clocks not
 locked (the LXC cannot set them), so treat sub-3% differences as noise.
 
 - QPN split-K: 1.91x–2.48x on `qkv` (N=1792, 4 splits); exactly 1.00x on shapes
-  that already fill the GPU. This is what turned QPN from "no end-to-end gain"
-  into a real win.
+  that already fill the GPU. This is an isolated-kernel capability, not an
+  end-to-end claim: Qwen3.6-27B AWQ does not quantize that qkv shape, and its
+  three-repeat M=8 gate measured QPN 10.9% slower than the default route.
 - `__ldcs` on streaming weight codes: +6% to +21% on three of four shapes, −6%
   on the one sitting near the L2 boundary.
 - Rejected after measuring: merging the SIMT full-chunk and tail loops into one

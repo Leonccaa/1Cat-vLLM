@@ -19,8 +19,49 @@ AWQ_GROUP_SIZE = 128
 _SELF_CHECK_TOL = 3e-2
 _AWQ_REVERSE_PACK_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
 _QPN_K_ORDER = (0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15)
+_QPN_TARGET_BLOCKS = 160
 
 _awq_route_log_seen: set[tuple[str, int, torch.dtype]] = set()
+
+
+def qpn_k_splits(
+    input_size: int,
+    output_size: int,
+    target_blocks: int = _QPN_TARGET_BLOCKS,
+) -> int:
+    """Mirror the CUDA QPN split-K launch policy for load-time diagnostics."""
+    warps = 4
+    min_groups_per_warp = 4
+    max_splits = 16
+    group_count = input_size // 16
+    tiles = output_size // 32
+    splits = 1
+    while splits < max_splits:
+        if tiles * splits >= target_blocks:
+            break
+        next_splits = splits * 2
+        if group_count % (warps * next_splits) != 0:
+            break
+        if group_count // (warps * next_splits) < min_groups_per_warp:
+            break
+        splits = next_splits
+    return splits
+
+
+def log_qpn_split_geometry(format_name: str, input_size: int, output_size: int) -> None:
+    """Log once per unique shape whether QPN split-K will actually engage."""
+    splits = qpn_k_splits(input_size, output_size)
+    logger.info_once(
+        "SM70 Skinny %s QPN split-K %s for N=%d K=%d: "
+        "splits=%d, N32 tiles=%d, target_blocks=%d.",
+        format_name,
+        "active" if splits > 1 else "inactive",
+        output_size,
+        input_size,
+        splits,
+        output_size // 32,
+        _QPN_TARGET_BLOCKS,
+    )
 
 
 def selected_base_backend(default_auto: str = "turbomind") -> str:
@@ -216,8 +257,14 @@ def prepare_awq_state(
         qpn_codes, qpn_scales, qpn_biases = qpn_prepack_awq(
             codes, logical_scales, biases
         )
+        if qpn_codes is not None:
+            log_qpn_split_geometry("AWQ", qweight.shape[0], qweight.shape[1] * 8)
     else:
         qpn_codes = qpn_scales = qpn_biases = None
+        logger.info_once(
+            "SM70 Skinny AWQ QPN disabled by layout=simt; split-K is not "
+            "part of this load."
+        )
 
     keep_simt = layout in ("simt", "both")
     return SM70SkinnyAwqState(
@@ -737,90 +784,103 @@ def validate_awq_state(
         cases.append((8, "qpn"))
     for m, route in cases:
         validation_key = (base_backend, route)
-        if validation_key in state.validated_routes or route in state.disabled_routes:
-            continue
-        try:
-            values = torch.arange(
-                m * state.input_size,
-                device=state.codes.device,
-                dtype=torch.int32,
-            )
-            x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(
-                m, state.input_size
-            )
-            reference = reference_apply(x)
-            if route == "simt":
-                actual = sm70_ops.skinny_awq_gemm_simt(
-                    x,
-                    state.codes,
-                    state.scales,
-                    state.biases,
-                    state.group_size,
+        local_error: Exception | None = None
+        local_ok = route not in state.disabled_routes
+        if local_ok and validation_key not in state.validated_routes:
+            try:
+                values = torch.arange(
+                    m * state.input_size,
+                    device=state.codes.device,
+                    dtype=torch.int32,
                 )
-            else:
-                actual = sm70_ops.skinny_awq_gemm_qpn(
-                    x,
-                    state.qpn_codes,
-                    state.qpn_scales,
-                    state.qpn_biases,
-                    state.group_size,
-                    state.output_size,
+                x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(
+                    m, state.input_size
                 )
-            relative_error = _relative_error(actual, reference)
-            if not math.isfinite(relative_error) or relative_error > _SELF_CHECK_TOL:
-                raise RuntimeError(
-                    f"{route} relative error {relative_error:.3e} exceeds "
-                    f"{_SELF_CHECK_TOL:.3e}"
-                )
-            if envs.use_sm70_skinny_strict_check() and state.native is not None:
-                # The comparison above is circular: it checks Skinny against a
-                # backend that consumes the same checkpoint through similar
-                # unpack logic, so a shared misreading of the format passes.
-                # Compare against an independent FP32 dequant as well.
-                #
-                # Start from the checkpoint-native tensors rather than the
-                # Skinny buffers. That covers the prepack as well as the
-                # kernel, and - unlike reading state.codes - it works when the
-                # resident layout is QPN-only, where the SIMT buffers are
-                # deliberately empty.
-                truth = awq_native_fp32_reference(
-                    state.native[0],
-                    state.native[1],
-                    state.native[2],
-                    state.group_size,
-                    x,
-                )
-                stats = _error_stats(actual, truth)
-                logger.info(
-                    "SM70 Skinny AWQ %s FP32 ground truth N=%d K=%d: "
-                    "max_rel=%.3e rms=%.3e p50=%.3e p99=%.3e max_abs=%.3e",
+                reference = reference_apply(x)
+                if route == "simt":
+                    actual = sm70_ops.skinny_awq_gemm_simt(
+                        x,
+                        state.codes,
+                        state.scales,
+                        state.biases,
+                        state.group_size,
+                    )
+                else:
+                    actual = sm70_ops.skinny_awq_gemm_qpn(
+                        x,
+                        state.qpn_codes,
+                        state.qpn_scales,
+                        state.qpn_biases,
+                        state.group_size,
+                        state.output_size,
+                    )
+                relative_error = _relative_error(actual, reference)
+                if (
+                    not math.isfinite(relative_error)
+                    or relative_error > _SELF_CHECK_TOL
+                ):
+                    raise RuntimeError(
+                        f"{route} relative error {relative_error:.3e} exceeds "
+                        f"{_SELF_CHECK_TOL:.3e}"
+                    )
+                if envs.use_sm70_skinny_strict_check() and state.native is not None:
+                    # Start from checkpoint-native tensors so the independent
+                    # reference also covers the prepack.
+                    truth = awq_native_fp32_reference(
+                        state.native[0],
+                        state.native[1],
+                        state.native[2],
+                        state.group_size,
+                        x,
+                    )
+                    stats = _error_stats(actual, truth)
+                    logger.info(
+                        "SM70 Skinny AWQ %s FP32 ground truth N=%d K=%d: "
+                        "max_rel=%.3e rms=%.3e p50=%.3e p99=%.3e max_abs=%.3e",
+                        route,
+                        state.output_size,
+                        state.input_size,
+                        stats["max_rel"],
+                        stats["rms"],
+                        stats["p50"],
+                        stats["p99"],
+                        stats["max_abs"],
+                    )
+                    if (
+                        not math.isfinite(stats["max_rel"])
+                        or stats["max_rel"] > _SELF_CHECK_TOL
+                    ):
+                        raise RuntimeError(
+                            f"{route} FP32 ground-truth relative error "
+                            f"{stats['max_rel']:.3e} exceeds {_SELF_CHECK_TOL:.3e}"
+                        )
+            except Exception as exc:
+                local_ok = False
+                local_error = exc
+                logger.exception(
+                    "SM70 Skinny AWQ %s local self-check failed for N=%d K=%d "
+                    "against base=%s.",
                     route,
                     state.output_size,
                     state.input_size,
-                    stats["max_rel"],
-                    stats["rms"],
-                    stats["p50"],
-                    stats["p99"],
-                    stats["max_abs"],
+                    base_backend,
                 )
-                if (
-                    not math.isfinite(stats["max_rel"])
-                    or stats["max_rel"] > _SELF_CHECK_TOL
-                ):
-                    raise RuntimeError(
-                        f"{route} FP32 ground-truth relative error "
-                        f"{stats['max_rel']:.3e} exceeds {_SELF_CHECK_TOL:.3e}"
-                    )
-        except Exception:
-            state.disabled_routes.add(route)
-            logger.exception(
-                "SM70 Skinny AWQ %s self-check failed for N=%d K=%d "
-                "against base=%s; disabling only this route.",
-                route,
-                state.output_size,
-                state.input_size,
-                base_backend,
-            )
+
+        if not _all_ranks_succeeded(local_ok):
+            _release_awq_route(state, route)
+            if local_error is None:
+                logger.error(
+                    "SM70 Skinny AWQ %s self-check failed on another TP rank "
+                    "for N=%d K=%d; disabling this route on every rank.",
+                    route,
+                    state.output_size,
+                    state.input_size,
+                )
+            if envs.get_sm70_skinny_mode() == "on":
+                raise RuntimeError(
+                    "VLLM_SM70_SKINNY=on requires the AWQ "
+                    f"{route} self-check to pass on every TP rank."
+                ) from local_error
             continue
         state.validated_routes.add(validation_key)
         logger.info_once(
@@ -846,7 +906,7 @@ class _ResidencyDecision:
     keep: bool
 
 
-_residency_decisions: dict[tuple[int, int], _ResidencyDecision] = {}
+_residency_decisions: dict[tuple[int, int, str], _ResidencyDecision] = {}
 
 
 # Volta's L2 is 6 MiB; 24 MiB of dirty traffic evicts it comfortably.
@@ -884,16 +944,16 @@ def _time_apply(
     so the measurement reflects a cold weight stream rather than a hot loop.
     """
     if device is None:
-        device = torch.cuda.current_device()
+        device = torch.accelerator.current_device_index()
     for _ in range(3):
         fn()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     samples: list[float] = []
     for _ in range(iterations):
         _flush_l2(
             torch.device(device) if not isinstance(device, torch.device) else device
         )
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         stop = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -905,34 +965,69 @@ def _time_apply(
     return samples[len(samples) // 2]
 
 
-def _agree_across_tp(value: float) -> float:
-    """Reduce a per-rank measurement to one value shared by the whole TP group.
+def _agree_across_tp(value: float | None) -> float | None:
+    """Reduce a valid per-rank measurement across the whole TP group.
 
     Each rank runs its own timing, so without this the four ranks of a TP4
     deployment can reach different keep/drop verdicts on the same shape when
     their measurements straddle the threshold. That would leave inconsistent
     memory per card while the slowest rank still sets decode speed.
 
-    Take the minimum: decode waits for the slowest rank, so the least
-    optimistic measurement is the one that describes the deployment.
+    Every rank must call this for every candidate route, including after a
+    local timing failure. The first tensor element is therefore a validity bit;
+    if any rank failed, all ranks receive ``None`` and keep the base fallback.
+    For valid measurements take the minimum: decode waits for the slowest rank,
+    so the least optimistic saving describes the deployment.
     """
+    valid = value is not None and math.isfinite(value)
+    local_value = value if valid else 0.0
     try:
         from vllm.distributed import get_tp_group
 
         group = get_tp_group()
         if group is None or group.world_size <= 1:
-            return value
+            return local_value if valid else None
         tensor = torch.tensor(
-            [value], dtype=torch.float64, device=torch.cuda.current_device()
+            [1.0 if valid else 0.0, local_value],
+            dtype=torch.float64,
+            device=torch.accelerator.current_device_index(),
         )
         torch.distributed.all_reduce(
             tensor, op=torch.distributed.ReduceOp.MIN, group=group.device_group
         )
-        return float(tensor.item())
+        if tensor[0].item() < 1.0:
+            return None
+        return float(tensor[1].item())
     except Exception:
         # No TP group yet, or a backend that cannot reduce here: fall back to
         # the local value rather than failing the load.
-        return value
+        logger.warning_once(
+            "SM70 Skinny TP consensus is unavailable during model load; "
+            "using the local route decision."
+        )
+        return local_value if valid else None
+
+
+def _all_ranks_succeeded(local_ok: bool) -> bool:
+    """Return true only when every TP rank reached the same successful point."""
+    return _agree_across_tp(0.0 if local_ok else None) is not None
+
+
+def _release_awq_route(state: SM70SkinnyAwqState, route: str) -> None:
+    """Release a disabled AWQ layout immediately instead of retaining dead VRAM."""
+    empty_codes = state.codes.new_empty(0)
+    empty_meta = state.scales.new_empty(0)
+    if route == "simt":
+        state.codes = empty_codes
+        state.scales = empty_meta
+        state.biases = empty_meta
+    elif route == "qpn":
+        state.qpn_codes = empty_codes
+        state.qpn_scales = empty_meta
+        state.qpn_biases = empty_meta
+    else:
+        raise ValueError(f"Unknown SM70 Skinny AWQ route {route!r}.")
+    state.disabled_routes.add(route)
 
 
 def overlay_mib(output_size: int, input_size: int, layouts: int = 1) -> float:
@@ -977,22 +1072,31 @@ def _measure_route_roi(
                 state.output_size,
             )
 
+    local_saved: float | None = None
     try:
         base_us = _time_apply(lambda: reference_apply(x), device=device)
         skinny_us = _time_apply(skinny, device=device)
+        local_saved = base_us - skinny_us
     except Exception:
-        # Never let a timing failure cost correctness: report None so the
-        # caller keeps the route and lets the self-check own validity.
         logger.exception(
-            "SM70 Skinny AWQ %s residency measurement failed for N=%d K=%d; "
-            "keeping the overlay.",
+            "SM70 Skinny AWQ %s local residency measurement failed for N=%d K=%d.",
+            route,
+            state.output_size,
+            state.input_size,
+        )
+
+    # Participate even after a local timing failure. Otherwise healthy peers
+    # enter all_reduce while this rank skips it and model load deadlocks.
+    saved = _agree_across_tp(local_saved)
+    if saved is None:
+        logger.warning_once(
+            "SM70 Skinny AWQ %s residency measurement failed on at least one "
+            "TP rank for N=%d K=%d; keeping the overlay on every rank.",
             route,
             state.output_size,
             state.input_size,
         )
         return None
-
-    saved = _agree_across_tp(base_us - skinny_us)
     mib = overlay_mib(state.output_size, state.input_size)
     roi = saved / mib if mib > 0 else 0.0
     decision = _ResidencyDecision(
@@ -1040,6 +1144,9 @@ def apply_residency_policy(
 
     Returns True while any Skinny route is still resident.
     """
+    for disabled_route in tuple(state.disabled_routes):
+        _release_awq_route(state, disabled_route)
+
     routes = []
     if state.has_simt and "simt" not in state.disabled_routes:
         routes.append("simt")
@@ -1048,27 +1155,28 @@ def apply_residency_policy(
     if not routes:
         return False
 
+    if envs.get_sm70_skinny_mode() == "on":
+        logger.info_once(
+            "VLLM_SM70_SKINNY=on keeps every self-check-passing AWQ route; "
+            "the performance residency gate is bypassed."
+        )
+        return True
+
     for route in routes:
         key = (state.output_size, state.input_size, route)
         decision = _residency_decisions.get(key)
-        if decision is None:
+        # A cache miss must also be agreed across TP. If one process reused a
+        # cached result while another entered the timing collective, load would
+        # deadlock. A mixed cache state makes every rank remeasure.
+        if not _all_ranks_succeeded(decision is not None):
             decision = _measure_route_roi(state, reference_apply, route)
             if decision is None:
                 continue  # measurement failed; keep this route
             _residency_decisions[key] = decision
+        assert decision is not None
         if decision.keep:
             continue
-        empty_codes = state.codes.new_empty(0)
-        empty_meta = state.scales.new_empty(0)
-        if route == "simt":
-            state.codes = empty_codes
-            state.scales = empty_meta
-            state.biases = empty_meta
-        else:
-            state.qpn_codes = empty_codes
-            state.qpn_scales = empty_meta
-            state.qpn_biases = empty_meta
-        state.disabled_routes.add(route)
+        _release_awq_route(state, route)
 
     return state.has_simt or state.has_qpn
 
@@ -1085,7 +1193,7 @@ def log_residency_summary() -> None:
         f"{'keep' if d.keep else 'drop'}"
         for key, d in sorted(_residency_decisions.items(), key=lambda kv: -kv[1].roi)
     ]
-    logger.info(
+    logger.info_once(
         "SM70 Skinny AWQ residency summary (per distinct shape, per layer "
         "instance; threshold VLLM_SM70_SKINNY_MIN_ROI=%.3f):\n%s\n"
         "  kept %.1f MiB/layer-set, dropped %.1f MiB/layer-set",

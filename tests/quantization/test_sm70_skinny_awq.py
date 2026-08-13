@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm import _sm70_ops, envs
@@ -118,6 +119,14 @@ def test_prepare_awq_state_respects_resident_layout(monkeypatch):
     both = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
     assert both.has_simt
     assert both.has_qpn
+
+
+def test_qpn_split_geometry_matches_cuda_policy_for_real_awq_shapes():
+    assert sm70_skinny.qpn_k_splits(1536, 5120) == 1
+    assert sm70_skinny.qpn_k_splits(4352, 5120) == 1
+    assert sm70_skinny.qpn_k_splits(5120, 8704) == 1
+    assert sm70_skinny.qpn_k_splits(5120, 4096) == 2
+    assert sm70_skinny.qpn_k_splits(5120, 1792) == 4
 
 
 def test_prepare_awq_moe_bank_is_one_n_major_layout():
@@ -322,8 +331,32 @@ def test_awq_self_check_disables_only_failing_route(monkeypatch):
     )
 
     assert state.disabled_routes == {"simt"}
+    assert state.codes.numel() == 0
+    assert state.scales.numel() == 0
+    assert state.biases.numel() == 0
     assert sm70_skinny.select_awq_route(state, 1) is None
     assert sm70_skinny.select_awq_route(state, 8) == "qpn"
+
+
+def test_awq_force_on_fails_closed_on_self_check_error(monkeypatch):
+    qweight, scales, qzeros = _native_awq(32, 128)
+    monkeypatch.setenv("VLLM_SM70_SKINNY", "on")
+    monkeypatch.setenv("VLLM_SM70_SKINNY_AWQ_LAYOUT", "simt")
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+    monkeypatch.setattr(
+        _sm70_ops,
+        "skinny_awq_gemm_simt",
+        lambda x, *_: torch.full((x.shape[0], 32), 100.0, dtype=x.dtype),
+    )
+
+    with pytest.raises(RuntimeError, match="requires the AWQ simt self-check"):
+        sm70_skinny.validate_awq_state(
+            state,
+            lambda x: torch.zeros((x.shape[0], 32), dtype=x.dtype),
+            "fake-base",
+        )
+
+    assert state.codes.numel() == 0
 
 
 def test_awq_fp32_reference_matches_elementwise_dequant():
@@ -406,6 +439,39 @@ def test_residency_policy_keeps_shape_that_earns_its_memory(monkeypatch):
     assert sm70_skinny.apply_residency_policy(state, lambda x: x) is True
     assert state.codes.numel() != 0
     assert state.disabled_routes == set()
+
+
+def test_force_on_bypasses_performance_residency_gate(monkeypatch):
+    qweight, scales, qzeros = _native_awq(32, 128)
+    monkeypatch.setenv("VLLM_SM70_SKINNY", "on")
+    monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "999")
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+    monkeypatch.setattr(
+        sm70_skinny,
+        "_time_apply",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("force-on must not run the performance gate")
+        ),
+    )
+
+    assert sm70_skinny.apply_residency_policy(state, lambda x: x) is True
+    assert state.has_simt
+
+
+def test_tp_consensus_propagates_a_peer_failure(monkeypatch):
+    import vllm.distributed
+
+    group = SimpleNamespace(world_size=4, device_group=object())
+    monkeypatch.setattr(vllm.distributed, "get_tp_group", lambda: group)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: "cpu")
+
+    def peer_failed(tensor, op, group):
+        del op, group
+        assert tensor.tolist() == [1.0, 12.5]
+        tensor[0] = 0.0
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", peer_failed)
+    assert sm70_skinny._agree_across_tp(12.5) is None
 
 
 def test_residency_decision_is_cached_per_shape(monkeypatch):

@@ -13,14 +13,15 @@ with the workspace on `/mnt/llm_hfs` (CT252's root filesystem is still at 96%).
 48 targets, 10m10s wall on 32 jobs.
 
 - `_C.abi3.so` SHA-256
-  `fad4b2997fe8201253b10d48331a13a4e85e2cb82c7d0434d95e18464f89880f`
-  (43,960,168 bytes). Note this is an `_C`-target-only build, so it is not
+  `460cb522f6d57ccfcf81e539f88be8673b92d1b74a8d0b9f00d44225c4b908ac`
+  (43,951,976 bytes). This is the post-`__ldcs`-revert `_C`-target-only build,
+  so it is not
   comparable to a full release artifact's hash.
 - All five skinny ops register: `skinny_awq_gemm_simt`, `skinny_awq_gemm_qpn`,
   `skinny_awq_moe_gemm_simt_out`, `skinny_nvfp4_gemm_simt`,
   `skinny_nvfp4_gemm_qpn`.
 - GPU operator tests: **5 passed**.
-- CPU tests run against the real build: **35 passed**.
+- CPU tests run against the real build: **43 passed**.
 
 Split-K, CUDA Graph and MoE verification on the same build
 (`verify_splitk.py`, N=1792 K=5120 -> 4 splits):
@@ -47,8 +48,8 @@ Standalone kernel harness on the same host, see
 
 Host-side, on the dev box:
 
-- 35 CPU tests pass, including new ones that validate the FP32 references
-  against an explicit per-element walk of the packed bytes.
+- 43 CPU tests pass, including the FP32-reference, TP-consensus, fail-closed,
+  route-buffer release, and split-geometry policy checks.
 - `ruff check` / `ruff format` clean on every touched file; `clang-format`
   applied to all CUDA sources; `compileall` and `git diff --check` clean.
 
@@ -82,12 +83,12 @@ What this establishes:
 - **The ROI gate returns 1.93 GiB/card** (2.86 -> 0.93) for 4.2% of decode
   (68.73 -> 65.83). It keeps 72% of the overlay's benefit for 33% of its
   memory.
-- **This branch's kernels are level with the baseline on this workload**:
+- **This branch's M=1 kernel changes are level with the baseline on this
+  workload**:
   68.73 vs 68.56, i.e. +0.25%, inside noise. That is the expected result and
   not a disappointment: the workload is single-request with no MTP, so M is
-  always 1 and the split-K QPN path never executes. Its 1.9-2.5x applies to
-  MTP and multi-sequence decode, which this A/B does not exercise and which
-  remains unmeasured end to end.
+  always 1 and the split-K QPN path never executes. The separate batched gate
+  below establishes that QPN does not help this checkpoint end to end either.
 - **`__ldcs` was reverted.** It scored +6-21% in the standalone harness and
   measured 1.3% *slower* here (67.84 vs 68.73). See that commit; the general
   lesson is recorded in the harness README.
@@ -182,6 +183,35 @@ against the earlier overlay did not reproduce in this configuration (no MTP, no
 multimodal, `max_num_seqs=3`). The KV gain at 0.90 was still real: 1,302,288
 tokens gated versus 1,178,881 full.
 
+## NVFP4 + MTP3 regression after split-K closeout
+
+The post-`__ldcs`-revert `_C` above was exercised with the real
+`OptimizeLLM/Qwen3.5-122B-A10B-heretic-MTP-NVFP4` checkpoint, TP4, native
+MTP3, FP8 KV, original TileLang 0.1.10 prefill, and full CUDA Graph capture.
+`VLLM_SM70_QUANT_BACKEND=skinny` intentionally selected the compatibility
+alias (`base=auto`, `skinny=on`), so correctness self-checks ran while the
+performance residency gate was bypassed.
+
+The loader reported the actual QPN geometry once per shape:
+
+| shape | split-K |
+| --- | ---: |
+| N=512 K=3072 | 8 |
+| N=3072 K=256 | 1 (inactive) |
+| N=4608 K=3072 | 2 |
+| N=3072 K=2048 | 2 |
+
+All SIMT and QPN self-checks passed against the selected TurboMind Dense base;
+the MoE layers independently selected Marlin. Graph capture exercised QPN at
+M=4, 8 and 12 and SIMT at M=1. A fixed 4040-to-256 request completed at
+3610.06 prefill tok/s and 78.03 decode tok/s, with 19.65 GiB reported model
+residency per GPU, 6.95 GiB available KV cache, and 226,789 KV tokens at
+`gpu_memory_utilization=0.90`. Fatal-log scan was empty. This is a regression
+and integration gate, not a paired performance claim.
+
+Evidence:
+`/mnt/llm_hfs/skinny-closeout-20260813/logs/qwen35-122b-nvfp4-mtp3.log`.
+
 ## Fixed along the way
 
 `test_awq_overlay_dispatches_simt_qpn_then_delegates_base` fed CPU tensors to
@@ -194,13 +224,11 @@ executed on GPU hardware. It now follows the available device.
 
 ## Not yet verified
 
-1. **Residency policy on a real model.** Needs judgement rather than a
-   pass/fail — see below.
-2. **Full-model paired A/B** at the chosen threshold.
-3. **Concurrency.** The GPU gate is single-stream; concurrent requests sharing
-   the split-K workspace allocation have not been exercised.
-4. **A full release build.** Only the `_C` target was built here; `_moe_C` and
-   friends were reused from the existing image.
+1. **A full release build.** Only the `_C` target was rebuilt here; `_moe_C`
+   and friends were reused from the existing image.
+2. **Model-general policy.** The measured AWQ residency threshold and negative
+   QPN result apply to this Qwen3.6-27B checkpoint on TP4. A different TP degree
+   or quantized-shape set must re-run the logged geometry and paired A/B gates.
 
 ## Calibrating the residency threshold
 
@@ -208,9 +236,14 @@ executed on GPU hardware. It now follows the available device.
 of 0.0 keeps any shape with a measurable win, which is conservative and will
 not by itself hit a memory target.
 
+For the frozen Qwen3.6-27B AWQ TP4 profile above, `MIN_ROI=1.0` is the measured
+memory-oriented setting: 0.93 rather than 2.86 GiB/card of overlay, for 65.83
+rather than 68.73 decode tok/s. It is a deployment profile, not a universal
+default for other models or TP degrees.
+
 The intended workflow is to run once and read the table the loader logs:
 
-```
+```text
 SM70 Skinny AWQ residency summary (per distinct shape, per layer instance; ...)
   N=  5120 K=  1280  roi=   0.443us/MiB  saved=    1.4us  overlay=     3.2MiB  keep
   N=  5120 K=  4352  roi=   0.352us/MiB  saved=    3.8us  overlay=    10.8MiB  keep

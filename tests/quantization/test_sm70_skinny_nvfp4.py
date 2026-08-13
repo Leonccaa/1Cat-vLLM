@@ -314,3 +314,21 @@ def test_nvfp4_fp32_reference_chunking_is_transparent():
     whole = skinny.nvfp4_fp32_reference(codes, scales, 0.5, x, chunk=n)
     chunked = skinny.nvfp4_fp32_reference(codes, scales, 0.5, x, chunk=5)
     torch.testing.assert_close(whole, chunked)
+
+
+def test_nvfp4_release_route_frees_disabled_layout():
+    codes, scales, qcodes, qscales = _native_buffers(32, 128)
+    layer = SimpleNamespace(
+        skinny_codes=torch.nn.Parameter(codes, requires_grad=False),
+        skinny_scales=torch.nn.Parameter(scales, requires_grad=False),
+        skinny_qpn_codes=torch.nn.Parameter(qcodes, requires_grad=False),
+        skinny_qpn_scales=torch.nn.Parameter(qscales, requires_grad=False),
+        skinny_disabled_routes=set(),
+    )
+
+    skinny._release_route(layer, "simt")
+
+    assert layer.skinny_codes.numel() == 0
+    assert layer.skinny_scales.numel() == 0
+    assert layer.skinny_qpn_codes.numel() != 0
+    assert layer.skinny_disabled_routes == {"simt"}
