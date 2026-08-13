@@ -17,13 +17,20 @@ namespace vllm::sm70_skinny {
 // A segment is deliberately fixed at 16 K values. Both NVFP4 group-16 and
 // AWQ group-128 can stream through this core; only metadata cadence and the
 // register decoder differ.
-template <typename FormatPolicy, int M, int KC, int RowsPerWarp = 1,
-          bool Argmax = false>
+//
+// The full-chunk loop and the tail loop below repeat the same accumulation
+// body. That duplication is deliberate and was re-introduced after measuring:
+// factoring it into a __forceinline__ helper taking `float (&)[RowsPerWarp][M]`
+// by reference costs 10-14% on V100 (gate_up N=8704 K=5120 went 0.86x), because
+// the accumulator array stops living in registers. Merging the two loops into
+// one runtime-bounded loop costs a further 5-15% by losing the compile-time
+// trip count that lets ptxas software-pipeline the weight loads. Keep them
+// separate; if you edit one body, edit both.
+template <typename FormatPolicy, int M, int KC, int RowsPerWarp = 1>
 __global__ void simt_kernel(typename FormatPolicy::Params params,
                             const half* __restrict__ input,
                             half* __restrict__ output, int output_size,
-                            int input_size, half* __restrict__ block_values,
-                            int* __restrict__ block_indices) {
+                            int input_size) {
   static_assert(FormatPolicy::kSegmentK == 16,
                 "SM70 Skinny SIMT core requires K16 decode segments.");
   extern __shared__ char shared_raw[];
@@ -177,53 +184,38 @@ __global__ void simt_kernel(typename FormatPolicy::Params params,
     }
   }
 
-  if constexpr (!Argmax) {
 #pragma unroll
-    for (int row = 0; row < RowsPerWarp; ++row) {
+  for (int row = 0; row < RowsPerWarp; ++row) {
 #pragma unroll
-      for (int m = 0; m < M; ++m) {
-        const float value = warp_sum(accumulator[row][m]);
-        if (lane == 0) {
-          output[static_cast<size_t>(m) * output_size + output_col + row] =
-              __float2half(value);
-        }
-      }
-    }
-  } else {
-    static_assert(M == 1, "fused argmax supports exact M=1");
-    __shared__ half warp_value[8];
-    __shared__ int warp_index[8];
-    half best_value = __float2half(-3.0e38f);
-    int best_index = -1;
-#pragma unroll
-    for (int row = 0; row < RowsPerWarp; ++row) {
-      const float value = warp_sum(accumulator[row][0]);
+    for (int m = 0; m < M; ++m) {
+      const float value = warp_sum(accumulator[row][m]);
       if (lane == 0) {
-        const half rounded = __float2half(value);
-        if (__hgt(rounded, best_value)) {
-          best_value = rounded;
-          best_index = output_col + row;
-        }
+        output[static_cast<size_t>(m) * output_size + output_col + row] =
+            __float2half(value);
       }
     }
-    if (lane == 0) {
-      warp_value[warp] = best_value;
-      warp_index[warp] = best_index;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      half block_best = warp_value[0];
-      int block_index = warp_index[0];
-#pragma unroll
-      for (int other_warp = 1; other_warp < 8; ++other_warp) {
-        if (__hgt(warp_value[other_warp], block_best)) {
-          block_best = warp_value[other_warp];
-          block_index = warp_index[other_warp];
-        }
-      }
-      block_values[blockIdx.x] = block_best;
-      block_indices[blockIdx.x] = block_index;
-    }
+  }
+}
+
+// Shared memory the SIMT kernel needs for its activation staging buffer.
+inline int simt_shared_bytes(int rows, int chunk_k) {
+  return rows * (chunk_k / 2) * static_cast<int>(sizeof(half2));
+}
+
+// Resolves the RowsPerWarp template argument at the host boundary so the
+// launchers stay free of nested macros.
+template <typename FormatPolicy, int M, int KC>
+void launch_simt_kernel(typename FormatPolicy::Params params, const half* input,
+                        half* output, int output_size, int input_size,
+                        bool two_rows, int shared_bytes, cudaStream_t stream) {
+  const dim3 grid(two_rows ? output_size / 16 : output_size / 8);
+  const dim3 block(256);
+  if (two_rows) {
+    simt_kernel<FormatPolicy, M, KC, 2><<<grid, block, shared_bytes, stream>>>(
+        params, input, output, output_size, input_size);
+  } else {
+    simt_kernel<FormatPolicy, M, KC, 1><<<grid, block, shared_bytes, stream>>>(
+        params, input, output, output_size, input_size);
   }
 }
 
@@ -247,13 +239,24 @@ __global__ void moe_simt_kernel(typename FormatPolicy::Params base_params,
   if (row >= rows) {
     return;
   }
-  const int expert = expert_ids[row];
-  if (expert < 0 || expert >= num_experts) {
-    return;
-  }
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int output_col = static_cast<int>(blockIdx.x) * 8 + warp;
+
+  // An out-of-range expert id must still leave the output defined. Callers
+  // reuse a persistent output buffer across steps, so simply returning here
+  // would surface the previous step's values as if they were this step's
+  // result - worse than uninitialized memory, because it looks plausible.
+  // Write an explicit zero instead.
+  const int expert = expert_ids[row];
+  if (expert < 0 || expert >= num_experts) {
+    if (lane == 0) {
+      output[static_cast<size_t>(row) * output_size + output_col] =
+          __float2half(0.0f);
+    }
+    return;
+  }
+
   auto params = base_params;
   FormatPolicy::select_expert(params, expert, output_size, input_size);
   const auto thread_state = FormatPolicy::make_thread_state(params);

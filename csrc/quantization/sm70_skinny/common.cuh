@@ -11,13 +11,33 @@ namespace vllm::sm70_skinny {
 
 #define SM70_SKINNY_INLINE __device__ __forceinline__
 
+// XOR swizzle for the staged-activation buffer. This is load-bearing, not
+// cosmetic: without it the SIMT inner loop takes a 4-way shared-memory bank
+// conflict on every access.
+//
+// In simt_kernel a warp's lanes map to segments `segment = lane + 32 * iter`,
+// and for a fixed (word, pair) every lane reads
+//     base = segment * 8 + c,  c = word * 4 + pair in [0, 8)
+// Unswizzled, bank = base % 32 = (segment * 8 + c) % 32 takes only 8 distinct
+// values across the 32 lanes -> 4-way conflict.
+//
+// The swizzle rewrites only the low three bits, XORing them with bits [7:5] of
+// `base`, which for this access pattern is `segment >> 2`:
+//     idx  = (segment * 8) | ((c ^ (segment >> 2)) & 7)
+//     bank = (segment % 4) * 8 + ((c ^ (segment >> 2)) & 7)
+// For each of the 4 values of `segment % 4`, the 8 lanes sharing it have
+// `segment >> 2` = 0..7, so `c ^ (segment >> 2)` sweeps all of 0..7. The 32
+// lanes therefore cover all 32 banks exactly once -> conflict free.
+//
+// The rewrite stays inside each aligned group of 8 half2, so both the staging
+// side and the consuming side can apply it independently to the same index and
+// agree, without any extra bookkeeping.
 SM70_SKINNY_INLINE int swizzle_pair_index(int pair) {
   return (pair & ~7) | ((pair ^ (pair >> 5)) & 7);
 }
 
 // Stage eight contiguous FP16 activations in the pairing consumed by the
-// register decoders: (k, k+4), (k+1, k+5), ... . Format policies whose
-// decoder emits adjacent pairs can select stage_adjacent_pairs instead.
+// register decoders: (k, k+4), (k+1, k+5), ... .
 SM70_SKINNY_INLINE void stage_interleaved_pairs(half2* dst, int base_pair,
                                                 const uint4& value) {
   const unsigned* words = reinterpret_cast<const unsigned*>(&value);
@@ -31,15 +51,6 @@ SM70_SKINNY_INLINE void stage_interleaved_pairs(half2* dst, int base_pair,
   for (int index = 0; index < 4; ++index) {
     dst[swizzle_pair_index(base_pair + index)] =
         *reinterpret_cast<const half2*>(&reordered[index]);
-  }
-}
-
-SM70_SKINNY_INLINE void stage_adjacent_pairs(half2* dst, int base_pair,
-                                             const uint4& value) {
-  const half2* pairs = reinterpret_cast<const half2*>(&value);
-#pragma unroll
-  for (int index = 0; index < 4; ++index) {
-    dst[swizzle_pair_index(base_pair + index)] = pairs[index];
   }
 }
 

@@ -7,6 +7,15 @@
 
 namespace vllm::sm70_skinny {
 
+// E4M3 -> FP16 by field re-alignment plus a 2^8 exponent-bias correction
+// (E4M3 bias 7, FP16 bias 15). Subnormal E4M3 inputs land on FP16 subnormals
+// and come out exact.
+//
+// Known limitation: this is a pure bit shuffle with no special-case handling,
+// so the E4M3 NaN encodings 0x7F/0xFF decode to the finite value +-480 instead
+// of propagating NaN. A corrupt scale byte therefore yields wrong numbers
+// rather than an obvious NaN. Detecting that belongs in the load-time
+// self-check, not in this inner-loop helper.
 SM70_SKINNY_INLINE half2 fp8e4m3_to_half2(unsigned char value) {
   const unsigned short bits = (((unsigned short)value & 0x80u) << 8) |
                               (((unsigned short)value & 0x7fu) << 7);
@@ -32,19 +41,6 @@ SM70_SKINNY_INLINE void decode_nvfp4_tm(unsigned packed, half2 scale,
   output[3] = __hmul2(*reinterpret_cast<half2*>(&value3), scale);
 }
 
-SM70_SKINNY_INLINE half2 decode_nvfp4_lut(unsigned packed, int pair,
-                                          half2 scale) {
-  constexpr unsigned kLutLow = 0x3e3c3800u;
-  constexpr unsigned kLutHigh = 0x46444240u;
-  const unsigned magnitude = (packed & 0x77777777u) >> (8 * pair);
-  const unsigned sign = (packed & 0x88888888u) >> (8 * pair);
-  const unsigned selector =
-      ((magnitude & 0x7u) << 4) | ((magnitude & 0x70u) << 8);
-  unsigned halves = __byte_perm(kLutLow, kLutHigh, selector);
-  halves |= ((sign & 0x8u) << 12) | ((sign & 0x80u) << 24);
-  return __hmul2(*reinterpret_cast<half2*>(&halves), scale);
-}
-
 struct Nvfp4SimtPolicy {
   static constexpr int kSegmentK = 16;
 
@@ -64,22 +60,22 @@ struct Nvfp4SimtPolicy {
     half2 scale;
   };
 
+  // decode_nvfp4_tm leaves the E2M1 magnitude in FP16 bits [11:9], i.e. the
+  // true value scaled by 2^-14. The compensating 16384 is folded into the
+  // thread-resident global scale so the inner loop stays two ALU ops per pair.
+  //
+  // Range contract: the compensated group scale must stay inside FP16, so
+  // `fp8_scale * global_scale < 65504 / 16384 ~= 4.0`. Since the largest E2M1
+  // code is 6, that bounds representable weights at |w| < 24, far above any
+  // real checkpoint. skinny_nvfp4_gemm_* checks this at launch.
   SM70_SKINNY_INLINE static ThreadState make_thread_state(
       const Params& params) {
-#ifdef SKINNY_LUT_CVT
-    return {__float2half2_rn(params.global_scale)};
-#else
     return {__float2half2_rn(params.global_scale * 16384.0f)};
-#endif
   }
 
   SM70_SKINNY_INLINE static void stage_pairs(half2* destination, int base_pair,
                                              const uint4& value) {
-#ifdef SKINNY_LUT_CVT
-    stage_adjacent_pairs(destination, base_pair, value);
-#else
     stage_interleaved_pairs(destination, base_pair, value);
-#endif
   }
 
   SM70_SKINNY_INLINE static void load_segment(const Params& params,
@@ -91,22 +87,19 @@ struct Nvfp4SimtPolicy {
     const uint8_t* scale_row =
         params.scales +
         static_cast<size_t>(output_col) * (params.input_size / kSegmentK);
-    segment.codes = *reinterpret_cast<const uint2*>(code_row + absolute_k / 2);
-    segment.scale = __hmul2(fp8e4m3_to_half2(scale_row[absolute_k / kSegmentK]),
-                            state.global_scale);
+    // See AwqG128SimtPolicy::load_segment for why codes stream with __ldcs
+    // while metadata takes the normal read-only path.
+    segment.codes =
+        __ldcs(reinterpret_cast<const uint2*>(code_row + absolute_k / 2));
+    segment.scale =
+        __hmul2(fp8e4m3_to_half2(__ldg(scale_row + absolute_k / kSegmentK)),
+                state.global_scale);
   }
 
   SM70_SKINNY_INLINE static void decode_word(const Segment& segment, int word,
                                              half2 output[4]) {
     const unsigned packed = word == 0 ? segment.codes.x : segment.codes.y;
-#ifdef SKINNY_LUT_CVT
-  #pragma unroll
-    for (int pair = 0; pair < 4; ++pair) {
-      output[pair] = decode_nvfp4_lut(packed, pair, segment.scale);
-    }
-#else
     decode_nvfp4_tm(packed, segment.scale, output);
-#endif
   }
 };
 

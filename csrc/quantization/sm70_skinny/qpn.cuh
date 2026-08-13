@@ -11,23 +11,44 @@ namespace vllm::sm70_skinny {
 // Quadpair-N core for M=4..16. FormatPolicy supplies one already-prepacked
 // K16/N32 B fragment; the core owns activation reuse, Volta mma.m8n8k4,
 // four-warp K partitioning, and the sole cross-warp reduction barrier.
-template <typename FormatPolicy, int MT>
+//
+// Launch geometry note. One block owns one N32 tile across the whole of K, so
+// without KSplits the grid is exactly N/32 blocks of 128 threads regardless of
+// K. For the per-rank N that TP4 decode actually produces (roughly 1k..4k)
+// that is 32..128 blocks on an 80-SM V100 - at the low end more than half the
+// SMs never receive work, and there are nowhere near enough concurrent loads
+// in flight to reach the HBM roof. SIMT does not have this problem because its
+// grid is N/8 blocks of 256 threads, i.e. 8x the threads for the same N.
+//
+// KSplits fixes that by also partitioning K across blocks: grid becomes
+// (N/32, KSplits) and each block accumulates its own K slice. KSplits == 1
+// keeps the original single-pass behaviour and writes FP16 directly; KSplits
+// > 1 writes FP32 partials that qpn_reduce_kernel sums in a fixed split order,
+// so the result stays deterministic.
+template <typename FormatPolicy, int MT, typename OutT, bool Split>
 __global__ void qpn_kernel(typename FormatPolicy::Params params,
                            const half* __restrict__ input,
-                           half* __restrict__ output, int output_size,
-                           int input_size, int rows) {
+                           OutT* __restrict__ output, int output_size,
+                           int input_size, int rows, int k_splits) {
   constexpr int kWarps = 4;
   __shared__ float partials[kWarps][MT * 256];
 
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const int tile = blockIdx.x;
+  const int split = Split ? blockIdx.y : 0;
   const int quadpair = (lane >> 2) & 3;
   const int local_row =
       (lane & 3) + ((lane & 16) ? 4 : 0);  // A row and B local column
   const int group_count = input_size / 16;
-  const int groups_per_warp = group_count / kWarps;
-  const int first_group = warp * groups_per_warp;
+  // The launcher guarantees group_count % (kWarps * k_splits) == 0, so every
+  // warp of every split gets the same number of K16 groups and no group is
+  // silently dropped. With Split=false the compiler sees k_splits==1 and drops
+  // the extra integer division from the prologue.
+  const int groups_per_split = Split ? group_count / k_splits : group_count;
+  const int groups_per_warp = groups_per_split / kWarps;
+  const int first_group =
+      (Split ? split * groups_per_split : 0) + warp * groups_per_warp;
   const auto thread_state = FormatPolicy::make_thread_state(params);
 
   float accumulator[MT][8];
@@ -83,10 +104,96 @@ __global__ void qpn_kernel(typename FormatPolicy::Params params,
     const int row = element >> 5;
     const int col = element & 31;
     if (row < rows) {
-      output[static_cast<size_t>(row) * output_size +
-             static_cast<size_t>(tile) * 32 + col] = __float2half(value);
+      const size_t offset = static_cast<size_t>(row) * output_size +
+                            static_cast<size_t>(tile) * 32 + col;
+      if constexpr (Split) {
+        output[static_cast<size_t>(split) * rows * output_size + offset] =
+            value;
+      } else {
+        output[offset] = __float2half(value);
+      }
     }
   }
+}
+
+// Deterministic fixed-order reduction of the KSplits > 1 FP32 partials.
+//
+// Templated purely for linkage: this header is included by both skinny_awq.cu
+// and skinny_nvfp4.cu, and a plain __global__ in a header would emit the same
+// strong symbol in both translation units.
+template <typename Accum>
+__global__ void qpn_reduce_kernel(const Accum* __restrict__ partials,
+                                  half* __restrict__ output, int rows,
+                                  int output_size, int k_splits) {
+  const size_t total = static_cast<size_t>(rows) * output_size;
+  const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  for (size_t index = blockIdx.x * blockDim.x + threadIdx.x; index < total;
+       index += stride) {
+    Accum sum = 0.0f;
+    for (int split = 0; split < k_splits; ++split) {
+      sum += partials[static_cast<size_t>(split) * total + index];
+    }
+    output[index] = __float2half(sum);
+  }
+}
+
+// Two blocks per SM on the 80-SM V100 PCIe parts these kernels target.
+constexpr int kQpnTargetBlocks = 160;
+
+// Runs the split-K pass and, when needed, the deterministic reduction.
+// `workspace` may be null when k_splits == 1.
+template <typename FormatPolicy, int MT>
+void launch_qpn_kernel(typename FormatPolicy::Params params, const half* input,
+                       half* output, float* workspace, int output_size,
+                       int input_size, int rows, int k_splits,
+                       cudaStream_t stream) {
+  const dim3 grid(output_size / 32, k_splits);
+  const dim3 block(128);
+  if (k_splits == 1) {
+    qpn_kernel<FormatPolicy, MT, half, false><<<grid, block, 0, stream>>>(
+        params, input, output, output_size, input_size, rows, 1);
+    return;
+  }
+  qpn_kernel<FormatPolicy, MT, float, true><<<grid, block, 0, stream>>>(
+      params, input, workspace, output_size, input_size, rows, k_splits);
+  const size_t total = static_cast<size_t>(rows) * output_size;
+  const int reduce_block = 256;
+  size_t reduce_grid = (total + reduce_block - 1) / reduce_block;
+  if (reduce_grid > 65535) {
+    reduce_grid = 65535;
+  }
+  qpn_reduce_kernel<float>
+      <<<static_cast<int>(reduce_grid), reduce_block, 0, stream>>>(
+          workspace, output, rows, output_size, k_splits);
+}
+
+// Smallest power-of-two K split that brings the block count up to
+// target_blocks, subject to two constraints: every warp of every split must
+// receive a whole number of K16 groups (otherwise groups are silently
+// dropped), and each warp must keep enough groups that the per-block shared
+// reduction and output write stay amortized.
+inline int qpn_choose_k_splits(int input_size, int output_size,
+                               int target_blocks) {
+  constexpr int kWarps = 4;
+  constexpr int kMinGroupsPerWarp = 4;
+  constexpr int kMaxSplits = 16;
+  const int group_count = input_size / 16;
+  const int tiles = output_size / 32;
+  int splits = 1;
+  while (splits < kMaxSplits) {
+    if (tiles * splits >= target_blocks) {
+      break;
+    }
+    const int next = splits * 2;
+    if (group_count % (kWarps * next) != 0) {
+      break;
+    }
+    if (group_count / (kWarps * next) < kMinGroupsPerWarp) {
+      break;
+    }
+    splits = next;
+  }
+  return splits;
 }
 
 }  // namespace vllm::sm70_skinny
