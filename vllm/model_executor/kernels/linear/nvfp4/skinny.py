@@ -4,13 +4,13 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 import torch
 from torch.nn.parameter import Parameter
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization import sm70_residency
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -444,17 +444,9 @@ def _error_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, floa
     }
 
 
-@dataclass
-class _ResidencyDecision:
-    """Per-(N, K) verdict on whether the overlay earns its VRAM."""
-
-    roi: float  # microseconds saved per MiB of overlay
-    mib: float
-    saved_us: float
-    keep: bool
-
-
-_residency_decisions: dict[tuple[int, int, str], _ResidencyDecision] = {}
+_residency_decisions: dict[
+    sm70_residency.ResidencyKey, sm70_residency.ResidencyDecision
+] = {}
 
 
 def _release_route(layer: torch.nn.Module, route: str) -> None:
@@ -513,10 +505,6 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
         return True, None
 
     def _validate_shape(self, layer: torch.nn.Module) -> None:
-        from vllm.model_executor.layers.quantization.sm70_skinny import (
-            _all_ranks_succeeded,
-        )
-
         n = layer.output_size_per_partition
         k = layer.input_size_per_partition
         native_codes = layer.skinny_codes
@@ -616,7 +604,9 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
                             type(self.base_kernel).__name__,
                         )
 
-            if not _all_ranks_succeeded(local_ok):
+            if not sm70_residency.all_ranks_succeeded(
+                local_ok, device=native_codes.device
+            ):
                 _release_route(layer, route)
                 if local_error is None:
                     message = (
@@ -709,15 +699,9 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
         SIMT and QPN are scored separately at the M each actually serves and
         charged only their own copy, because a shape can be worth keeping for
         decode and not for MTP verification, or the reverse. Timing is L2-cold
-        and reduced across the TP group so every rank agrees - see
-        sm70_skinny._time_apply and _agree_across_tp for why both matter.
+        and reduced across the TP group so every rank agrees. The format-neutral
+        measurement and consensus flow lives in ``sm70_residency``.
         """
-        from vllm.model_executor.layers.quantization.sm70_skinny import (
-            _agree_across_tp,
-            _all_ranks_succeeded,
-            _time_apply,
-        )
-
         n = layer.output_size_per_partition
         k = layer.input_size_per_partition
         per_layout_mib = n * k * 0.5625 / (1024.0 * 1024.0)
@@ -740,99 +724,57 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
             layer.skinny_enabled = False
             return False
 
-        if envs.get_sm70_skinny_mode() == "on":
-            logger.info_once(
-                "VLLM_SM70_SKINNY=on keeps every self-check-passing NVFP4 "
-                "route; the performance residency gate is bypassed."
-            )
-            return True
-
         device = layer.skinny_codes.device
-        for route in routes:
-            key = (n, k, route)
-            decision = _residency_decisions.get(key)
-            if not _all_ranks_succeeded(decision is not None):
-                rows = 1 if route == "simt" else 8
-                values = torch.arange(rows * k, device=device, dtype=torch.int32)
-                x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(rows, k)
-                if route == "simt":
 
-                    def skinny(x=x):
-                        return torch.ops._C.skinny_nvfp4_gemm_simt(
-                            x,
-                            layer.skinny_codes,
-                            layer.skinny_scales,
-                            layer.skinny_global_scale,
-                        )
+        def make_benchmark(route: str) -> sm70_residency.RouteBenchmark:
+            rows = 1 if route == "simt" else 8
+            values = torch.arange(rows * k, device=device, dtype=torch.int32)
+            x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(rows, k)
 
-                else:
+            def base_apply() -> torch.Tensor:
+                return self.base_kernel.apply_weights(layer, x)
 
-                    def skinny(x=x):
-                        return torch.ops._C.skinny_nvfp4_gemm_qpn(
-                            x,
-                            layer.skinny_qpn_codes,
-                            layer.skinny_qpn_scales,
-                            layer.skinny_global_scale,
-                            n,
-                        )
+            if route == "simt":
 
-                def base(x: torch.Tensor = x) -> torch.Tensor:
-                    return self.base_kernel.apply_weights(layer, x)
-
-                local_saved: float | None = None
-                try:
-                    base_us = _time_apply(base, device=device)
-                    skinny_us = _time_apply(skinny, device=device)
-                    local_saved = base_us - skinny_us
-                except Exception:
-                    logger.exception(
-                        "SM70 Skinny NVFP4 %s local residency measurement "
-                        "failed for N=%d K=%d.",
-                        route,
-                        n,
-                        k,
+                def skinny_apply() -> torch.Tensor:
+                    return torch.ops._C.skinny_nvfp4_gemm_simt(
+                        x,
+                        layer.skinny_codes,
+                        layer.skinny_scales,
+                        layer.skinny_global_scale,
                     )
-                saved = _agree_across_tp(local_saved)
-                if saved is None:
-                    logger.warning_once(
-                        "SM70 Skinny NVFP4 %s residency measurement failed on "
-                        "at least one TP rank for N=%d K=%d; keeping the "
-                        "overlay on every rank.",
-                        route,
+
+            else:
+
+                def skinny_apply() -> torch.Tensor:
+                    return torch.ops._C.skinny_nvfp4_gemm_qpn(
+                        x,
+                        layer.skinny_qpn_codes,
+                        layer.skinny_qpn_scales,
+                        layer.skinny_global_scale,
                         n,
-                        k,
                     )
-                    continue
-                roi = saved / per_layout_mib if per_layout_mib > 0 else 0.0
-                decision = _ResidencyDecision(
-                    roi=roi,
-                    mib=per_layout_mib,
-                    saved_us=saved,
-                    keep=roi >= envs.get_sm70_skinny_min_roi(),
-                )
-                _residency_decisions[key] = decision
-                logger.info(
-                    "SM70 Skinny NVFP4 residency %s N=%d K=%d: base=%.1fus "
-                    "skinny=%.1fus saved=%.1fus overlay=%.1fMiB "
-                    "roi=%.3fus/MiB -> %s",
-                    route,
-                    n,
-                    k,
-                    base_us,
-                    skinny_us,
-                    saved,
-                    per_layout_mib,
-                    roi,
-                    "keep" if decision.keep else "drop",
-                )
-            assert decision is not None
-            if decision.keep:
-                continue
+
+            return sm70_residency.RouteBenchmark(base_apply, skinny_apply)
+
+        def release_route(route: str) -> None:
             _release_route(layer, route)
 
-        layer.skinny_enabled = (
-            layer.skinny_codes.numel() > 0 or layer.skinny_qpn_codes.numel() > 0
+        retained = sm70_residency.apply_route_policy(
+            format_name="NVFP4",
+            output_size=n,
+            input_size=k,
+            routes=routes,
+            device=device,
+            overlay_mib=per_layout_mib,
+            min_roi=envs.get_sm70_skinny_min_roi(),
+            force_on=envs.get_sm70_skinny_mode() == "on",
+            decisions=_residency_decisions,
+            make_benchmark=make_benchmark,
+            release_route=release_route,
         )
+
+        layer.skinny_enabled = bool(retained)
         return layer.skinny_enabled
 
     def apply_weights(

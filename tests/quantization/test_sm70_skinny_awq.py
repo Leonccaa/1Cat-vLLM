@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from vllm import _sm70_ops, envs
-from vllm.model_executor.layers.quantization import sm70_skinny
+from vllm.model_executor.layers.quantization import sm70_residency, sm70_skinny
 
 
 def _pack_awq_rows(logical: torch.Tensor) -> torch.Tensor:
@@ -121,12 +121,26 @@ def test_prepare_awq_state_respects_resident_layout(monkeypatch):
     assert both.has_qpn
 
 
-def test_qpn_split_geometry_matches_cuda_policy_for_real_awq_shapes():
-    assert sm70_skinny.qpn_k_splits(1536, 5120) == 1
-    assert sm70_skinny.qpn_k_splits(4352, 5120) == 1
-    assert sm70_skinny.qpn_k_splits(5120, 8704) == 1
-    assert sm70_skinny.qpn_k_splits(5120, 4096) == 2
-    assert sm70_skinny.qpn_k_splits(5120, 1792) == 4
+@pytest.mark.parametrize(
+    ("input_size", "output_size", "expected_splits"),
+    [
+        # Qwen3.6-27B TP4 dense shapes.
+        (1536, 5120, 1),
+        (4352, 5120, 1),
+        (5120, 8704, 1),
+        (5120, 4096, 2),
+        # Narrow-N and minimum-groups-per-warp boundaries.
+        (5120, 1792, 4),
+        (128, 32, 1),
+        (512, 32, 2),
+        (4096, 32, 16),
+    ],
+)
+def test_qpn_split_geometry_matches_cuda_contract(
+    input_size: int, output_size: int, expected_splits: int
+):
+    # The identical table is compiled as static_asserts beside the C++ policy.
+    assert sm70_skinny.qpn_k_splits(input_size, output_size) == expected_splits
 
 
 def test_prepare_awq_moe_bank_is_one_n_major_layout():
@@ -410,7 +424,7 @@ def test_residency_policy_drops_shape_below_roi_threshold(monkeypatch):
 
     monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
     monkeypatch.setattr(
-        sm70_skinny, "_time_apply", lambda fn, iterations=12, device=None: 10.0
+        sm70_residency, "time_apply", lambda fn, iterations=12, device=None: 10.0
     )
     monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "1.0")
 
@@ -430,8 +444,8 @@ def test_residency_policy_keeps_shape_that_earns_its_memory(monkeypatch):
     monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
     timings = iter([500.0, 10.0])  # base slow, skinny fast
     monkeypatch.setattr(
-        sm70_skinny,
-        "_time_apply",
+        sm70_residency,
+        "time_apply",
         lambda fn, iterations=12, device=None: next(timings),
     )
     monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "0")
@@ -447,8 +461,8 @@ def test_force_on_bypasses_performance_residency_gate(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "999")
     state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
     monkeypatch.setattr(
-        sm70_skinny,
-        "_time_apply",
+        sm70_residency,
+        "time_apply",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("force-on must not run the performance gate")
         ),
@@ -462,8 +476,12 @@ def test_tp_consensus_propagates_a_peer_failure(monkeypatch):
     import vllm.distributed
 
     group = SimpleNamespace(world_size=4, device_group=object())
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        vllm.distributed, "tensor_model_parallel_is_initialized", lambda: True
+    )
     monkeypatch.setattr(vllm.distributed, "get_tp_group", lambda: group)
-    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: "cpu")
 
     def peer_failed(tensor, op, group):
         del op, group
@@ -471,7 +489,60 @@ def test_tp_consensus_propagates_a_peer_failure(monkeypatch):
         tensor[0] = 0.0
 
     monkeypatch.setattr(torch.distributed, "all_reduce", peer_failed)
-    assert sm70_skinny._agree_across_tp(12.5) is None
+    assert sm70_residency.agree_across_tp(12.5, device="cpu") is None
+
+
+def test_tp_consensus_uses_local_value_before_tp_initialization(monkeypatch):
+    import vllm.distributed
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        vllm.distributed, "tensor_model_parallel_is_initialized", lambda: False
+    )
+    monkeypatch.setattr(
+        vllm.distributed,
+        "get_tp_group",
+        lambda: (_ for _ in ()).throw(AssertionError("must not access TP group")),
+    )
+
+    assert sm70_residency.agree_across_tp(12.5, device="cpu") == 12.5
+
+
+def test_tp_consensus_uses_local_value_before_distributed_initialization(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("must not enter a collective before initialization")
+        ),
+    )
+
+    assert sm70_residency.agree_across_tp(12.5, device="cpu") == 12.5
+
+
+def test_tp_consensus_propagates_collective_failure(monkeypatch):
+    import vllm.distributed
+
+    group = SimpleNamespace(world_size=4, device_group=object())
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        vllm.distributed, "tensor_model_parallel_is_initialized", lambda: True
+    )
+    monkeypatch.setattr(vllm.distributed, "get_tp_group", lambda: group)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated NCCL failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated NCCL failure"):
+        sm70_residency.agree_across_tp(12.5, device="cpu")
 
 
 def test_residency_decision_is_cached_per_shape(monkeypatch):
@@ -485,7 +556,7 @@ def test_residency_decision_is_cached_per_shape(monkeypatch):
         calls.append(1)
         return 500.0 if len(calls) % 2 else 10.0
 
-    monkeypatch.setattr(sm70_skinny, "_time_apply", _timer)
+    monkeypatch.setattr(sm70_residency, "time_apply", _timer)
     for _ in range(4):
         state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
         sm70_skinny.apply_residency_policy(state, lambda x: x)
@@ -511,7 +582,9 @@ def test_residency_scores_simt_and_qpn_independently(monkeypatch):
     # simt: base 10 vs skinny 10 -> no gain.  qpn: base 500 vs skinny 10 -> big.
     seq = iter([10.0, 10.0, 500.0, 10.0])
     monkeypatch.setattr(
-        sm70_skinny, "_time_apply", lambda fn, iterations=12, device=None: next(seq)
+        sm70_residency,
+        "time_apply",
+        lambda fn, iterations=12, device=None: next(seq),
     )
 
     assert sm70_skinny.apply_residency_policy(state, lambda x: x) is True
@@ -537,7 +610,7 @@ def test_residency_measures_qpn_when_simt_is_not_resident(monkeypatch):
         calls.append(1)
         return 10.0  # no gain -> must drop
 
-    monkeypatch.setattr(sm70_skinny, "_time_apply", _timer)
+    monkeypatch.setattr(sm70_residency, "time_apply", _timer)
 
     kept = sm70_skinny.apply_residency_policy(state, lambda x: x)
 

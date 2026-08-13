@@ -19,6 +19,9 @@ ALLOWED_FILES = {
     "vllm/platforms/",
     "vllm/device_allocator/",
     "vllm/distributed/weight_transfer/ipc_engine.py",
+    # Exact-SM70 code: CUDA events, streams, and device synchronization are
+    # deliberately one API family in this V100-only timing helper.
+    "vllm/model_executor/layers/quantization/sm70_residency.py",
     "tests/distributed/test_packed_tensor.py",
 }
 

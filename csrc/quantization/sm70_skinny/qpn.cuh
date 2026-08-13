@@ -172,8 +172,8 @@ void launch_qpn_kernel(typename FormatPolicy::Params params, const half* input,
 // receive a whole number of K16 groups (otherwise groups are silently
 // dropped), and each warp must keep enough groups that the per-block shared
 // reduction and output write stay amortized.
-inline int qpn_choose_k_splits(int input_size, int output_size,
-                               int target_blocks) {
+constexpr int qpn_choose_k_splits(int input_size, int output_size,
+                                  int target_blocks) {
   constexpr int kWarps = 4;
   constexpr int kMinGroupsPerWarp = 4;
   constexpr int kMaxSplits = 16;
@@ -195,5 +195,17 @@ inline int qpn_choose_k_splits(int input_size, int output_size,
   }
   return splits;
 }
+
+// Keep this contract table in sync with the parametrized Python mirror test
+// in tests/quantization/test_sm70_skinny_awq.py.  These include every dense
+// Qwen3.6-27B TP4 shape plus split and minimum-work boundary cases.
+static_assert(qpn_choose_k_splits(1536, 5120, 160) == 1);
+static_assert(qpn_choose_k_splits(4352, 5120, 160) == 1);
+static_assert(qpn_choose_k_splits(5120, 8704, 160) == 1);
+static_assert(qpn_choose_k_splits(5120, 4096, 160) == 2);
+static_assert(qpn_choose_k_splits(5120, 1792, 160) == 4);
+static_assert(qpn_choose_k_splits(128, 32, 160) == 1);
+static_assert(qpn_choose_k_splits(512, 32, 160) == 2);
+static_assert(qpn_choose_k_splits(4096, 32, 160) == 16);
 
 }  // namespace vllm::sm70_skinny
