@@ -9,7 +9,6 @@ import torch
 from torch.nn.parameter import Parameter
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -18,8 +17,6 @@ from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
 logger = init_logger(__name__)
 
 _SELF_CHECK_TOL = 3e-2
-_runtime_ok = True
-_validated_shapes: set[tuple[int, int]] = set()
 _route_log_seen: set[tuple[str, int, torch.dtype]] = set()
 
 
@@ -84,70 +81,65 @@ def qpn_prepack(
     return qcodes.view(-1).contiguous(), qscales.view(-1).contiguous()
 
 
-def _turbomind_fallback(
-    x: torch.Tensor,
-    tm_weight: torch.Tensor,
-    tm_scales: torch.Tensor,
-    n: int,
-    group_size: int,
-    k_ld: int,
-    q_ld: int,
-) -> torch.Tensor:
-    from vllm import _sm70_ops as sm70_ops
-
-    out = torch.empty((x.shape[0], n), dtype=x.dtype, device=x.device)
-    sm70_ops.nvfp4_gemm_sm70_out(
-        out,
-        x,
-        tm_weight,
-        tm_scales,
-        group_size,
-        k_ld,
-        q_ld,
-    )
-    return out
-
-
 def _skinny_nvfp4_linear_impl(
     x: torch.Tensor,
     codes: torch.Tensor,
     scales: torch.Tensor,
     qpn_codes: torch.Tensor,
     qpn_scales: torch.Tensor,
-    tm_weight: torch.Tensor,
-    tm_scales: torch.Tensor,
     global_scale: float,
     n: int,
     k: int,
-    group_size: int,
-    k_ld: int,
-    q_ld: int,
 ) -> torch.Tensor:
-    global _runtime_ok
+    out = _try_skinny_nvfp4_linear(
+        x,
+        codes,
+        scales,
+        qpn_codes,
+        qpn_scales,
+        global_scale,
+        n,
+        k,
+    )
+    if out is None:
+        raise RuntimeError(
+            f"SM70 Skinny NVFP4 has no route for M={x.shape[0]}, N={n}, K={k}; "
+            "use a graph-safe overlay op that owns the selected base fallback."
+        )
+    return out
 
+
+def _try_skinny_nvfp4_linear(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    qpn_codes: torch.Tensor,
+    qpn_scales: torch.Tensor,
+    global_scale: float,
+    n: int,
+    k: int,
+) -> torch.Tensor | None:
+    """Run a supported route, or return ``None`` inside a hybrid op."""
     if x.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(
             f"SM70 skinny NVFP4 supports FP16 or BF16 activations, but got {x.dtype}."
         )
 
-    # Both the small-M kernels and the existing TurboMind fallback execute in
-    # FP16 on Volta. For a BF16 model, make that conversion explicit at this
-    # adapter boundary and restore the public output dtype afterwards.
+    # The small-M kernels execute in FP16 on Volta. For a BF16 model, make that
+    # conversion explicit and restore the public output dtype afterwards.
     output_dtype = x.dtype
     kernel_x = x if x.dtype == torch.float16 else x.to(torch.float16)
     m = kernel_x.shape[0]
 
     use_qpn = (
-        _runtime_ok
-        and 4 <= m <= 16
+        4 <= m <= 16
         and k % 64 == 0
         and n % 32 == 0
         and qpn_codes.numel() == n * (k // 2)
         and qpn_scales.numel() == n * (k // 16)
     )
     use_simt = (
-        _runtime_ok
-        and 1 <= m <= 3
+        1 <= m <= 3
         and k % 128 == 0
         and n % 8 == 0
         and codes.numel() == n * (k // 2)
@@ -159,18 +151,23 @@ def _skinny_nvfp4_linear_impl(
     elif use_simt:
         route = "simt"
     else:
-        route = "turbomind"
-    route_key = (route, m, output_dtype)
-    if route_key not in _route_log_seen:
-        _route_log_seen.add(route_key)
-        logger.info(
-            "SM70 skinny NVFP4 route: M=%d N=%d K=%d dtype=%s -> %s",
-            m,
-            n,
-            k,
-            output_dtype,
-            route,
-        )
+        route = "unsupported"
+    # Keep diagnostics out of Dynamo traces. The hybrid custom op may be
+    # invoked while a new dtype specialization is being compiled, and Python
+    # logger/set side effects would otherwise turn an opaque runtime-M dispatch
+    # into a graph break.
+    if not torch.compiler.is_compiling():
+        route_key = (route, m, output_dtype)
+        if route_key not in _route_log_seen:
+            _route_log_seen.add(route_key)
+            logger.info(
+                "SM70 skinny NVFP4 route: M=%d N=%d K=%d dtype=%s -> %s",
+                m,
+                n,
+                k,
+                output_dtype,
+                route,
+            )
 
     from vllm import _sm70_ops as sm70_ops
 
@@ -181,9 +178,7 @@ def _skinny_nvfp4_linear_impl(
     elif use_simt:
         out = sm70_ops.skinny_nvfp4_gemm_simt(kernel_x, codes, scales, global_scale)
     else:
-        out = _turbomind_fallback(
-            kernel_x, tm_weight, tm_scales, n, group_size, k_ld, q_ld
-        )
+        return None
 
     return out if output_dtype == torch.float16 else out.to(output_dtype)
 
@@ -194,27 +189,17 @@ def _skinny_nvfp4_linear_fake(
     scales: torch.Tensor,
     qpn_codes: torch.Tensor,
     qpn_scales: torch.Tensor,
-    tm_weight: torch.Tensor,
-    tm_scales: torch.Tensor,
     global_scale: float,
     n: int,
     k: int,
-    group_size: int,
-    k_ld: int,
-    q_ld: int,
 ) -> torch.Tensor:
     del (
         codes,
         scales,
         qpn_codes,
         qpn_scales,
-        tm_weight,
-        tm_scales,
         global_scale,
         k,
-        group_size,
-        k_ld,
-        q_ld,
     )
     return x.new_empty((x.shape[0], n))
 
@@ -226,6 +211,169 @@ direct_register_custom_op(
 )
 
 
+def _skinny_nvfp4_turbomind_linear_impl(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    qpn_codes: torch.Tensor,
+    qpn_scales: torch.Tensor,
+    global_scale: float,
+    base_weight: torch.Tensor,
+    base_scales: torch.Tensor,
+    n: int,
+    k: int,
+    base_group_size: int,
+    base_k_ld: int,
+    base_q_ld: int,
+) -> torch.Tensor:
+    out = _try_skinny_nvfp4_linear(
+        x,
+        codes,
+        scales,
+        qpn_codes,
+        qpn_scales,
+        global_scale,
+        n,
+        k,
+    )
+    if out is not None:
+        return out
+
+    from vllm import _sm70_ops as sm70_ops
+
+    output_dtype = x.dtype
+    kernel_x = x if x.dtype == torch.float16 else x.to(torch.float16)
+    out = torch.empty(
+        (kernel_x.shape[0], n), dtype=torch.float16, device=kernel_x.device
+    )
+    sm70_ops.nvfp4_gemm_sm70_out(
+        out,
+        kernel_x,
+        base_weight,
+        base_scales,
+        base_group_size,
+        base_k_ld,
+        base_q_ld,
+    )
+    return out if output_dtype == torch.float16 else out.to(output_dtype)
+
+
+def _skinny_nvfp4_turbomind_linear_fake(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    qpn_codes: torch.Tensor,
+    qpn_scales: torch.Tensor,
+    global_scale: float,
+    base_weight: torch.Tensor,
+    base_scales: torch.Tensor,
+    n: int,
+    k: int,
+    base_group_size: int,
+    base_k_ld: int,
+    base_q_ld: int,
+) -> torch.Tensor:
+    del (
+        codes,
+        scales,
+        qpn_codes,
+        qpn_scales,
+        global_scale,
+        base_weight,
+        base_scales,
+        k,
+        base_group_size,
+        base_k_ld,
+        base_q_ld,
+    )
+    return x.new_empty((x.shape[0], n))
+
+
+direct_register_custom_op(
+    op_name="sm70_skinny_nvfp4_turbomind_linear",
+    op_func=_skinny_nvfp4_turbomind_linear_impl,
+    fake_impl=_skinny_nvfp4_turbomind_linear_fake,
+)
+
+
+def _skinny_nvfp4_marlin_linear_impl(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    qpn_codes: torch.Tensor,
+    qpn_scales: torch.Tensor,
+    global_scale: float,
+    base_weight: torch.Tensor,
+    base_scales: torch.Tensor,
+    base_global_scale: torch.Tensor,
+    base_workspace: torch.Tensor,
+    n: int,
+    k: int,
+) -> torch.Tensor:
+    out = _try_skinny_nvfp4_linear(
+        x,
+        codes,
+        scales,
+        qpn_codes,
+        qpn_scales,
+        global_scale,
+        n,
+        k,
+    )
+    if out is not None:
+        return out
+
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+        apply_fp4_marlin_linear,
+    )
+
+    return apply_fp4_marlin_linear(
+        input=x,
+        weight=base_weight,
+        weight_scale=base_scales,
+        weight_global_scale=base_global_scale,
+        workspace=base_workspace,
+        size_n=n,
+        size_k=k,
+    )
+
+
+def _skinny_nvfp4_marlin_linear_fake(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    qpn_codes: torch.Tensor,
+    qpn_scales: torch.Tensor,
+    global_scale: float,
+    base_weight: torch.Tensor,
+    base_scales: torch.Tensor,
+    base_global_scale: torch.Tensor,
+    base_workspace: torch.Tensor,
+    n: int,
+    k: int,
+) -> torch.Tensor:
+    del (
+        codes,
+        scales,
+        qpn_codes,
+        qpn_scales,
+        global_scale,
+        base_weight,
+        base_scales,
+        base_global_scale,
+        base_workspace,
+        k,
+    )
+    return x.new_empty((x.shape[0], n))
+
+
+direct_register_custom_op(
+    op_name="sm70_skinny_nvfp4_marlin_linear",
+    op_func=_skinny_nvfp4_marlin_linear_impl,
+    fake_impl=_skinny_nvfp4_marlin_linear_fake,
+)
+
+
 def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
     denominator = expected.float().abs().max().clamp(min=1e-6)
     error = (actual.float() - expected.float()).abs().max() / denominator
@@ -233,7 +381,18 @@ def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
-    """SM70 small-M NVFP4 overlay with a TurboMind fallback."""
+    """SM70 small-M NVFP4 decorator over a selected base kernel."""
+
+    def __init__(
+        self,
+        config: NvFp4LinearLayerConfig,
+        base_kernel: NvFp4LinearKernel,
+    ) -> None:
+        supported, reason = self.is_supported()
+        if not supported:
+            raise ValueError(f"SM70 Skinny NVFP4 is unavailable: {reason}")
+        self.config = config
+        self.base_kernel = base_kernel
 
     @classmethod
     def is_supported(
@@ -251,8 +410,6 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
         required_ops = (
             "skinny_nvfp4_gemm_simt",
             "skinny_nvfp4_gemm_qpn",
-            "nvfp4_sm70_prepare",
-            "nvfp4_gemm_sm70_out",
         )
         missing = [name for name in required_ops if not hasattr(torch.ops._C, name)]
         if missing:
@@ -265,34 +422,24 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
         return True, None
 
     def _validate_shape(self, layer: torch.nn.Module) -> None:
-        global _runtime_ok
-
         n = layer.output_size_per_partition
         k = layer.input_size_per_partition
-        shape = (n, k)
-        if not _runtime_ok or shape in _validated_shapes:
-            return
-
-        state = sm70_tm.get_prepared_linear_state(layer)
         cases = [(1, "simt")]
         if layer.skinny_qpn_codes.numel() > 0:
             cases.append((8, "qpn"))
 
-        try:
-            for m, route in cases:
+        for m, route in cases:
+            if route in layer.skinny_disabled_routes:
+                continue
+            validation_key = (type(self.base_kernel).__name__, route)
+            if validation_key in layer.skinny_validated_routes:
+                continue
+            try:
                 values = torch.arange(
                     m * k, device=layer.skinny_codes.device, dtype=torch.int32
                 )
                 x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(m, k)
-                reference = _turbomind_fallback(
-                    x,
-                    state.weight,
-                    state.scales,
-                    n,
-                    state.group_size,
-                    state.k_ld,
-                    state.q_ld,
-                )
+                reference = self.base_kernel.apply_weights(layer, x, None)
                 if route == "simt":
                     actual = torch.ops._C.skinny_nvfp4_gemm_simt(
                         x,
@@ -317,23 +464,25 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
                         f"{route} relative error {relative_error:.3e} exceeds "
                         f"{_SELF_CHECK_TOL:.3e}"
                     )
-        except Exception:
-            _runtime_ok = False
-            logger.exception(
-                "SM70 skinny NVFP4 self-check failed for N=%d K=%d; "
-                "disabling skinny routes and retaining TurboMind.",
+            except Exception:
+                layer.skinny_disabled_routes.add(route)
+                logger.exception(
+                    "SM70 Skinny NVFP4 %s self-check failed for N=%d K=%d "
+                    "against base=%s; disabling only this route.",
+                    route,
+                    n,
+                    k,
+                    type(self.base_kernel).__name__,
+                )
+                continue
+            layer.skinny_validated_routes.add(validation_key)
+            logger.info_once(
+                "SM70 Skinny NVFP4 %s self-check passed for N=%d K=%d against base=%s.",
+                route,
                 n,
                 k,
+                type(self.base_kernel).__name__,
             )
-            return
-
-        _validated_shapes.add(shape)
-        logger.info(
-            "SM70 skinny NVFP4 self-check passed for N=%d K=%d (%d route(s)).",
-            n,
-            k,
-            len(cases),
-        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if layer.weight.dtype != torch.uint8 or layer.weight.dim() != 2:
@@ -347,15 +496,15 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
                 f"got {tuple(layer.weight.shape)}."
             )
 
-        # Keep aliases of the checkpoint-native tensors; no clone is needed.
-        # TurboMind prepare only reads them before replacing layer.weight.
+        # Keep an overlay-owned native layout. The selected base is free to
+        # replace or repack the checkpoint tensors in place.
         layer.register_parameter(
-            "skinny_codes", Parameter(layer.weight.data, requires_grad=False)
+            "skinny_codes", Parameter(layer.weight.data.clone(), requires_grad=False)
         )
         layer.register_parameter(
             "skinny_scales",
             Parameter(
-                layer.weight_scale.data.view(torch.uint8).contiguous(),
+                layer.weight_scale.data.view(torch.uint8).clone().contiguous(),
                 requires_grad=False,
             ),
         )
@@ -373,24 +522,15 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
             "skinny_qpn_scales",
             Parameter(qscales if qscales is not None else empty, requires_grad=False),
         )
+        layer.skinny_disabled_routes = set()
+        layer.skinny_validated_routes = set()
 
-        sm70_tm.prepare_nvfp4_linear(layer)
-        weight_device = layer.weight.device
-        scale_device = layer.weight_scale.device
-        scale_dtype = layer.weight_scale.dtype
-        layer.weight = Parameter(
-            torch.empty(0, dtype=torch.uint8, device=weight_device),
-            requires_grad=False,
-        )
-        layer.weight_scale = Parameter(
-            torch.empty(0, dtype=scale_dtype, device=scale_device),
-            requires_grad=False,
-        )
+        self.base_kernel.process_weights_after_loading(layer)
 
         self._validate_shape(layer)
         logger.info_once(
-            "SM70 skinny NVFP4 dense backend enabled: SIMT M<=3, "
-            "QPN M=4..16, TurboMind fallback."
+            "SM70 Skinny NVFP4 dense overlay enabled: SIMT M<=3, QPN M=4..16, base=%s.",
+            type(self.base_kernel).__name__,
         )
 
     def apply_weights(
@@ -399,24 +539,104 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        state = sm70_tm.get_prepared_linear_state(layer)
         k = layer.input_size_per_partition
         n = layer.output_size_per_partition
         reshaped_x = x.reshape(-1, k).contiguous()
+        rows = reshaped_x.shape[0]
+        simt_codes = (
+            layer.skinny_codes
+            if "simt" not in layer.skinny_disabled_routes
+            else layer.skinny_codes[:0]
+        )
+        simt_scales = (
+            layer.skinny_scales
+            if "simt" not in layer.skinny_disabled_routes
+            else layer.skinny_scales[:0]
+        )
+        qpn_codes = (
+            layer.skinny_qpn_codes
+            if "qpn" not in layer.skinny_disabled_routes
+            else layer.skinny_qpn_codes[:0]
+        )
+        qpn_scales = (
+            layer.skinny_qpn_scales
+            if "qpn" not in layer.skinny_disabled_routes
+            else layer.skinny_qpn_scales[:0]
+        )
+
+        # The hybrid op is deliberately opaque to torch.compile.  It sees the
+        # real runtime M and owns both the Skinny route and the selected base
+        # fallback, so a decode trace cannot pin a later prefill to Skinny.
+        base_name = type(self.base_kernel).__name__
+        if base_name == "TurboMindNvFp4LinearKernel":
+            from vllm.model_executor.layers.quantization import sm70_turbomind
+
+            base_state = getattr(layer, sm70_turbomind.STATE_ATTR)
+            out = torch.ops.vllm.sm70_skinny_nvfp4_turbomind_linear(
+                reshaped_x,
+                simt_codes,
+                simt_scales,
+                qpn_codes,
+                qpn_scales,
+                layer.skinny_global_scale,
+                base_state.weight,
+                base_state.scales,
+                n,
+                k,
+                base_state.group_size,
+                base_state.k_ld,
+                base_state.q_ld,
+            )
+            if bias is not None:
+                out.add_(bias)
+            return out.reshape(x.shape[:-1] + (n,))
+        if base_name == "MarlinNvFp4LinearKernel":
+            out = torch.ops.vllm.sm70_skinny_nvfp4_marlin_linear(
+                reshaped_x,
+                simt_codes,
+                simt_scales,
+                qpn_codes,
+                qpn_scales,
+                layer.skinny_global_scale,
+                layer.weight,
+                layer.weight_scale,
+                layer.weight_global_scale,
+                layer.workspace,
+                n,
+                k,
+            )
+            if bias is not None:
+                out.add_(bias)
+            return out.reshape(x.shape[:-1] + (n,))
+
+        # Keep the simple eager decorator behavior for third-party test/base
+        # kernels. Production SM70 selection currently resolves to one of the
+        # two graph-safe hybrid paths above.
+        use_simt = (
+            1 <= rows <= 3
+            and "simt" not in layer.skinny_disabled_routes
+            and k % 128 == 0
+            and n % 8 == 0
+            and layer.skinny_codes.numel() == n * (k // 2)
+        )
+        use_qpn = (
+            4 <= rows <= 16
+            and "qpn" not in layer.skinny_disabled_routes
+            and k % 64 == 0
+            and n % 32 == 0
+            and layer.skinny_qpn_codes.numel() == n * (k // 2)
+        )
+        if not (use_simt or use_qpn):
+            return self.base_kernel.apply_weights(layer, x, bias)
         out = torch.ops.vllm.sm70_skinny_nvfp4_linear(
             reshaped_x,
-            layer.skinny_codes,
-            layer.skinny_scales,
-            layer.skinny_qpn_codes,
-            layer.skinny_qpn_scales,
-            state.weight,
-            state.scales,
+            simt_codes,
+            simt_scales,
+            qpn_codes,
+            qpn_scales,
             layer.skinny_global_scale,
             n,
             k,
-            state.group_size,
-            state.k_ld,
-            state.q_ld,
         )
         if bias is not None:
             out = out + bias

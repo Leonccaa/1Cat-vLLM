@@ -49,6 +49,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -1051,10 +1052,16 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # The opt-in skinny backend consumes ModelOpt NVFP4 as W4A16 and has
-        # an exact-SM70 implementation. Other ModelOpt NVFP4 backends retain
-        # their upstream minimum.
-        return 70 if envs.use_sm70_skinny_nvfp4() else 75
+        # Capability follows the available SM70 execution route, not the
+        # orthogonal Skinny overlay. In particular, SKINNY=off must still let
+        # an explicitly selected (or default-enabled) TurboMind/Marlin base
+        # load on V100.
+        base_backend = envs.get_sm70_quant_base_backend()
+        if base_backend in ("turbomind", "marlin"):
+            return 70
+        if envs.use_sm70_skinny_nvfp4() or envs.VLLM_SM70_NVFP4_TURBOMIND:
+            return 70
+        return 75
 
     @classmethod
     def override_quantization_method(
@@ -1265,11 +1272,14 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         # backend == "marlin"; we don't set that since we pin the kernel
         # below, but we keep the attribute for shape parity.
         self.marlin_input_dtype = None
-        # W4A16 normally pins Marlin so the generic NVFP4 selector cannot pick
-        # an activation-quantizing W4A4 kernel. The explicit SM70 skinny mode
-        # is also weight-only and keeps TurboMind as its fallback, so it is the
-        # one safe exception.
-        if envs.use_sm70_skinny_nvfp4():
+        # W4A16 normally pins Marlin so the generic selector cannot pick an
+        # activation-quantizing W4A4 kernel. Exact SM70 is the exception: its
+        # selector returns a weight-only TurboMind/Marlin base, optionally
+        # decorated by Skinny.
+        if sm70_tm.is_exact_sm70_cuda_platform() and (
+            envs.use_sm70_skinny_nvfp4()
+            or envs.get_sm70_quant_base_backend() in ("auto", "turbomind")
+        ):
             self.kernel = init_nvfp4_linear_kernel()
         else:
             self.kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())

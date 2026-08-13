@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe import (
     SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.quantization import sm70_skinny
 from vllm.model_executor.layers.quantization.sm70_moe_router import (
     Sm70MoeStageRoute,
     select_sm70_quantized_moe_route,
@@ -556,6 +557,50 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             )
 
         num_experts = int(layer.w13_qweight.shape[0])
+        use_skinny_moe = (
+            envs.use_sm70_skinny_awq_moe()
+            and self.group_size == sm70_skinny.AWQ_GROUP_SIZE
+            and hasattr(torch.ops._C, "skinny_awq_moe_gemm_simt_out")
+        )
+        if use_skinny_moe:
+            w13_codes, w13_skinny_scales, w13_biases = sm70_skinny.prepare_awq_moe_bank(
+                layer.w13_qweight,
+                layer.w13_scales,
+                layer.w13_qzeros,
+                self.group_size,
+            )
+            w2_codes, w2_skinny_scales, w2_biases = sm70_skinny.prepare_awq_moe_bank(
+                layer.w2_qweight,
+                layer.w2_scales,
+                layer.w2_qzeros,
+                self.group_size,
+            )
+            layer.w13_skinny_codes = Parameter(w13_codes, requires_grad=False)
+            layer.w13_skinny_scales = Parameter(w13_skinny_scales, requires_grad=False)
+            layer.w13_skinny_biases = Parameter(w13_biases, requires_grad=False)
+            layer.w2_skinny_codes = Parameter(w2_codes, requires_grad=False)
+            layer.w2_skinny_scales = Parameter(w2_skinny_scales, requires_grad=False)
+            layer.w2_skinny_biases = Parameter(w2_biases, requires_grad=False)
+            layer.sm70_num_experts = num_experts
+            layer.sm70_w13_k_dim = int(w13_codes.shape[2]) * 2
+            layer.sm70_w13_n_dim = int(w13_codes.shape[1])
+            layer.sm70_w2_k_dim = int(w2_codes.shape[2]) * 2
+            layer.sm70_w2_n_dim = int(w2_codes.shape[1])
+            layer.sm70_intermediate_size = layer.sm70_w2_k_dim
+            layer.sm70_ptr_row_bytes = 1
+            layer.sm70_awq_moe_batched_gemm = False
+            layer.sm70_awq_moe_w13_interleaved = False
+            layer.sm70_awq_moe_skinny = True
+            self._allocate_buffers(layer)
+            del layer.w13_qweight, layer.w13_scales, layer.w13_qzeros
+            del layer.w2_qweight, layer.w2_scales, layer.w2_qzeros
+            logger.info_once(
+                "SM70 Skinny AWQ grouped MoE replacement backend enabled "
+                "(%d experts, one resident expert-bank layout).",
+                num_experts,
+            )
+            return
+
         w13_tm_weights, w13_tm_scales, w13_meta = [], [], []
         w2_tm_weights, w2_tm_scales, w2_meta = [], [], []
         build_legacy_w13 = (
@@ -568,9 +613,14 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         # carrying a second per-expert W13 TurboMind copy.
         w13_interleaved = build_legacy_w13
         for expert_id in range(num_experts):
+            # AWQ checkpoint parameters inherit the model dtype. TurboMind's
+            # SM70 prepare ABI is FP16-only, so normalize BF16 scale tensors at
+            # this AWQ metadata boundary. This is separate from issue #105's
+            # TileLang common.h compilation bug.
+            w13_scale = layer.w13_scales[expert_id].to(torch.float16).contiguous()
             r13 = sm70_ops.awq_sm70_prepare(
                 layer.w13_qweight[expert_id],
-                layer.w13_scales[expert_id],
+                w13_scale,
                 layer.w13_qzeros[expert_id],
                 self.group_size,
                 w13_interleaved,
@@ -578,10 +628,10 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             w13_tm_weights.append(r13[0])
             w13_tm_scales.append(r13[1])
             w13_meta.append(r13[2])
-
+            w2_scale = layer.w2_scales[expert_id].to(torch.float16).contiguous()
             r2 = sm70_ops.awq_sm70_prepare(
                 layer.w2_qweight[expert_id],
-                layer.w2_scales[expert_id],
+                w2_scale,
                 layer.w2_qzeros[expert_id],
                 self.group_size,
                 False,
@@ -669,7 +719,10 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         )
 
     def _allocate_buffers(self, layer: RoutedExperts) -> None:
-        device = layer.w13_tm_weight.device
+        if getattr(layer, "sm70_awq_moe_skinny", False):
+            device = layer.w13_skinny_codes.device
+        else:
+            device = layer.w13_tm_weight.device
         top_k = self.moe.experts_per_token
         persistent_tokens = _DEFAULT_PERSISTENT_MAX_TOKENS
         max_slots = persistent_tokens * top_k
@@ -993,6 +1046,71 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
     def supports_eplb(self) -> bool:
         return False
 
+    def _apply_skinny_grouped(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids_i32: torch.Tensor,
+        buffers: dict[str, torch.Tensor],
+        top_k: int,
+        total_slots: int,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run W13 and W2 from one N-major expert-bank layout."""
+        _log_runtime_route_once(
+            "SM70 Skinny AWQ grouped MoE route enabled "
+            "(tokens=%d, routes=%d, experts=%d).",
+            x.shape[0],
+            total_slots,
+            layer.sm70_num_experts,
+        )
+        torch.ops._moe_C.moe_permute_with_scratch(
+            x,
+            topk_ids_i32,
+            buffers["token_expert_indices"],
+            layer.expert_map,
+            layer.global_num_experts,
+            layer.local_num_experts,
+            top_k,
+            buffers["permuted_input"],
+            buffers["expert_offsets64"],
+            buffers["inv_permuted_idx"],
+            buffers["permuted_idx"],
+            buffers["sort_workspace"],
+            buffers["permuted_experts_id"],
+            buffers["sorted_row_idx"],
+            buffers["topk_ids_for_sort"],
+        )
+        sm70_ops.skinny_awq_moe_gemm_simt_out(
+            buffers["gate_up"],
+            buffers["permuted_input"],
+            buffers["permuted_experts_id"],
+            layer.w13_skinny_codes,
+            layer.w13_skinny_scales,
+            layer.w13_skinny_biases,
+            self.group_size,
+        )
+        _silu_and_mul_w13(layer, buffers["intermediate"], buffers["gate_up"])
+        sm70_ops.skinny_awq_moe_gemm_simt_out(
+            buffers["sorted_output"],
+            buffers["intermediate"],
+            buffers["permuted_experts_id"],
+            layer.w2_skinny_codes,
+            layer.w2_skinny_scales,
+            layer.w2_skinny_biases,
+            self.group_size,
+        )
+        torch.ops._moe_C.moe_unpermute(
+            buffers["sorted_output"][:, : layer.sm70_hidden_logical_size],
+            topk_weights,
+            buffers["inv_permuted_idx"],
+            buffers["expert_offsets64"],
+            top_k,
+            output,
+        )
+        return output
+
     def apply(
         self,
         layer: RoutedExperts,
@@ -1022,6 +1140,17 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         x = _dump_awq_moe_buffer(layer, x, "input")
         topk_weights = _dump_awq_moe_buffer(layer, topk_weights, "topk_weights")
         topk_ids_i32 = _dump_awq_moe_buffer(layer, topk_ids_i32, "topk_ids_i32")
+        if getattr(layer, "sm70_awq_moe_skinny", False):
+            return self._apply_skinny_grouped(
+                layer,
+                x,
+                topk_weights,
+                topk_ids_i32,
+                buffers,
+                top_k,
+                total_slots,
+                output,
+            )
         if (
             num_tokens == 1
             and layer.sm70_awq_moe_batched_gemm

@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import torch
 
 from vllm import _sm70_ops
 from vllm.model_executor.kernels.linear.nvfp4 import skinny
+from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
 from vllm.model_executor.layers.quantization import modelopt
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+    compressed_tensors_w4a16_nvfp4 as ct_w4a16,
+)
 
 
 def _unpack_nibble(codes: torch.Tensor, row: int, column: int) -> int:
@@ -58,9 +64,7 @@ def _native_buffers(n: int, k: int):
     scales = torch.zeros((n, k // 16), dtype=torch.uint8)
     qcodes = torch.zeros(n * (k // 2), dtype=torch.uint8)
     qscales = torch.zeros(n * (k // 16), dtype=torch.uint8)
-    tm_weight = torch.empty(0, dtype=torch.int32)
-    tm_scales = torch.empty(0, dtype=torch.float16)
-    return codes, scales, qcodes, qscales, tm_weight, tm_scales
+    return codes, scales, qcodes, qscales
 
 
 def test_bf16_activation_is_explicitly_converted_and_restored(monkeypatch):
@@ -76,31 +80,95 @@ def test_bf16_activation_is_explicitly_converted_and_restored(monkeypatch):
     monkeypatch.setattr(_sm70_ops, "skinny_nvfp4_gemm_simt", fake_simt)
     x = torch.ones((1, k), dtype=torch.bfloat16)
 
-    out = skinny._skinny_nvfp4_linear_impl(x, *buffers, 1.0, n, k, 16, 0, 0)
+    out = skinny._skinny_nvfp4_linear_impl(x, *buffers, 1.0, n, k)
 
     assert seen_dtypes == [torch.float16]
     assert out.dtype == torch.bfloat16
     assert out.shape == (1, n)
 
 
-def test_large_m_uses_turbomind_fallback(monkeypatch):
+def test_turbomind_hybrid_op_dispatches_on_runtime_rows(monkeypatch):
+    n, k = 32, 128
+    buffers = _native_buffers(n, k)
+    calls: list[tuple[str, int]] = []
+
+    def simt(input, codes, scales, global_scale):
+        del codes, scales, global_scale
+        calls.append(("simt", input.shape[0]))
+        return input.new_ones((input.shape[0], n))
+
+    def base(out, input, weight, scales, group_size, k_ld, q_ld):
+        del weight, scales, group_size, k_ld, q_ld
+        calls.append(("base", input.shape[0]))
+        out.fill_(2)
+
+    monkeypatch.setattr(_sm70_ops, "skinny_nvfp4_gemm_simt", simt)
+    monkeypatch.setattr(_sm70_ops, "nvfp4_gemm_sm70_out", base)
+    base_weight = torch.empty((1, 1), dtype=torch.int32)
+    base_scales = torch.empty((1, 1), dtype=torch.float16)
+
+    small = skinny._skinny_nvfp4_turbomind_linear_impl(
+        torch.ones((1, k), dtype=torch.float16),
+        *buffers,
+        1.0,
+        base_weight,
+        base_scales,
+        n,
+        k,
+        16,
+        0,
+        0,
+    )
+    large = skinny._skinny_nvfp4_turbomind_linear_impl(
+        torch.ones((17, k), dtype=torch.float16),
+        *buffers,
+        1.0,
+        base_weight,
+        base_scales,
+        n,
+        k,
+        16,
+        0,
+        0,
+    )
+
+    assert calls == [("simt", 1), ("base", 17)]
+    assert torch.equal(small, torch.ones_like(small))
+    assert torch.equal(large, torch.full_like(large, 2))
+
+
+def test_large_m_delegates_to_selected_base_without_dtype_rewrite(monkeypatch):
     n, k, m = 32, 128, 17
     buffers = _native_buffers(n, k)
     calls = []
 
-    def fake_turbomind(
-        out, input, qweight, scales, group_size, k_ld, q_ld, gated_silu=False
-    ):
-        del qweight, scales, group_size, k_ld, q_ld, gated_silu
-        calls.append(input.dtype)
-        out.copy_(input.sum(dim=1, keepdim=True).expand(-1, n))
+    class FakeBase:
+        def apply_weights(self, layer, input, bias=None):
+            del layer, bias
+            calls.append(input.dtype)
+            return input.sum(dim=1, keepdim=True).expand(-1, n).contiguous()
 
-    monkeypatch.setattr(_sm70_ops, "nvfp4_gemm_sm70_out", fake_turbomind)
+    monkeypatch.setattr(
+        skinny.SkinnyNvFp4LinearKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (True, None)),
+    )
+    kernel = skinny.SkinnyNvFp4LinearKernel(NvFp4LinearLayerConfig(), FakeBase())
+    layer = SimpleNamespace(
+        input_size_per_partition=k,
+        output_size_per_partition=n,
+        skinny_codes=buffers[0],
+        skinny_scales=buffers[1],
+        skinny_qpn_codes=buffers[2],
+        skinny_qpn_scales=buffers[3],
+        skinny_global_scale=1.0,
+        skinny_disabled_routes=set(),
+    )
     x = torch.ones((m, k), dtype=torch.bfloat16)
 
-    out = skinny._skinny_nvfp4_linear_impl(x, *buffers, 1.0, n, k, 16, 0, 0)
+    out = kernel.apply_weights(layer, x)
 
-    assert calls == [torch.float16]
+    assert calls == [torch.bfloat16]
     assert out.dtype == torch.bfloat16
     assert out.shape == (m, n)
 
@@ -112,10 +180,23 @@ def test_skinny_kernel_rejects_non_sm70():
     assert reason == "requires exact CUDA capability 7.0"
 
 
-def test_modelopt_nvfp4_min_capability_is_lowered_only_for_skinny(monkeypatch):
+def test_modelopt_nvfp4_min_capability_follows_base_and_overlay(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_QUANT_BACKEND", raising=False)
+    monkeypatch.delenv("VLLM_SM70_SKINNY", raising=False)
+    monkeypatch.delenv("VLLM_SM70_NVFP4_TURBOMIND", raising=False)
+    assert modelopt.ModelOptNvFp4Config.get_min_capability() == 70
+
+    monkeypatch.setenv("VLLM_SM70_SKINNY", "off")
+    # Disabling the overlay does not disable the default TurboMind base.
+    assert modelopt.ModelOptNvFp4Config.get_min_capability() == 70
+
+    monkeypatch.setenv("VLLM_SM70_NVFP4_TURBOMIND", "0")
     assert modelopt.ModelOptNvFp4Config.get_min_capability() == 75
 
+    monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "marlin")
+    assert modelopt.ModelOptNvFp4Config.get_min_capability() == 70
+
+    monkeypatch.delenv("VLLM_SM70_SKINNY", raising=False)
     monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "skinny")
     assert modelopt.ModelOptNvFp4Config.get_min_capability() == 70
 
@@ -123,6 +204,7 @@ def test_modelopt_nvfp4_min_capability_is_lowered_only_for_skinny(monkeypatch):
 def test_modelopt_w4a16_selects_generic_skinny_kernel(monkeypatch):
     sentinel = object()
     monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "skinny")
+    monkeypatch.setattr(modelopt.sm70_tm, "is_exact_sm70_cuda_platform", lambda: True)
     monkeypatch.setattr(modelopt, "init_nvfp4_linear_kernel", lambda: sentinel)
     config = modelopt.ModelOptNvFp4Config(
         quant_method="W4A16_NVFP4",
@@ -139,6 +221,7 @@ def test_modelopt_w4a16_selects_generic_skinny_kernel(monkeypatch):
 def test_modelopt_w4a4_selects_generic_skinny_kernel(monkeypatch):
     sentinel = object()
     monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "skinny")
+    monkeypatch.setattr(modelopt.sm70_tm, "is_exact_sm70_cuda_platform", lambda: True)
     monkeypatch.setattr(modelopt, "init_nvfp4_linear_kernel", lambda: sentinel)
     config = modelopt.ModelOptNvFp4Config(
         quant_method="NVFP4",
@@ -150,3 +233,39 @@ def test_modelopt_w4a4_selects_generic_skinny_kernel(monkeypatch):
     method = modelopt.ModelOptNvFp4LinearMethod(config)
 
     assert method.kernel is sentinel
+
+
+def test_ct_w4a16_preserves_non_sm70_marlin_base(monkeypatch):
+    calls: list[str] = []
+
+    class FakeMarlin:
+        def process_weights_after_loading(self, layer):
+            calls.append("marlin")
+            assert layer.weight.dtype == torch.uint8
+
+    monkeypatch.setattr(ct_w4a16.sm70_tm, "is_exact_sm70_cuda_platform", lambda: False)
+    monkeypatch.setattr(
+        ct_w4a16,
+        "init_nvfp4_linear_kernel",
+        lambda: (_ for _ in ()).throw(AssertionError("unexpected SM70 selector")),
+    )
+    monkeypatch.setattr(
+        ct_w4a16,
+        "MarlinNvFp4LinearKernel",
+        lambda config: FakeMarlin(),
+    )
+    layer = torch.nn.Module()
+    layer.weight_packed = torch.nn.Parameter(
+        torch.zeros((8, 64), dtype=torch.uint8), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.ones((8, 8), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_global_scale = torch.nn.Parameter(
+        torch.ones(1, dtype=torch.float32), requires_grad=False
+    )
+
+    scheme = ct_w4a16.CompressedTensorsW4A16Fp4()
+    scheme.process_weights_after_loading(layer)
+
+    assert calls == ["marlin"]

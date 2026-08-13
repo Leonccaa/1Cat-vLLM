@@ -20,6 +20,7 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.quantization import sm70_skinny
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -367,12 +368,41 @@ class AWQLinearMethod(LinearMethodBase):
                 "and the SM70 TurboMind extension."
             )
 
+        # Normalize metadata at the backend boundary. AWQ checkpoints can be
+        # loaded under a BF16 model dtype, while every Volta AWQ kernel here
+        # consumes FP16 scales. This is an AWQ prepare-time type boundary; it
+        # is separate from issue #105's TileLang common.h compilation bug.
+        sm70_scales = layer.scales.data.to(torch.float16).contiguous()
         is_gated_silu_layer = self._is_sm70_gated_silu_layer(layer)
+        skinny_mode = envs.get_sm70_skinny_mode()
+        skinny_eligible = group_size == sm70_skinny.AWQ_GROUP_SIZE and not (
+            is_gated_silu_layer and envs.VLLM_SM70_AWQ_MLP_ENGINE
+        )
+        missing_skinny_ops = sm70_skinny.missing_awq_ops()
+        if skinny_mode == "on" and (not skinny_eligible or missing_skinny_ops):
+            reason = (
+                f"unsupported group/layout (group_size={group_size})"
+                if not skinny_eligible
+                else "missing ops: " + ", ".join(missing_skinny_ops)
+            )
+            raise RuntimeError(f"VLLM_SM70_SKINNY=on cannot overlay AWQ: {reason}.")
+        use_skinny = (
+            envs.use_sm70_skinny_awq() and skinny_eligible and not missing_skinny_ops
+        )
+        skinny_state = None
+        if use_skinny:
+            skinny_state = sm70_skinny.prepare_awq_state(
+                layer.qweight.data,
+                sm70_scales,
+                layer.qzeros.data,
+                group_size,
+            )
+
         use_gated_silu = is_gated_silu_layer and envs.VLLM_SM70_AWQ_MLP_ENGINE
 
         tm_weight, tm_scales, meta = sm70_ops.awq_sm70_prepare(
             layer.qweight,
-            layer.scales,
+            sm70_scales,
             layer.qzeros,
             group_size,
             use_gated_silu,
@@ -383,6 +413,35 @@ class AWQLinearMethod(LinearMethodBase):
         layer._awq_sm70_q_ld = int(meta[1])
         layer._awq_sm70_group_size = group_size
         layer._awq_sm70_prepared = True
+        if skinny_state is not None:
+
+            def reference_apply(x: torch.Tensor) -> torch.Tensor:
+                out = torch.empty(
+                    (x.shape[0], skinny_state.output_size),
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                sm70_ops.awq_gemm_sm70_out(
+                    out,
+                    x,
+                    tm_weight,
+                    tm_scales,
+                    group_size,
+                    layer._awq_sm70_k_ld,
+                    layer._awq_sm70_q_ld,
+                )
+                return out
+
+            layer._awq_sm70_skinny = skinny_state
+            sm70_skinny.validate_awq_state(
+                skinny_state,
+                reference_apply,
+                "turbomind",
+            )
+            logger.info_once(
+                "SM70 Skinny AWQ dense overlay enabled: layout=%s, base=turbomind.",
+                envs.get_sm70_skinny_awq_layout(),
+            )
         if use_gated_silu:
             layer._awq_sm70_gated_silu = True
             layer._awq_sm70_gated_silu_primary = True
@@ -471,6 +530,20 @@ class AWQLinearMethod(LinearMethodBase):
 
         # num_tokens >= threshold
         FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
+        skinny_state = getattr(layer, "_awq_sm70_skinny", None)
+        if skinny_state is not None and getattr(layer, "_awq_sm70_prepared", False):
+            out_shape = x.shape[:-1] + (skinny_state.output_size,)
+            out = sm70_skinny.apply_awq_turbomind_overlay(
+                skinny_state,
+                reshaped_x,
+                layer._awq_sm70_weight,
+                layer._awq_sm70_scales,
+                layer._awq_sm70_k_ld,
+                layer._awq_sm70_q_ld,
+            )
+            if bias is not None:
+                out.add_(bias)
+            return out.reshape(out_shape)
         if getattr(layer, "_awq_sm70_prepared", False):
             out_shape = x.shape[:-1] + (layer._awq_sm70_weight.shape[-1] * pack_factor,)
             out = torch.empty(

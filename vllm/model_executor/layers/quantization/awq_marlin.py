@@ -15,6 +15,9 @@ from vllm.model_executor.kernels.linear import (
     MPLinearLayerConfig,
     choose_mp_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
+    MarlinLinearKernel,
+)
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
@@ -37,6 +40,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
     set_weight_attrs,
 )
+from vllm.model_executor.layers.quantization import sm70_skinny
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.layers.quantization.base_config import (
@@ -101,6 +105,8 @@ def _should_prepare_sm70_awq_dense_route(
     layer: torch.nn.Module,
     input_dtype: torch.dtype | None,
 ) -> bool:
+    if sm70_skinny.selected_base_backend() != "turbomind":
+        return False
     if not sm70_tm.is_exact_sm70_cuda(
         layer.qweight,
         envs.VLLM_SM70_AWQ_TURBOMIND,
@@ -292,12 +298,13 @@ class AWQMarlinConfig(QuantizationConfig):
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> "QuantizationMethods | None":
         sm70_quant_backend = envs.get_sm70_quant_backend()
+        sm70_base_backend = sm70_skinny.selected_base_backend()
         if (
             current_platform.is_cuda()
             and current_platform.has_device_capability(70)
             and not current_platform.has_device_capability(75)
             and (
-                sm70_quant_backend == "turbomind"
+                sm70_base_backend == "turbomind"
                 or (
                     sm70_quant_backend == "auto"
                     and user_quant not in ("marlin", "awq_marlin")
@@ -573,11 +580,50 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _should_prepare_sm70_awq_dense_route(
+        exact_sm70 = layer.qweight.is_cuda and torch.cuda.get_device_capability(
+            layer.qweight.device
+        ) == (7, 0)
+        use_turbomind_base = _should_prepare_sm70_awq_dense_route(
             self.quant_config,
             layer,
             self.input_dtype,
+        )
+        use_marlin_base = isinstance(self.kernel, MarlinLinearKernel)
+        skinny_mode = envs.get_sm70_skinny_mode()
+        skinny_eligible = (
+            exact_sm70
+            and self.quant_config.group_size == sm70_skinny.AWQ_GROUP_SIZE
+            and (use_turbomind_base or use_marlin_base)
+        )
+        missing_skinny_ops = sm70_skinny.missing_awq_ops()
+        if (
+            skinny_mode == "on"
+            and exact_sm70
+            and (not skinny_eligible or missing_skinny_ops)
         ):
+            reason = (
+                "selected base backend does not expose a graph-safe Skinny overlay"
+                if exact_sm70
+                and self.quant_config.group_size == sm70_skinny.AWQ_GROUP_SIZE
+                and not (use_turbomind_base or use_marlin_base)
+                else f"unsupported group_size={self.quant_config.group_size}"
+                if not skinny_eligible
+                else "missing ops: " + ", ".join(missing_skinny_ops)
+            )
+            raise RuntimeError(f"VLLM_SM70_SKINNY=on cannot overlay AWQ: {reason}.")
+        use_skinny = (
+            skinny_eligible and envs.use_sm70_skinny_awq() and not missing_skinny_ops
+        )
+        skinny_state = None
+        if use_skinny:
+            skinny_state = sm70_skinny.prepare_awq_state(
+                layer.qweight.data,
+                layer.scales.data.to(torch.float16).contiguous(),
+                layer.qzeros.data,
+                self.quant_config.group_size,
+            )
+
+        if use_turbomind_base:
             if not hasattr(torch.ops._C, "awq_sm70_prepare"):
                 raise RuntimeError(
                     "VLLM_SM70_AWQ_TURBOMIND=1 requires a build with CUDA "
@@ -585,9 +631,10 @@ class AWQMarlinLinearMethod(LinearMethodBase):
                 )
             from vllm import _sm70_ops as sm70_ops
 
+            sm70_scales = layer.scales.data.to(torch.float16).contiguous()
             tm_weight, tm_scales, meta = sm70_ops.awq_sm70_prepare(
                 layer.qweight,
-                layer.scales,
+                sm70_scales,
                 layer.qzeros,
                 self.quant_config.group_size,
             )
@@ -597,6 +644,30 @@ class AWQMarlinLinearMethod(LinearMethodBase):
             layer._awq_sm70_q_ld = int(meta[1])
             layer._awq_sm70_group_size = self.quant_config.group_size
             layer._awq_sm70_prepared = True
+
+            if skinny_state is not None:
+
+                def reference_apply(x: torch.Tensor) -> torch.Tensor:
+                    out = torch.empty(
+                        (x.shape[0], skinny_state.output_size),
+                        dtype=x.dtype,
+                        device=x.device,
+                    )
+                    sm70_ops.awq_gemm_sm70_out(
+                        out,
+                        x,
+                        tm_weight,
+                        tm_scales,
+                        self.quant_config.group_size,
+                        layer._awq_sm70_k_ld,
+                        layer._awq_sm70_q_ld,
+                    )
+                    return out
+
+                layer._awq_sm70_skinny = skinny_state
+                sm70_skinny.validate_awq_state(
+                    skinny_state, reference_apply, "turbomind"
+                )
 
             layer.qweight = torch.nn.Parameter(
                 torch.empty(0, dtype=torch.int32, device=tm_weight.device),
@@ -610,9 +681,7 @@ class AWQMarlinLinearMethod(LinearMethodBase):
                 torch.empty(0, dtype=tm_scales.dtype, device=tm_weight.device),
                 requires_grad=False,
             )
-            logger.info_once(
-                "SM70 AWQ TurboMind dense path enabled under AWQ Marlin."
-            )
+            logger.info_once("SM70 AWQ TurboMind dense path enabled under AWQ Marlin.")
             return
 
         # AWQ checkpoints use a non-standard packing order and pack qweight
@@ -623,6 +692,19 @@ class AWQMarlinLinearMethod(LinearMethodBase):
             layer, "qweight", "qzeros", self.quant_config.quant_type.size_bits
         )
         self.kernel.process_weights_after_loading(layer)
+        if skinny_state is not None:
+            assert use_marlin_base
+            layer._awq_sm70_skinny = skinny_state
+            sm70_skinny.validate_awq_state(
+                skinny_state,
+                lambda x: self.kernel.apply_weights(layer, x, None),
+                type(self.kernel).__name__,
+            )
+            logger.info_once(
+                "SM70 Skinny AWQ dense overlay enabled: layout=%s, base=%s.",
+                envs.get_sm70_skinny_awq_layout(),
+                type(self.kernel).__name__,
+            )
 
     def apply(
         self,
@@ -630,6 +712,40 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        skinny_state = getattr(layer, "_awq_sm70_skinny", None)
+        if skinny_state is not None and getattr(layer, "_awq_sm70_prepared", False):
+            reshaped_x = x.reshape(-1, x.shape[-1])
+            skinny_out = sm70_skinny.apply_awq_turbomind_overlay(
+                skinny_state,
+                reshaped_x,
+                layer._awq_sm70_weight,
+                layer._awq_sm70_scales,
+                layer._awq_sm70_k_ld,
+                layer._awq_sm70_q_ld,
+            )
+            if bias is not None:
+                skinny_out.add_(bias)
+            return skinny_out.reshape(x.shape[:-1] + (skinny_state.output_size,))
+        if skinny_state is not None:
+            assert isinstance(self.kernel, MarlinLinearKernel)
+            base_weight, base_scales, base_zeros, base_g_idx = (
+                self.kernel._get_weight_params(layer)
+            )
+            assert base_zeros is not None and base_g_idx is not None
+            skinny_out = sm70_skinny.apply_awq_marlin_overlay(
+                skinny_state,
+                x,
+                base_weight,
+                base_scales,
+                base_zeros,
+                base_g_idx,
+                layer.g_idx_sort_indices,
+                self.kernel.workspace,
+                self.kernel.is_k_full,
+            )
+            if bias is not None:
+                skinny_out.add_(bias)
+            return skinny_out.reshape(x.shape[:-1] + (skinny_state.output_size,))
         if getattr(layer, "_awq_sm70_prepared", False):
             reshaped_x = x.reshape(-1, x.shape[-1])
             out_shape = x.shape[:-1] + (

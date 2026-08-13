@@ -1,31 +1,44 @@
-# SM70 skinny NVFP4 dense backend
+# SM70 Skinny NVFP4 dense overlay
 
 ## Scope
 
-The skinny backend is an opt-in small-batch overlay for dense W4A16 NVFP4
-linear layers on exact SM70 GPUs. It is model-agnostic: selection depends on
-the quantization layout and GEMM shape, not on a Qwen model class.
+Skinny is a small-batch decorator for dense W4A16 NVFP4 linear layers on exact
+SM70 GPUs. It is model-agnostic: selection depends on the quantization layout
+and GEMM shape, not on a Qwen model class. The wrapped base kernel remains
+responsible for larger batches and unsupported shapes.
 
-Enable it with:
+The preferred controls are:
 
 ```bash
-VLLM_SM70_QUANT_BACKEND=skinny vllm serve ... --dtype half
+VLLM_SM70_QUANT_BACKEND=auto \
+VLLM_SM70_SKINNY=auto \
+vllm serve ... --dtype half
 ```
 
-`skinny` extends the existing unified SM70 backend selector. Other quantized
-formats continue to use TurboMind. NVFP4 uses this runtime frontier:
+`VLLM_SM70_QUANT_BACKEND` continues to select `auto`, `turbomind`, or
+`marlin`; `VLLM_SM70_SKINNY` independently selects `auto`, `on`, or `off`.
+The old `VLLM_SM70_QUANT_BACKEND=skinny` value is accepted only as a
+compatibility alias for base `auto` plus overlay `on`. NVFP4 uses this runtime
+frontier:
 
 | Condition | Route |
 | --- | --- |
 | FP16, `M <= 3`, `K % 128 == 0`, `N % 8 == 0` | skinny SIMT |
 | FP16, `4 <= M <= 16`, QPN-eligible shape | skinny QPN |
-| Larger M or unsupported shape | TurboMind |
+| Larger M or unsupported shape | selected base kernel |
 | BF16 activation | explicit FP16 conversion, selected route, BF16 output |
 
-The adapter runs one eager comparison against TurboMind for each unique
-`(N, K)` shape at load time. A non-finite result, exception, or relative error
-above `3e-2` disables the skinny routes for the worker; TurboMind remains
-available because its packed state is prepared unconditionally.
+The decorator runs one eager comparison against the selected base for each
+route on every prepared layer state. A non-finite result, exception, or
+relative error above `3e-2` disables only that route for that state; the
+selected base remains available because it is prepared unconditionally.
+
+Dispatch and fallback are contained in one opaque hybrid custom op for each
+supported base (`Skinny+TurboMind` and `Skinny+Marlin`). The op sees the real
+runtime row count, so `torch.compile` or CUDA Graph tracing at M=1 cannot bind a
+later prefill to the SIMT-only route. V100 tests compile one dynamic full graph
+and then verify M=1 SIMT, M=8 QPN, and M=17 base fallback through that same
+compiled callable.
 
 ## Checkpoint contract
 
@@ -47,18 +60,20 @@ step.
 
 For dense models the load-time representation contains:
 
-1. the checkpoint-native codes/scales for SIMT;
-2. one same-size fragment-order QPN copy;
-3. the existing TurboMind packed fallback.
+1. an overlay-owned checkpoint-native codes/scales copy for SIMT;
+2. one same-size fragment-order QPN copy when that layout is enabled;
+3. the selected base kernel's own prepared state.
 
-The native tensors are aliased before TurboMind preparation rather than
-cloned. QPN therefore adds one NVFP4-weight-sized copy, not two. This profile is
-appropriate for dense 27B-class models under tensor parallelism, but it must
-not be applied wholesale to a large MoE expert bank.
+The overlay owns its copy because a base kernel may replace or repack the
+checkpoint tensors in place. This profile is appropriate for dense 27B-class
+models under tensor parallelism, but it must not be applied wholesale to a
+large MoE expert bank.
 
-MoE support should reuse the same CUDA operators and prepack ABI behind a
-separate expert adapter with a bounded or lazy QPN cache. That keeps this dense
-backend reusable while avoiding an unbounded duplicate of every expert.
+MoE is a separate selector. The experimental AWQ expert adapter uses one
+replacement-layout SIMT bank and remains default-off; it does not change this
+Dense NVFP4 decorator or the selected MoE backend. A future NVFP4 expert path
+would still need a bounded/lazy or replacement-layout policy rather than an
+unbounded duplicate of every expert.
 
 ## Provenance
 

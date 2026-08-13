@@ -113,6 +113,9 @@ if TYPE_CHECKING:
     VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS: bool = False
     VLLM_SM70_QUANT_BACKEND: Literal["auto", "marlin", "turbomind", "skinny"] = "auto"
+    VLLM_SM70_SKINNY: Literal["auto", "on", "off"] = "auto"
+    VLLM_SM70_SKINNY_AWQ_LAYOUT: Literal["simt", "qpn", "both"] = "simt"
+    VLLM_SM70_SKINNY_AWQ_MOE: bool = False
     VLLM_SM70_AWQ_TURBOMIND: bool = True
     VLLM_SM70_GPTQ_TURBOMIND: bool = False
     VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND: bool = False
@@ -772,9 +775,18 @@ def env_with_choices(
 
 SM70_QUANT_BACKENDS = ("auto", "marlin", "turbomind", "skinny")
 SM70QuantBackend = Literal["auto", "marlin", "turbomind", "skinny"]
+SM70_SKINNY_MODES = ("auto", "on", "off")
+SM70SkinnyMode = Literal["auto", "on", "off"]
 
 
 def get_sm70_quant_backend() -> SM70QuantBackend:
+    """Read the legacy combined selector.
+
+    New code treats this as the base-backend selector and uses
+    :func:`get_sm70_skinny_mode` for the independent overlay. The historical
+    ``skinny`` value remains a compatibility alias for ``auto`` plus overlay
+    ``on``.
+    """
     value = os.getenv("VLLM_SM70_QUANT_BACKEND", "auto").strip().lower()
     if value not in SM70_QUANT_BACKENDS:
         raise ValueError(
@@ -785,26 +797,75 @@ def get_sm70_quant_backend() -> SM70QuantBackend:
     return cast(SM70QuantBackend, value)
 
 
+def get_sm70_quant_base_backend() -> Literal["auto", "marlin", "turbomind"]:
+    """Return the base backend selected by the existing SM70 variable."""
+    value = get_sm70_quant_backend()
+    if value == "skinny":
+        return "auto"
+    return cast(Literal["auto", "marlin", "turbomind"], value)
+
+
+def get_sm70_skinny_mode() -> SM70SkinnyMode:
+    """Return the independent Skinny overlay mode.
+
+    With no new variable, legacy ``skinny`` means ``on``. Every other value
+    keeps the new default ``auto`` behavior, so choosing a base backend does
+    not silently disable the orthogonal overlay.
+    """
+    raw = os.getenv("VLLM_SM70_SKINNY")
+    if raw is None:
+        legacy = get_sm70_quant_backend()
+        value = "on" if legacy == "skinny" else "auto"
+    else:
+        value = raw.strip().lower()
+    if value not in SM70_SKINNY_MODES:
+        raise ValueError(
+            f"VLLM_SM70_SKINNY must be one of auto, on, off; got {value!r}."
+        )
+    return cast(SM70SkinnyMode, value)
+
+
 def use_sm70_turbomind(default_enabled: bool) -> bool:
-    backend = get_sm70_quant_backend()
+    backend = get_sm70_quant_base_backend()
     if backend == "marlin":
         return False
-    if backend in ("turbomind", "skinny"):
+    if backend == "turbomind":
         return True
     return bool(default_enabled)
 
 
 def force_sm70_marlin() -> bool:
-    return get_sm70_quant_backend() == "marlin"
+    return get_sm70_quant_base_backend() == "marlin"
 
 
 def use_sm70_skinny_nvfp4() -> bool:
     """Use the skinny small-M overlay for SM70 NVFP4 dense layers.
 
-    Other quantized formats continue to use TurboMind when the unified
-    backend is ``skinny``.
+    ``auto`` is eligible because dense NVFP4 has completed its V100 gates.
+    Platform, format, shape, and operator checks remain at the call site.
     """
-    return get_sm70_quant_backend() == "skinny"
+    return get_sm70_skinny_mode() in ("auto", "on")
+
+
+def use_sm70_skinny_awq() -> bool:
+    """Use the format-independent Skinny small-M core for dense SM70 AWQ."""
+    return get_sm70_skinny_mode() in ("auto", "on")
+
+
+def get_sm70_skinny_awq_layout() -> Literal["simt", "qpn", "both"]:
+    """Select resident AWQ Skinny layouts to balance latency and VRAM."""
+    value = os.getenv("VLLM_SM70_SKINNY_AWQ_LAYOUT", "simt").strip().lower()
+    if value not in ("simt", "qpn", "both"):
+        raise ValueError(
+            "VLLM_SM70_SKINNY_AWQ_LAYOUT must be one of simt, qpn, both; "
+            f"got {value!r}."
+        )
+    return cast(Literal["simt", "qpn", "both"], value)
+
+
+def use_sm70_skinny_awq_moe() -> bool:
+    """Enable the replacement-layout grouped AWQ MoE prototype."""
+    return bool(int(os.getenv("VLLM_SM70_SKINNY_AWQ_MOE", "0")))
 
 
 def env_list_with_choices(
@@ -1479,11 +1540,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS": lambda: bool(
         int(os.getenv("VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS", "0"))
     ),
-    # Unified V100/SM70 quantized linear backend selector. "auto" resolves to
-    # TurboMind for supported SM70 quant routes; "skinny" overlays the NVFP4
-    # dense small-M kernels while retaining TurboMind for all fallbacks and
-    # other formats. Only "marlin" forces Marlin.
+    # Existing V100 base-backend selector. The historical "skinny" value is a
+    # compatibility alias for base=auto plus VLLM_SM70_SKINNY=on.
     "VLLM_SM70_QUANT_BACKEND": get_sm70_quant_backend,
+    # Small-M overlay is independent from the existing base-backend selector.
+    "VLLM_SM70_SKINNY": get_sm70_skinny_mode,
+    # Resident layouts for the dense AWQ Skinny overlay. SIMT covers ordinary
+    # M<=3 decode with one additional weight-sized prepack; QPN covers M=4..16
+    # verification, and "both" deliberately pays for both layouts.
+    "VLLM_SM70_SKINNY_AWQ_LAYOUT": get_sm70_skinny_awq_layout,
+    # Replacement-layout grouped MoE prototype. It is deliberately separate
+    # from the dense overlay because it trades TurboMind prefill throughput for
+    # a single-copy expert bank and needs its own end-to-end acceptance gate.
+    "VLLM_SM70_SKINNY_AWQ_MOE": lambda: bool(
+        int(os.getenv("VLLM_SM70_SKINNY_AWQ_MOE", "0"))
+    ),
     # V100/SM70 AWQ dense path using the local TurboMind backend. This matches
     # the 0.0.3 route semantics: enable by default on SM70 and allow an explicit
     # opt-out with VLLM_SM70_AWQ_TURBOMIND=0.

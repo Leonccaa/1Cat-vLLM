@@ -6,7 +6,7 @@ from torch.nn.parameter import Parameter
 
 import vllm.model_executor.kernels.linear.nvfp4.emulation as nvfp4_emulation
 from vllm import envs
-from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
+from vllm.config import DeviceConfig, KernelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
 from vllm.model_executor.kernels.linear.nvfp4.emulation import (
     EmulationNvFp4LinearKernel,
@@ -29,6 +29,14 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 )
 
 
+def _cpu_vllm_config(linear_backend: str) -> VllmConfig:
+    """Keep selector-only tests independent of local CUDA discovery."""
+    return VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        kernel_config=KernelConfig(linear_backend=linear_backend),
+    )
+
+
 def test_sm70_quant_backend_auto_respects_route_default(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_QUANT_BACKEND", raising=False)
 
@@ -42,7 +50,8 @@ def test_sm70_quant_backend_auto_respects_route_default(monkeypatch):
     assert not envs.use_sm70_turbomind(True)
 
     monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "skinny")
-    assert envs.use_sm70_turbomind(False)
+    assert not envs.use_sm70_turbomind(False)
+    assert envs.get_sm70_quant_base_backend() == "auto"
     assert envs.use_sm70_skinny_nvfp4()
 
 
@@ -51,42 +60,30 @@ def test_nvfp4_min_capability_honors_linear_backend_emulation(monkeypatch):
     monkeypatch.delenv("VLLM_NVFP4_GEMM_BACKEND", raising=False)
     monkeypatch.delenv("VLLM_SM70_QUANT_BACKEND", raising=False)
 
-    with set_current_vllm_config(
-        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
-    ):
+    with set_current_vllm_config(_cpu_vllm_config("auto")):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
 
     monkeypatch.setenv("VLLM_SM70_NVFP4_TURBOMIND", "0")
-    with set_current_vllm_config(
-        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
-    ):
+    with set_current_vllm_config(_cpu_vllm_config("auto")):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 75
 
     monkeypatch.delenv("VLLM_SM70_NVFP4_TURBOMIND", raising=False)
     monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "marlin")
-    with set_current_vllm_config(
-        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
-    ):
+    with set_current_vllm_config(_cpu_vllm_config("auto")):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
 
     monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "turbomind")
-    with set_current_vllm_config(
-        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
-    ):
+    with set_current_vllm_config(_cpu_vllm_config("auto")):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
 
-    with set_current_vllm_config(
-        VllmConfig(kernel_config=KernelConfig(linear_backend="emulation"))
-    ):
+    with set_current_vllm_config(_cpu_vllm_config("emulation")):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
 
 
 def test_nvfp4_min_capability_honors_legacy_emulation_env(monkeypatch):
     monkeypatch.setenv("VLLM_NVFP4_GEMM_BACKEND", "emulation")
 
-    with set_current_vllm_config(
-        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
-    ):
+    with set_current_vllm_config(_cpu_vllm_config("auto")):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
 
 

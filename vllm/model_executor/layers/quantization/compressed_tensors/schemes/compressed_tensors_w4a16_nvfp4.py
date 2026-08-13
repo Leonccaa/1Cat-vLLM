@@ -5,19 +5,14 @@ from collections.abc import Callable
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm import envs
-from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
 from vllm.model_executor.kernels.linear.nvfp4 import NvFp4LinearLayerConfig
-from vllm.model_executor.kernels.linear.nvfp4.skinny import (
-    SkinnyNvFp4LinearKernel,
+from vllm.model_executor.kernels.linear.nvfp4.marlin import (
+    MarlinNvFp4LinearKernel,
 )
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
-)
-from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-    apply_fp4_marlin_linear,
-    prepare_fp4_layer_for_marlin,
 )
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
@@ -26,8 +21,6 @@ from vllm.model_executor.parameter import (
 )
 
 __all__ = ["CompressedTensorsW4A16Fp4"]
-
-logger = init_logger(__name__)
 
 
 class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
@@ -97,37 +90,16 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
             1.0 / layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
-        if sm70_tm.uses_skinny_nvfp4():
-            supported, reason = SkinnyNvFp4LinearKernel.is_supported()
-            if not supported:
-                raise RuntimeError(
-                    "VLLM_SM70_QUANT_BACKEND=skinny was requested, but the "
-                    f"backend is unavailable: {reason}."
-                )
-            self.skinny_kernel = SkinnyNvFp4LinearKernel(NvFp4LinearLayerConfig())
-            self.skinny_kernel.process_weights_after_loading(layer)
-            return
-
-        if sm70_tm.should_prepare_turbomind(
-            layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
-        ):
-            logger.info_once(
-                "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path enabled."
-            )
-            sm70_tm.prepare_nvfp4_linear(layer)
-            layer.weight = Parameter(
-                torch.empty(0, dtype=torch.uint8, device=layer.weight.device),
-                requires_grad=False,
-            )
-            layer.weight_scale = Parameter(
-                torch.empty(
-                    0, dtype=torch.float8_e4m3fn, device=layer.weight_scale.device
-                ),
-                requires_grad=False,
-            )
-            return
-
-        prepare_fp4_layer_for_marlin(layer)
+        # This on-disk scheme is weight-only W4A16. Preserve its existing
+        # Marlin behavior away from V100: the generic NVFP4 registry also
+        # contains W4A4 kernels that require activation-scale state this
+        # scheme intentionally does not create. Exact SM70 alone uses the
+        # base selector plus optional Skinny decorator.
+        if sm70_tm.is_exact_sm70_cuda_platform():
+            self.nvfp4_kernel = init_nvfp4_linear_kernel()
+        else:
+            self.nvfp4_kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())
+        self.nvfp4_kernel.process_weights_after_loading(layer)
 
     def apply_weights(
         self,
@@ -135,17 +107,4 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if hasattr(self, "skinny_kernel"):
-            return self.skinny_kernel.apply_weights(layer, x, bias)
-        if sm70_tm.has_prepared_linear(layer):
-            return sm70_tm.apply_prepared_linear(layer, x, bias)
-        return apply_fp4_marlin_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            weight_global_scale=layer.weight_global_scale,
-            workspace=layer.workspace,
-            size_n=layer.output_size_per_partition,
-            size_k=layer.input_size_per_partition,
-            bias=bias,
-        )
+        return self.nvfp4_kernel.apply_weights(layer, x, bias)
