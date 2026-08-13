@@ -19,8 +19,49 @@ AWQ_GROUP_SIZE = 128
 _SELF_CHECK_TOL = 3e-2
 _AWQ_REVERSE_PACK_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
 _QPN_K_ORDER = (0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15)
+_QPN_TARGET_BLOCKS = 160
 
 _awq_route_log_seen: set[tuple[str, int, torch.dtype]] = set()
+
+
+def qpn_k_splits(
+    input_size: int,
+    output_size: int,
+    target_blocks: int = _QPN_TARGET_BLOCKS,
+) -> int:
+    """Mirror the CUDA QPN split-K launch policy for load-time diagnostics."""
+    warps = 4
+    min_groups_per_warp = 4
+    max_splits = 16
+    group_count = input_size // 16
+    tiles = output_size // 32
+    splits = 1
+    while splits < max_splits:
+        if tiles * splits >= target_blocks:
+            break
+        next_splits = splits * 2
+        if group_count % (warps * next_splits) != 0:
+            break
+        if group_count // (warps * next_splits) < min_groups_per_warp:
+            break
+        splits = next_splits
+    return splits
+
+
+def log_qpn_split_geometry(format_name: str, input_size: int, output_size: int) -> None:
+    """Log once per unique shape whether QPN split-K will actually engage."""
+    splits = qpn_k_splits(input_size, output_size)
+    logger.info_once(
+        "SM70 Skinny %s QPN split-K %s for N=%d K=%d: "
+        "splits=%d, N32 tiles=%d, target_blocks=%d.",
+        format_name,
+        "active" if splits > 1 else "inactive",
+        output_size,
+        input_size,
+        splits,
+        output_size // 32,
+        _QPN_TARGET_BLOCKS,
+    )
 
 
 def selected_base_backend(default_auto: str = "turbomind") -> str:
@@ -68,6 +109,11 @@ class SM70SkinnyAwqState:
     output_size: int
     disabled_routes: set[str]
     validated_routes: set[tuple[str, str]]
+    # Checkpoint-native (qweight, scales, qzeros), retained only while the
+    # strict self-check needs them so the FP32 ground truth can start from the
+    # on-disk format and therefore also cover the prepack. Released by
+    # validate_awq_state; None when the strict check is off.
+    native: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     @property
     def has_simt(self) -> bool:
@@ -211,8 +257,14 @@ def prepare_awq_state(
         qpn_codes, qpn_scales, qpn_biases = qpn_prepack_awq(
             codes, logical_scales, biases
         )
+        if qpn_codes is not None:
+            log_qpn_split_geometry("AWQ", qweight.shape[0], qweight.shape[1] * 8)
     else:
         qpn_codes = qpn_scales = qpn_biases = None
+        logger.info_once(
+            "SM70 Skinny AWQ QPN disabled by layout=simt; split-K is not "
+            "part of this load."
+        )
 
     keep_simt = layout in ("simt", "both")
     return SM70SkinnyAwqState(
@@ -227,6 +279,9 @@ def prepare_awq_state(
         output_size=qweight.shape[1] * 8,
         disabled_routes=set(),
         validated_routes=set(),
+        native=(
+            (qweight, scales, qzeros) if envs.use_sm70_skinny_strict_check() else None
+        ),
     )
 
 
@@ -597,6 +652,118 @@ def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float(error.item())
 
 
+def _error_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    """Report more than one number.
+
+    A single max-relative scalar hides exactly the failures worth catching: a
+    handful of bad elements disappear into the max over a large output, and
+    near-zero outputs look fine relative to the tensor-wide maximum.
+    """
+    difference = (actual.float() - expected.float()).abs()
+    denominator = expected.float().abs().max().clamp(min=1e-6)
+    quantiles = torch.quantile(
+        difference.flatten().float(),
+        torch.tensor([0.5, 0.99, 1.0], device=difference.device),
+    )
+    return {
+        "max_rel": float((difference.max() / denominator).item()),
+        "rms": float(difference.pow(2).mean().sqrt().item()),
+        "p50": float(quantiles[0].item()),
+        "p99": float(quantiles[1].item()),
+        "max_abs": float(quantiles[2].item()),
+    }
+
+
+def awq_fp32_reference(
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    biases: torch.Tensor,
+    x: torch.Tensor,
+    chunk: int = 4096,
+) -> torch.Tensor:
+    """Independent FP32 ground truth for the AWQ g128 Skinny layout.
+
+    Deliberately shares no code with the kernels or with the base backends:
+    comparing Skinny against TurboMind or Marlin cannot catch an error that
+    both make, and both consume the same checkpoint through similar unpack
+    logic. This walks the packed bytes directly in FP32.
+
+    ``codes`` is uint8 [N, K/2] with the low nibble at even k, ``scales`` and
+    ``biases`` are FP16 [N, K/128], and ``x`` is [M, K]. Chunked over N so a
+    vocabulary-sized projection does not materialize an N*K FP32 weight.
+
+    Scope: this starts from the Skinny layout, so it validates the kernel but
+    not the native-AWQ to Skinny prepack that produced that layout. Use
+    :func:`awq_native_fp32_reference` to cover the prepack as well.
+    """
+    n, packed_k = codes.shape
+    k = packed_k * 2
+    groups = scales.shape[1]
+    out = x.new_empty((x.shape[0], n), dtype=torch.float32)
+    x32 = x.float()
+    for start in range(0, n, chunk):
+        stop = min(start + chunk, n)
+        block = codes[start:stop]
+        nibbles = torch.stack((block & 0xF, block >> 4), dim=-1)
+        quantized = nibbles.reshape(stop - start, k).float()
+        weight = quantized * scales[start:stop].float().repeat_interleave(
+            k // groups, dim=1
+        ) + biases[start:stop].float().repeat_interleave(k // groups, dim=1)
+        out[:, start:stop] = x32 @ weight.t()
+    return out
+
+
+def awq_native_fp32_reference(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
+    group_size: int,
+    x: torch.Tensor,
+    chunk: int = 1024,
+) -> torch.Tensor:
+    """FP32 ground truth computed from the checkpoint-native AWQ tensors.
+
+    Starts one step earlier than :func:`awq_fp32_reference`: from the int32
+    tensors as they appear on disk, so it covers the native-to-Skinny prepack
+    (nibble de-interleave, transpose to N-major, byte repack, ``bias = -z*s``)
+    in addition to the kernel. It also works for any resident layout, since it
+    never touches the Skinny buffers.
+
+    It performs the shifts, transpose and group expansion independently; it
+    necessarily shares the AWQ nibble-order convention, because that
+    convention *is* the on-disk format definition rather than an implementation
+    choice.
+
+    ``qweight`` is int32 [K, N/8], ``qzeros`` int32 [G, N/8], ``scales``
+    FP16 [G, N], ``x`` is [M, K]. Returns [M, N] in FP32. Chunked over K to
+    bound the dequantized weight.
+    """
+    # Logical index j lives at nibble slot AWQ_SLOT[j] inside each int32.
+    awq_slot = torch.tensor(
+        [0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.long, device=qweight.device
+    )
+    shifts = (awq_slot * 4).to(torch.int32)
+
+    def unpack(packed: torch.Tensor) -> torch.Tensor:
+        # [rows, cols] int32 -> [rows, cols * 8] uint8, logical order.
+        wide = (packed.unsqueeze(-1) >> shifts.view(1, 1, 8)) & 0xF
+        return wide.reshape(packed.shape[0], -1)
+
+    k, n = qweight.shape[0], qweight.shape[1] * 8
+    zeros = unpack(qzeros).float()  # [G, N]
+    scales32 = scales.float()  # [G, N]
+
+    out = x.new_zeros((x.shape[0], n), dtype=torch.float32)
+    x32 = x.float()
+    for start in range(0, k, chunk):
+        stop = min(start + chunk, k)
+        q = unpack(qweight[start:stop]).float()  # [chunk, N]
+        rows = torch.arange(start, stop, device=qweight.device) // group_size
+        weight = (q - zeros[rows]) * scales32[rows]  # [chunk, N]
+        out += x32[:, start:stop] @ weight
+    return out
+
+
 def validate_awq_state(
     state: SM70SkinnyAwqState,
     reference_apply: Callable[[torch.Tensor], torch.Tensor],
@@ -617,51 +784,103 @@ def validate_awq_state(
         cases.append((8, "qpn"))
     for m, route in cases:
         validation_key = (base_backend, route)
-        if validation_key in state.validated_routes or route in state.disabled_routes:
-            continue
-        try:
-            values = torch.arange(
-                m * state.input_size,
-                device=state.codes.device,
-                dtype=torch.int32,
-            )
-            x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(
-                m, state.input_size
-            )
-            reference = reference_apply(x)
-            if route == "simt":
-                actual = sm70_ops.skinny_awq_gemm_simt(
-                    x,
-                    state.codes,
-                    state.scales,
-                    state.biases,
-                    state.group_size,
+        local_error: Exception | None = None
+        local_ok = route not in state.disabled_routes
+        if local_ok and validation_key not in state.validated_routes:
+            try:
+                values = torch.arange(
+                    m * state.input_size,
+                    device=state.codes.device,
+                    dtype=torch.int32,
                 )
-            else:
-                actual = sm70_ops.skinny_awq_gemm_qpn(
-                    x,
-                    state.qpn_codes,
-                    state.qpn_scales,
-                    state.qpn_biases,
-                    state.group_size,
+                x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(
+                    m, state.input_size
+                )
+                reference = reference_apply(x)
+                if route == "simt":
+                    actual = sm70_ops.skinny_awq_gemm_simt(
+                        x,
+                        state.codes,
+                        state.scales,
+                        state.biases,
+                        state.group_size,
+                    )
+                else:
+                    actual = sm70_ops.skinny_awq_gemm_qpn(
+                        x,
+                        state.qpn_codes,
+                        state.qpn_scales,
+                        state.qpn_biases,
+                        state.group_size,
+                        state.output_size,
+                    )
+                relative_error = _relative_error(actual, reference)
+                if (
+                    not math.isfinite(relative_error)
+                    or relative_error > _SELF_CHECK_TOL
+                ):
+                    raise RuntimeError(
+                        f"{route} relative error {relative_error:.3e} exceeds "
+                        f"{_SELF_CHECK_TOL:.3e}"
+                    )
+                if envs.use_sm70_skinny_strict_check() and state.native is not None:
+                    # Start from checkpoint-native tensors so the independent
+                    # reference also covers the prepack.
+                    truth = awq_native_fp32_reference(
+                        state.native[0],
+                        state.native[1],
+                        state.native[2],
+                        state.group_size,
+                        x,
+                    )
+                    stats = _error_stats(actual, truth)
+                    logger.info(
+                        "SM70 Skinny AWQ %s FP32 ground truth N=%d K=%d: "
+                        "max_rel=%.3e rms=%.3e p50=%.3e p99=%.3e max_abs=%.3e",
+                        route,
+                        state.output_size,
+                        state.input_size,
+                        stats["max_rel"],
+                        stats["rms"],
+                        stats["p50"],
+                        stats["p99"],
+                        stats["max_abs"],
+                    )
+                    if (
+                        not math.isfinite(stats["max_rel"])
+                        or stats["max_rel"] > _SELF_CHECK_TOL
+                    ):
+                        raise RuntimeError(
+                            f"{route} FP32 ground-truth relative error "
+                            f"{stats['max_rel']:.3e} exceeds {_SELF_CHECK_TOL:.3e}"
+                        )
+            except Exception as exc:
+                local_ok = False
+                local_error = exc
+                logger.exception(
+                    "SM70 Skinny AWQ %s local self-check failed for N=%d K=%d "
+                    "against base=%s.",
+                    route,
                     state.output_size,
+                    state.input_size,
+                    base_backend,
                 )
-            relative_error = _relative_error(actual, reference)
-            if not math.isfinite(relative_error) or relative_error > _SELF_CHECK_TOL:
+
+        if not _all_ranks_succeeded(local_ok):
+            _release_awq_route(state, route)
+            if local_error is None:
+                logger.error(
+                    "SM70 Skinny AWQ %s self-check failed on another TP rank "
+                    "for N=%d K=%d; disabling this route on every rank.",
+                    route,
+                    state.output_size,
+                    state.input_size,
+                )
+            if envs.get_sm70_skinny_mode() == "on":
                 raise RuntimeError(
-                    f"{route} relative error {relative_error:.3e} exceeds "
-                    f"{_SELF_CHECK_TOL:.3e}"
-                )
-        except Exception:
-            state.disabled_routes.add(route)
-            logger.exception(
-                "SM70 Skinny AWQ %s self-check failed for N=%d K=%d "
-                "against base=%s; disabling only this route.",
-                route,
-                state.output_size,
-                state.input_size,
-                base_backend,
-            )
+                    "VLLM_SM70_SKINNY=on requires the AWQ "
+                    f"{route} self-check to pass on every TP rank."
+                ) from local_error
             continue
         state.validated_routes.add(validation_key)
         logger.info_once(
@@ -671,6 +890,318 @@ def validate_awq_state(
             state.input_size,
             base_backend,
         )
+
+    # The native tensors exist only for the strict check; the caller frees the
+    # originals right after loading, so do not keep a second reference alive.
+    state.native = None
+
+
+@dataclass
+class _ResidencyDecision:
+    """Per-(N, K) verdict on whether the overlay earns its VRAM."""
+
+    roi: float  # microseconds saved per MiB of overlay
+    mib: float
+    saved_us: float
+    keep: bool
+
+
+_residency_decisions: dict[tuple[int, int, str], _ResidencyDecision] = {}
+
+
+# Volta's L2 is 6 MiB; 24 MiB of dirty traffic evicts it comfortably.
+_L2_FLUSH_BYTES = 24 << 20
+_l2_flush_buffer: torch.Tensor | None = None
+
+
+def _flush_l2(device: torch.device) -> None:
+    """Evict L2 so the next timed call streams its weights from HBM.
+
+    Without this, a layer whose overlay is smaller than L2 gets cache hits on
+    every iteration after the first, which is not what decode does - decode
+    walks the whole model before returning to this layer. Worse, the hits are
+    asymmetric: Skinny loads codes with __ldcs (evict-first) while the base
+    backend does not, so the base backend collects the free hits and the shape
+    is scored against Skinny. That is exactly the artifact the standalone
+    harness rotates buffers to avoid.
+    """
+    global _l2_flush_buffer
+    if _l2_flush_buffer is None or _l2_flush_buffer.device != device:
+        _l2_flush_buffer = torch.empty(
+            _L2_FLUSH_BYTES // 4, dtype=torch.float32, device=device
+        )
+    _l2_flush_buffer.zero_()
+
+
+def _time_apply(
+    fn: Callable[[], torch.Tensor],
+    iterations: int = 12,
+    device: torch.device | None = None,
+) -> float:
+    """Median wall time of one L2-cold GEMM call, in microseconds.
+
+    Each call is timed on its own with an L2 flush outside the timing window,
+    so the measurement reflects a cold weight stream rather than a hot loop.
+    """
+    if device is None:
+        device = torch.accelerator.current_device_index()
+    for _ in range(3):
+        fn()
+    torch.accelerator.synchronize()
+    samples: list[float] = []
+    for _ in range(iterations):
+        _flush_l2(
+            torch.device(device) if not isinstance(device, torch.device) else device
+        )
+        torch.accelerator.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        stop.record()
+        stop.synchronize()
+        samples.append(start.elapsed_time(stop) * 1000.0)
+    samples.sort()
+    return samples[len(samples) // 2]
+
+
+def _agree_across_tp(value: float | None) -> float | None:
+    """Reduce a valid per-rank measurement across the whole TP group.
+
+    Each rank runs its own timing, so without this the four ranks of a TP4
+    deployment can reach different keep/drop verdicts on the same shape when
+    their measurements straddle the threshold. That would leave inconsistent
+    memory per card while the slowest rank still sets decode speed.
+
+    Every rank must call this for every candidate route, including after a
+    local timing failure. The first tensor element is therefore a validity bit;
+    if any rank failed, all ranks receive ``None`` and keep the base fallback.
+    For valid measurements take the minimum: decode waits for the slowest rank,
+    so the least optimistic saving describes the deployment.
+    """
+    valid = value is not None and math.isfinite(value)
+    local_value = value if valid else 0.0
+    try:
+        from vllm.distributed import get_tp_group
+
+        group = get_tp_group()
+        if group is None or group.world_size <= 1:
+            return local_value if valid else None
+        tensor = torch.tensor(
+            [1.0 if valid else 0.0, local_value],
+            dtype=torch.float64,
+            device=torch.accelerator.current_device_index(),
+        )
+        torch.distributed.all_reduce(
+            tensor, op=torch.distributed.ReduceOp.MIN, group=group.device_group
+        )
+        if tensor[0].item() < 1.0:
+            return None
+        return float(tensor[1].item())
+    except Exception:
+        # No TP group yet, or a backend that cannot reduce here: fall back to
+        # the local value rather than failing the load.
+        logger.warning_once(
+            "SM70 Skinny TP consensus is unavailable during model load; "
+            "using the local route decision."
+        )
+        return local_value if valid else None
+
+
+def _all_ranks_succeeded(local_ok: bool) -> bool:
+    """Return true only when every TP rank reached the same successful point."""
+    return _agree_across_tp(0.0 if local_ok else None) is not None
+
+
+def _release_awq_route(state: SM70SkinnyAwqState, route: str) -> None:
+    """Release a disabled AWQ layout immediately instead of retaining dead VRAM."""
+    empty_codes = state.codes.new_empty(0)
+    empty_meta = state.scales.new_empty(0)
+    if route == "simt":
+        state.codes = empty_codes
+        state.scales = empty_meta
+        state.biases = empty_meta
+    elif route == "qpn":
+        state.qpn_codes = empty_codes
+        state.qpn_scales = empty_meta
+        state.qpn_biases = empty_meta
+    else:
+        raise ValueError(f"Unknown SM70 Skinny AWQ route {route!r}.")
+    state.disabled_routes.add(route)
+
+
+def overlay_mib(output_size: int, input_size: int, layouts: int = 1) -> float:
+    """Resident overlay bytes for one dense layer, in MiB.
+
+    AWQ g128 costs 0.5 byte/weight of codes plus an FP16 scale and an FP16 bias
+    per 128 weights, i.e. 0.53125 byte/weight, per resident layout.
+    """
+    return output_size * input_size * 0.53125 * layouts / (1024.0 * 1024.0)
+
+
+def _measure_route_roi(
+    state: SM70SkinnyAwqState,
+    reference_apply: Callable[[torch.Tensor], torch.Tensor],
+    route: str,
+) -> _ResidencyDecision | None:
+    """Time one resident route against the base backend at its own M."""
+    from vllm import _sm70_ops as sm70_ops
+
+    rows = 1 if route == "simt" else 8
+    device = state.codes.device if route == "simt" else state.qpn_codes.device
+    values = torch.arange(rows * state.input_size, device=device, dtype=torch.int32)
+    x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(
+        rows, state.input_size
+    )
+    if route == "simt":
+
+        def skinny():
+            return sm70_ops.skinny_awq_gemm_simt(
+                x, state.codes, state.scales, state.biases, state.group_size
+            )
+
+    else:
+
+        def skinny():
+            return sm70_ops.skinny_awq_gemm_qpn(
+                x,
+                state.qpn_codes,
+                state.qpn_scales,
+                state.qpn_biases,
+                state.group_size,
+                state.output_size,
+            )
+
+    local_saved: float | None = None
+    try:
+        base_us = _time_apply(lambda: reference_apply(x), device=device)
+        skinny_us = _time_apply(skinny, device=device)
+        local_saved = base_us - skinny_us
+    except Exception:
+        logger.exception(
+            "SM70 Skinny AWQ %s local residency measurement failed for N=%d K=%d.",
+            route,
+            state.output_size,
+            state.input_size,
+        )
+
+    # Participate even after a local timing failure. Otherwise healthy peers
+    # enter all_reduce while this rank skips it and model load deadlocks.
+    saved = _agree_across_tp(local_saved)
+    if saved is None:
+        logger.warning_once(
+            "SM70 Skinny AWQ %s residency measurement failed on at least one "
+            "TP rank for N=%d K=%d; keeping the overlay on every rank.",
+            route,
+            state.output_size,
+            state.input_size,
+        )
+        return None
+    mib = overlay_mib(state.output_size, state.input_size)
+    roi = saved / mib if mib > 0 else 0.0
+    decision = _ResidencyDecision(
+        roi=roi,
+        mib=mib,
+        saved_us=saved,
+        keep=roi >= envs.get_sm70_skinny_min_roi(),
+    )
+    logger.info(
+        "SM70 Skinny AWQ residency %s N=%d K=%d: base=%.1fus skinny=%.1fus "
+        "saved=%.1fus overlay=%.1fMiB roi=%.3fus/MiB -> %s",
+        route,
+        state.output_size,
+        state.input_size,
+        base_us,
+        skinny_us,
+        saved,
+        mib,
+        roi,
+        "keep" if decision.keep else "drop",
+    )
+    return decision
+
+
+def apply_residency_policy(
+    state: SM70SkinnyAwqState,
+    reference_apply: Callable[[torch.Tensor], torch.Tensor],
+) -> bool:
+    """Release the overlay layouts that do not earn their memory.
+
+    The overlay holds a second full copy of every weight it covers, so on a
+    32 GiB V100 it trades directly against KV cache and context length. That
+    trade is not uniform across layers: where the base backend already
+    saturates HBM there is no latency left to win, but the memory cost is the
+    same as anywhere else.
+
+    SIMT and QPN are scored separately, each at the M it actually serves (M=1
+    and M=8) and each charged only its own copy of the weights. They are
+    independent residency decisions: a shape can be worth keeping for decode
+    and not worth keeping for MTP verification, or the reverse.
+
+    Decisions are cached per (N, K, route), so the cost is a few timed GEMMs
+    per distinct shape rather than per layer, and each measurement is reduced
+    across the TP group so every rank reaches the same verdict.
+
+    Returns True while any Skinny route is still resident.
+    """
+    for disabled_route in tuple(state.disabled_routes):
+        _release_awq_route(state, disabled_route)
+
+    routes = []
+    if state.has_simt and "simt" not in state.disabled_routes:
+        routes.append("simt")
+    if state.has_qpn and "qpn" not in state.disabled_routes:
+        routes.append("qpn")
+    if not routes:
+        return False
+
+    if envs.get_sm70_skinny_mode() == "on":
+        logger.info_once(
+            "VLLM_SM70_SKINNY=on keeps every self-check-passing AWQ route; "
+            "the performance residency gate is bypassed."
+        )
+        return True
+
+    for route in routes:
+        key = (state.output_size, state.input_size, route)
+        decision = _residency_decisions.get(key)
+        # A cache miss must also be agreed across TP. If one process reused a
+        # cached result while another entered the timing collective, load would
+        # deadlock. A mixed cache state makes every rank remeasure.
+        if not _all_ranks_succeeded(decision is not None):
+            decision = _measure_route_roi(state, reference_apply, route)
+            if decision is None:
+                continue  # measurement failed; keep this route
+            _residency_decisions[key] = decision
+        assert decision is not None
+        if decision.keep:
+            continue
+        _release_awq_route(state, route)
+
+    return state.has_simt or state.has_qpn
+
+
+def log_residency_summary() -> None:
+    """One ranked table so a real threshold can be chosen from real numbers."""
+    if not _residency_decisions:
+        return
+    kept = sum(d.mib for d in _residency_decisions.values() if d.keep)
+    dropped = sum(d.mib for d in _residency_decisions.values() if not d.keep)
+    lines = [
+        f"  {key[2]:<4} N={key[0]:>6} K={key[1]:>6}  roi={d.roi:8.3f}us/MiB  "
+        f"saved={d.saved_us:7.1f}us  overlay={d.mib:8.1f}MiB  "
+        f"{'keep' if d.keep else 'drop'}"
+        for key, d in sorted(_residency_decisions.items(), key=lambda kv: -kv[1].roi)
+    ]
+    logger.info_once(
+        "SM70 Skinny AWQ residency summary (per distinct shape, per layer "
+        "instance; threshold VLLM_SM70_SKINNY_MIN_ROI=%.3f):\n%s\n"
+        "  kept %.1f MiB/layer-set, dropped %.1f MiB/layer-set",
+        envs.get_sm70_skinny_min_roi(),
+        "\n".join(lines),
+        kept,
+        dropped,
+    )
 
 
 def select_awq_route(state: SM70SkinnyAwqState, rows: int) -> str | None:

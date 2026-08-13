@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 from torch.nn.parameter import Parameter
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -380,6 +382,95 @@ def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float(error.item())
 
 
+# E2M1: sign in bit 3, magnitude in bits 2:0.
+_E2M1_MAGNITUDE = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def nvfp4_fp32_reference(
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    x: torch.Tensor,
+    chunk: int = 4096,
+) -> torch.Tensor:
+    """Independent FP32 ground truth for the NVFP4 group-16 Skinny layout.
+
+    Shares no code with the kernels or the base backends. In particular it does
+    not reproduce the kernel's 16384 exponent trick or its bit-shuffle FP8
+    decode, so a mistake in either shows up here rather than cancelling out.
+
+    ``codes`` is uint8 [N, K/2] holding two E2M1 nibbles per byte with the low
+    nibble at even k, ``scales`` is uint8 [N, K/16] of FP8-E4M3 bytes, and
+    ``x`` is [M, K]. Chunked over N to bound the dequantized weight.
+    """
+    n, packed_k = codes.shape
+    k = packed_k * 2
+    groups = scales.shape[1]
+    lut = torch.tensor(_E2M1_MAGNITUDE, dtype=torch.float32, device=codes.device)
+    out = x.new_empty((x.shape[0], n), dtype=torch.float32)
+    x32 = x.float()
+    for start in range(0, n, chunk):
+        stop = min(start + chunk, n)
+        block = codes[start:stop]
+        nibbles = torch.stack((block & 0xF, block >> 4), dim=-1).reshape(
+            stop - start, k
+        )
+        magnitude = lut[(nibbles & 0x7).long()]
+        signed = torch.where(nibbles & 0x8 != 0, -magnitude, magnitude)
+        # torch decodes E4M3 natively; no need to mirror the kernel's shifts.
+        group_scale = (
+            scales[start:stop].view(torch.float8_e4m3fn).float() * global_scale
+        )
+        weight = signed * group_scale.repeat_interleave(k // groups, dim=1)
+        out[:, start:stop] = x32 @ weight.t()
+    return out
+
+
+def _error_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    """Report more than one number; a lone max-relative scalar hides
+    localized errors and near-zero outputs."""
+    difference = (actual.float() - expected.float()).abs()
+    denominator = expected.float().abs().max().clamp(min=1e-6)
+    quantiles = torch.quantile(
+        difference.flatten().float(),
+        torch.tensor([0.5, 0.99, 1.0], device=difference.device),
+    )
+    return {
+        "max_rel": float((difference.max() / denominator).item()),
+        "rms": float(difference.pow(2).mean().sqrt().item()),
+        "p50": float(quantiles[0].item()),
+        "p99": float(quantiles[1].item()),
+        "max_abs": float(quantiles[2].item()),
+    }
+
+
+@dataclass
+class _ResidencyDecision:
+    """Per-(N, K) verdict on whether the overlay earns its VRAM."""
+
+    roi: float  # microseconds saved per MiB of overlay
+    mib: float
+    saved_us: float
+    keep: bool
+
+
+_residency_decisions: dict[tuple[int, int, str], _ResidencyDecision] = {}
+
+
+def _release_route(layer: torch.nn.Module, route: str) -> None:
+    """Release a disabled NVFP4 layout immediately."""
+    empty = layer.skinny_codes.data.new_empty(0)
+    if route == "simt":
+        layer.skinny_codes = Parameter(empty, requires_grad=False)
+        layer.skinny_scales = Parameter(empty, requires_grad=False)
+    elif route == "qpn":
+        layer.skinny_qpn_codes = Parameter(empty, requires_grad=False)
+        layer.skinny_qpn_scales = Parameter(empty, requires_grad=False)
+    else:
+        raise ValueError(f"Unknown SM70 Skinny NVFP4 route {route!r}.")
+    layer.skinny_disabled_routes.add(route)
+
+
 class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
     """SM70 small-M NVFP4 decorator over a selected base kernel."""
 
@@ -422,58 +513,113 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
         return True, None
 
     def _validate_shape(self, layer: torch.nn.Module) -> None:
+        from vllm.model_executor.layers.quantization.sm70_skinny import (
+            _all_ranks_succeeded,
+        )
+
         n = layer.output_size_per_partition
         k = layer.input_size_per_partition
+        native_codes = layer.skinny_codes
+        native_scales = layer.skinny_scales
         cases = [(1, "simt")]
         if layer.skinny_qpn_codes.numel() > 0:
             cases.append((8, "qpn"))
 
         for m, route in cases:
-            if route in layer.skinny_disabled_routes:
-                continue
             validation_key = (type(self.base_kernel).__name__, route)
-            if validation_key in layer.skinny_validated_routes:
-                continue
-            try:
-                values = torch.arange(
-                    m * k, device=layer.skinny_codes.device, dtype=torch.int32
-                )
-                x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(m, k)
-                reference = self.base_kernel.apply_weights(layer, x, None)
-                if route == "simt":
-                    actual = torch.ops._C.skinny_nvfp4_gemm_simt(
-                        x,
-                        layer.skinny_codes,
-                        layer.skinny_scales,
-                        layer.skinny_global_scale,
+            local_error: Exception | None = None
+            local_ok = route not in layer.skinny_disabled_routes
+            if local_ok and validation_key not in layer.skinny_validated_routes:
+                try:
+                    values = torch.arange(
+                        m * k, device=native_codes.device, dtype=torch.int32
                     )
-                else:
-                    actual = torch.ops._C.skinny_nvfp4_gemm_qpn(
-                        x,
-                        layer.skinny_qpn_codes,
-                        layer.skinny_qpn_scales,
-                        layer.skinny_global_scale,
+                    x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(
+                        m, k
+                    )
+                    reference = self.base_kernel.apply_weights(layer, x, None)
+                    if route == "simt":
+                        actual = torch.ops._C.skinny_nvfp4_gemm_simt(
+                            x,
+                            layer.skinny_codes,
+                            layer.skinny_scales,
+                            layer.skinny_global_scale,
+                        )
+                    else:
+                        actual = torch.ops._C.skinny_nvfp4_gemm_qpn(
+                            x,
+                            layer.skinny_qpn_codes,
+                            layer.skinny_qpn_scales,
+                            layer.skinny_global_scale,
+                            n,
+                        )
+                    relative_error = _relative_error(actual, reference)
+                    if (
+                        not math.isfinite(relative_error)
+                        or relative_error > _SELF_CHECK_TOL
+                    ):
+                        raise RuntimeError(
+                            f"{route} relative error {relative_error:.3e} exceeds "
+                            f"{_SELF_CHECK_TOL:.3e}"
+                        )
+                    if envs.use_sm70_skinny_strict_check():
+                        stats = _error_stats(
+                            actual,
+                            nvfp4_fp32_reference(
+                                native_codes,
+                                native_scales,
+                                layer.skinny_global_scale,
+                                x,
+                            ),
+                        )
+                        logger.info(
+                            "SM70 Skinny NVFP4 %s FP32 ground truth N=%d K=%d: "
+                            "max_rel=%.3e rms=%.3e p50=%.3e p99=%.3e max_abs=%.3e",
+                            route,
+                            n,
+                            k,
+                            stats["max_rel"],
+                            stats["rms"],
+                            stats["p50"],
+                            stats["p99"],
+                            stats["max_abs"],
+                        )
+                        if (
+                            not math.isfinite(stats["max_rel"])
+                            or stats["max_rel"] > _SELF_CHECK_TOL
+                        ):
+                            raise RuntimeError(
+                                f"{route} FP32 ground-truth relative error "
+                                f"{stats['max_rel']:.3e} exceeds "
+                                f"{_SELF_CHECK_TOL:.3e}"
+                            )
+                except Exception as exc:
+                    local_ok = False
+                    local_error = exc
+                    logger.exception(
+                        "SM70 Skinny NVFP4 %s local self-check failed for "
+                        "N=%d K=%d against base=%s.",
+                        route,
                         n,
+                        k,
+                        type(self.base_kernel).__name__,
                     )
-                relative_error = _relative_error(actual, reference)
-                if (
-                    not math.isfinite(relative_error)
-                    or relative_error > _SELF_CHECK_TOL
-                ):
+
+            if not _all_ranks_succeeded(local_ok):
+                _release_route(layer, route)
+                if local_error is None:
+                    logger.error(
+                        "SM70 Skinny NVFP4 %s self-check failed on another TP "
+                        "rank for N=%d K=%d; disabling it on every rank.",
+                        route,
+                        n,
+                        k,
+                    )
+                if envs.get_sm70_skinny_mode() == "on":
                     raise RuntimeError(
-                        f"{route} relative error {relative_error:.3e} exceeds "
-                        f"{_SELF_CHECK_TOL:.3e}"
-                    )
-            except Exception:
-                layer.skinny_disabled_routes.add(route)
-                logger.exception(
-                    "SM70 Skinny NVFP4 %s self-check failed for N=%d K=%d "
-                    "against base=%s; disabling only this route.",
-                    route,
-                    n,
-                    k,
-                    type(self.base_kernel).__name__,
-                )
+                        "VLLM_SM70_SKINNY=on requires the NVFP4 "
+                        f"{route} self-check to pass on every TP rank."
+                    ) from local_error
                 continue
             layer.skinny_validated_routes.add(validation_key)
             logger.info_once(
@@ -513,6 +659,10 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
         )
 
         qcodes, qscales = qpn_prepack(layer.skinny_codes.data, layer.skinny_scales.data)
+        if qcodes is not None:
+            from vllm.model_executor.layers.quantization import sm70_skinny
+
+            sm70_skinny.log_qpn_split_geometry("NVFP4", k, n)
         empty = layer.skinny_codes.data.new_empty(0)
         layer.register_parameter(
             "skinny_qpn_codes",
@@ -524,14 +674,154 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
         )
         layer.skinny_disabled_routes = set()
         layer.skinny_validated_routes = set()
+        layer.skinny_enabled = True
 
         self.base_kernel.process_weights_after_loading(layer)
 
         self._validate_shape(layer)
+        if not self._apply_residency_policy(layer):
+            return
         logger.info_once(
             "SM70 Skinny NVFP4 dense overlay enabled: SIMT M<=3, QPN M=4..16, base=%s.",
             type(self.base_kernel).__name__,
         )
+
+    def _apply_residency_policy(self, layer: torch.nn.Module) -> bool:
+        """Release the overlay layouts that do not earn their VRAM.
+
+        NVFP4 keeps a second copy of every covered weight at 0.5625 byte each
+        (plus another for QPN), which on a 32 GiB V100 comes straight out of
+        KV cache. Where the base backend already saturates HBM there is no
+        latency left to win, so the copy is pure cost.
+
+        SIMT and QPN are scored separately at the M each actually serves and
+        charged only their own copy, because a shape can be worth keeping for
+        decode and not for MTP verification, or the reverse. Timing is L2-cold
+        and reduced across the TP group so every rank agrees - see
+        sm70_skinny._time_apply and _agree_across_tp for why both matter.
+        """
+        from vllm.model_executor.layers.quantization.sm70_skinny import (
+            _agree_across_tp,
+            _all_ranks_succeeded,
+            _time_apply,
+        )
+
+        n = layer.output_size_per_partition
+        k = layer.input_size_per_partition
+        per_layout_mib = n * k * 0.5625 / (1024.0 * 1024.0)
+
+        for disabled_route in tuple(layer.skinny_disabled_routes):
+            _release_route(layer, disabled_route)
+
+        routes = []
+        if (
+            layer.skinny_codes.numel() > 0
+            and "simt" not in layer.skinny_disabled_routes
+        ):
+            routes.append("simt")
+        if (
+            layer.skinny_qpn_codes.numel() > 0
+            and "qpn" not in layer.skinny_disabled_routes
+        ):
+            routes.append("qpn")
+        if not routes:
+            layer.skinny_enabled = False
+            return False
+
+        if envs.get_sm70_skinny_mode() == "on":
+            logger.info_once(
+                "VLLM_SM70_SKINNY=on keeps every self-check-passing NVFP4 "
+                "route; the performance residency gate is bypassed."
+            )
+            return True
+
+        device = layer.skinny_codes.device
+        for route in routes:
+            key = (n, k, route)
+            decision = _residency_decisions.get(key)
+            if not _all_ranks_succeeded(decision is not None):
+                rows = 1 if route == "simt" else 8
+                values = torch.arange(rows * k, device=device, dtype=torch.int32)
+                x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(rows, k)
+                if route == "simt":
+
+                    def skinny(x=x):
+                        return torch.ops._C.skinny_nvfp4_gemm_simt(
+                            x,
+                            layer.skinny_codes,
+                            layer.skinny_scales,
+                            layer.skinny_global_scale,
+                        )
+
+                else:
+
+                    def skinny(x=x):
+                        return torch.ops._C.skinny_nvfp4_gemm_qpn(
+                            x,
+                            layer.skinny_qpn_codes,
+                            layer.skinny_qpn_scales,
+                            layer.skinny_global_scale,
+                            n,
+                        )
+
+                def base(x: torch.Tensor = x) -> torch.Tensor:
+                    return self.base_kernel.apply_weights(layer, x)
+
+                local_saved: float | None = None
+                try:
+                    base_us = _time_apply(base, device=device)
+                    skinny_us = _time_apply(skinny, device=device)
+                    local_saved = base_us - skinny_us
+                except Exception:
+                    logger.exception(
+                        "SM70 Skinny NVFP4 %s local residency measurement "
+                        "failed for N=%d K=%d.",
+                        route,
+                        n,
+                        k,
+                    )
+                saved = _agree_across_tp(local_saved)
+                if saved is None:
+                    logger.warning_once(
+                        "SM70 Skinny NVFP4 %s residency measurement failed on "
+                        "at least one TP rank for N=%d K=%d; keeping the "
+                        "overlay on every rank.",
+                        route,
+                        n,
+                        k,
+                    )
+                    continue
+                roi = saved / per_layout_mib if per_layout_mib > 0 else 0.0
+                decision = _ResidencyDecision(
+                    roi=roi,
+                    mib=per_layout_mib,
+                    saved_us=saved,
+                    keep=roi >= envs.get_sm70_skinny_min_roi(),
+                )
+                _residency_decisions[key] = decision
+                logger.info(
+                    "SM70 Skinny NVFP4 residency %s N=%d K=%d: base=%.1fus "
+                    "skinny=%.1fus saved=%.1fus overlay=%.1fMiB "
+                    "roi=%.3fus/MiB -> %s",
+                    route,
+                    n,
+                    k,
+                    base_us,
+                    skinny_us,
+                    saved,
+                    per_layout_mib,
+                    roi,
+                    "keep" if decision.keep else "drop",
+                )
+            assert decision is not None
+            if decision.keep:
+                continue
+            _release_route(layer, route)
+
+        layer.skinny_enabled = (
+            layer.skinny_codes.numel() > 0 or layer.skinny_qpn_codes.numel() > 0
+        )
+        return layer.skinny_enabled
 
     def apply_weights(
         self,
@@ -541,6 +831,10 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
     ) -> torch.Tensor:
         k = layer.input_size_per_partition
         n = layer.output_size_per_partition
+        if not getattr(layer, "skinny_enabled", True):
+            # Residency policy released this shape's overlay; go straight to
+            # the base backend rather than paying the hybrid op's dispatch.
+            return self.base_kernel.apply_weights(layer, x, bias)
         reshaped_x = x.reshape(-1, k).contiguous()
         rows = reshaped_x.shape[0]
         simt_codes = (

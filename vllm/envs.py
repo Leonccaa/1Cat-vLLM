@@ -116,6 +116,8 @@ if TYPE_CHECKING:
     VLLM_SM70_SKINNY: Literal["auto", "on", "off"] = "auto"
     VLLM_SM70_SKINNY_AWQ_LAYOUT: Literal["simt", "qpn", "both"] = "simt"
     VLLM_SM70_SKINNY_AWQ_MOE: bool = False
+    VLLM_SM70_SKINNY_MIN_ROI: float = 0.0
+    VLLM_SM70_SKINNY_STRICT_CHECK: bool = False
     VLLM_SM70_AWQ_TURBOMIND: bool = True
     VLLM_SM70_GPTQ_TURBOMIND: bool = False
     VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND: bool = False
@@ -868,6 +870,39 @@ def use_sm70_skinny_awq_moe() -> bool:
     return bool(int(os.getenv("VLLM_SM70_SKINNY_AWQ_MOE", "0")))
 
 
+def get_sm70_skinny_min_roi() -> float:
+    """Minimum overlay return-on-investment, in microseconds saved per MiB.
+
+    The overlay keeps a second copy of every covered weight, so it trades VRAM
+    (and therefore KV cache) for decode latency. Not every layer earns that
+    trade: a shape where the base backend already saturates HBM has nothing
+    left to win, yet still pays full price in memory.
+
+    At load time each distinct (N, K) is timed against the selected base
+    backend and admitted only if it clears this threshold. The default of 0.0
+    keeps any shape with a measurable win and drops the rest. Raise it to trade
+    more decode latency for more VRAM; the per-shape table is logged at load so
+    a target can be picked from real numbers instead of guessed.
+    """
+    raw = os.getenv("VLLM_SM70_SKINNY_MIN_ROI", "0")
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"VLLM_SM70_SKINNY_MIN_ROI must be a float; got {raw!r}."
+        ) from exc
+
+
+def use_sm70_skinny_strict_check() -> bool:
+    """Validate the overlay against an independent FP32 dequant reference.
+
+    The routine self-check compares Skinny against the selected base backend,
+    which cannot catch an error both share. This enables a slower, pure-PyTorch
+    FP32 ground truth instead. Off by default because it costs load time.
+    """
+    return bool(int(os.getenv("VLLM_SM70_SKINNY_STRICT_CHECK", "0")))
+
+
 def env_list_with_choices(
     env_name: str,
     default: list[str],
@@ -1555,6 +1590,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_SKINNY_AWQ_MOE": lambda: bool(
         int(os.getenv("VLLM_SM70_SKINNY_AWQ_MOE", "0"))
     ),
+    # Minimum microseconds saved per MiB of overlay for a shape to stay
+    # resident. The overlay doubles the weight footprint of every layer it
+    # covers, so shapes where the base backend already saturates HBM are pure
+    # VRAM cost. Load-time measurement decides; 0.0 keeps any measurable win.
+    "VLLM_SM70_SKINNY_MIN_ROI": get_sm70_skinny_min_roi,
+    # Validate against an independent FP32 dequant reference instead of only
+    # cross-checking against the selected base backend.
+    "VLLM_SM70_SKINNY_STRICT_CHECK": use_sm70_skinny_strict_check,
     # V100/SM70 AWQ dense path using the local TurboMind backend. This matches
     # the 0.0.3 route semantics: enable by default on SM70 and allow an explicit
     # opt-out with VLLM_SM70_AWQ_TURBOMIND=0.

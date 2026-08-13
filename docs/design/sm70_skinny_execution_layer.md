@@ -42,8 +42,10 @@ The two controls are deliberately orthogonal:
 - `VLLM_SM70_SKINNY=auto|on|off` controls only the small-`M` overlay.
 
 Both default to `auto`. On exact SM70, `SKINNY=auto` enables only a validated
-Dense format/shape/operator route; `on` is a fail-closed test mode, and `off`
-is the one-variable rollback to the unmodified selected base. The historical
+Dense format/shape/operator route. `on` is a fail-closed test mode: correctness
+self-checks still run, but a failure aborts instead of silently falling back
+and the performance residency gate is bypassed. `off` is the one-variable
+rollback to the unmodified selected base. The historical
 `VLLM_SM70_QUANT_BACKEND=skinny` spelling remains a compatibility alias for
 base `auto` plus `VLLM_SM70_SKINNY=on`, but new launch scripts should use the
 two controls above.
@@ -170,6 +172,13 @@ The earlier full-checkpoint gate for
 NVFP4 acceptance: Dense SIMT/QPN routes, native MTP3, image, video, tool use,
 and a 262,016-token request passed. Its routed experts remained Marlin; that
 mixed-MoE result must not be attributed entirely to the Dense kernel.
+
+After the split-K changes, the same real checkpoint passed an additional TP4
+MTP3 regression with full graph capture. QPN executed at M=4/8/12, SIMT at
+M=1, and the selected TurboMind base handled large M; all four Dense shapes
+passed both route self-checks. A fixed 4040-to-256 request measured 3610.06
+prefill tok/s and 78.03 decode tok/s. This closes functional compatibility of
+the retained split-K path, but is not a paired speed comparison.
 
 ### Grouped AWQ MoE prototype
 

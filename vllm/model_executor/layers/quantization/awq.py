@@ -432,16 +432,20 @@ class AWQLinearMethod(LinearMethodBase):
                 )
                 return out
 
-            layer._awq_sm70_skinny = skinny_state
             sm70_skinny.validate_awq_state(
                 skinny_state,
                 reference_apply,
                 "turbomind",
             )
-            logger.info_once(
-                "SM70 Skinny AWQ dense overlay enabled: layout=%s, base=turbomind.",
-                envs.get_sm70_skinny_awq_layout(),
-            )
+            # Only attach the overlay if it earns its VRAM on this shape; the
+            # policy releases the Skinny tensors when it does not.
+            if sm70_skinny.apply_residency_policy(skinny_state, reference_apply):
+                layer._awq_sm70_skinny = skinny_state
+                logger.info_once(
+                    "SM70 Skinny AWQ dense overlay enabled: layout=%s, base=turbomind.",
+                    envs.get_sm70_skinny_awq_layout(),
+                )
+            sm70_skinny.log_residency_summary()
         if use_gated_silu:
             layer._awq_sm70_gated_silu = True
             layer._awq_sm70_gated_silu_primary = True

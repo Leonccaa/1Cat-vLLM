@@ -6,8 +6,8 @@
 // This is the production small-M subset adapted from v100-skinny commit
 // f8194f7c3c9269fa74ee70b5029d53c20098f4c8. 1Cat dispatches FP16 M<=3
 // to SIMT and M=4..16 to QPN; the Python adapter explicitly converts BF16
-// activations to FP16, while TurboMind remains the fallback for unsupported
-// shapes and larger M.
+// activations to FP16. Unsupported shapes and larger M fall back to the
+// selected base backend (TurboMind or Marlin), not to TurboMind specifically.
 //
 // Packed format (0.5625 bytes/weight):
 //   codes  uint8 [N][K/2]   two E2M1 codes per byte, low nibble = even k
@@ -20,6 +20,9 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <cmath>
+#include <cstdint>
+
 #include "../sm70_skinny/formats/nvfp4.cuh"
 #include "../sm70_skinny/qpn.cuh"
 #include "../sm70_skinny/simt.cuh"
@@ -30,6 +33,31 @@ using vllm::sm70_skinny::Nvfp4SimtPolicy;
 // ---------------------------------------------------------------------------
 // Host dispatch
 // ---------------------------------------------------------------------------
+// The kernels issue uint4 loads against the activation and uint2 loads against
+// the packed codes. is_contiguous() alone does not guarantee that: a
+// contiguous view carved out of a larger buffer can start at any element
+// offset. Check the pointers rather than rely on the caller's row width.
+static void check_alignment(const torch::Tensor& x, const torch::Tensor& codes,
+                            const torch::Tensor& scales) {
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
+              "SM70 Skinny NVFP4 activation must be 16-byte aligned.");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(codes.data_ptr()) % 8 == 0,
+              "SM70 Skinny NVFP4 codes must be 8-byte aligned.");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(scales.data_ptr()) % 4 == 0,
+              "SM70 Skinny NVFP4 scales must be 4-byte aligned.");
+}
+
+// decode_nvfp4_tm folds a 16384 compensation into the group scale, so the
+// compensated global scale must itself stay representable in FP16. The
+// remaining product with the per-group FP8 scale is data dependent and is left
+// to the load-time self-check.
+static void check_global_scale(double gscale) {
+  TORCH_CHECK(
+      std::isfinite(gscale) && gscale >= 0.0 && gscale * 16384.0 < 65504.0,
+      "SM70 Skinny NVFP4 global scale ", gscale,
+      " is out of range; gscale * 16384 must be a finite FP16 value.");
+}
+
 static void check_inputs(const torch::Tensor& x, const torch::Tensor& codes,
                          const torch::Tensor& scales, int64_t& m, int64_t& n,
                          int64_t& k) {
@@ -43,11 +71,13 @@ static void check_inputs(const torch::Tensor& x, const torch::Tensor& codes,
   n = codes.size(0);
   TORCH_CHECK(codes.size(1) * 2 == k, "codes/x K mismatch");
   TORCH_CHECK(scales.size(0) == n && scales.size(1) * 16 == k);
+  check_alignment(x, codes, scales);
 }
 torch::Tensor skinny_gemm_simt(torch::Tensor x, torch::Tensor codes,
                                torch::Tensor scales, double gscale) {
   int64_t m, n, k;
   check_inputs(x, codes, scales, m, n, k);
+  check_global_scale(gscale);
   constexpr int KC = 1024;
   TORCH_CHECK(k % 128 == 0 && k >= 128, "K must be a multiple of 128");
   TORCH_CHECK(n % 8 == 0, "N must be a multiple of 8");
@@ -56,41 +86,30 @@ torch::Tensor skinny_gemm_simt(torch::Tensor x, torch::Tensor codes,
   // per warp restores latency hiding (shape diagnostic: out_proj K=1536
   // ran at 66% of flagship bandwidth with one row per warp).
   const bool two_rows = (k <= 2048) && (n % 16 == 0);
-  const dim3 grid(two_rows ? n / 16 : n / 8), block(256);
   auto stream = at::cuda::getCurrentCUDAStream();
-  const int smem = (int)m * (KC / 2) * sizeof(half2);
+  const int smem = vllm::sm70_skinny::simt_shared_bytes((int)m, KC);
   const Nvfp4SimtPolicy::Params params = {codes.data_ptr<uint8_t>(),
                                           scales.data_ptr<uint8_t>(), (int)k,
                                           (float)gscale};
-
-#define LAUNCH_SIMT(MM)                                                      \
-  if (two_rows)                                                              \
-    vllm::sm70_skinny::simt_kernel<Nvfp4SimtPolicy, MM, KC, 2>               \
-        <<<grid, block, smem, stream>>>(                                     \
-            params, reinterpret_cast<const half*>(x.data_ptr<at::Half>()),   \
-            reinterpret_cast<half*>(y.data_ptr<at::Half>()), (int)n, (int)k, \
-            nullptr, nullptr);                                               \
-  else                                                                       \
-    vllm::sm70_skinny::simt_kernel<Nvfp4SimtPolicy, MM, KC, 1>               \
-        <<<grid, block, smem, stream>>>(                                     \
-            params, reinterpret_cast<const half*>(x.data_ptr<at::Half>()),   \
-            reinterpret_cast<half*>(y.data_ptr<at::Half>()), (int)n, (int)k, \
-            nullptr, nullptr)
+  const half* x_ptr = reinterpret_cast<const half*>(x.data_ptr<at::Half>());
+  half* y_ptr = reinterpret_cast<half*>(y.data_ptr<at::Half>());
 
   switch (m) {
     case 1:
-      LAUNCH_SIMT(1);
+      vllm::sm70_skinny::launch_simt_kernel<Nvfp4SimtPolicy, 1, KC>(
+          params, x_ptr, y_ptr, (int)n, (int)k, two_rows, smem, stream);
       break;
     case 2:
-      LAUNCH_SIMT(2);
+      vllm::sm70_skinny::launch_simt_kernel<Nvfp4SimtPolicy, 2, KC>(
+          params, x_ptr, y_ptr, (int)n, (int)k, two_rows, smem, stream);
       break;
     case 3:
-      LAUNCH_SIMT(3);
+      vllm::sm70_skinny::launch_simt_kernel<Nvfp4SimtPolicy, 3, KC>(
+          params, x_ptr, y_ptr, (int)n, (int)k, two_rows, smem, stream);
       break;
     default:
       TORCH_CHECK(false, "simt kernel supports M in 1..3, got ", m);
   }
-#undef LAUNCH_SIMT
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;
 }
@@ -109,23 +128,35 @@ torch::Tensor skinny_gemm_qpn(torch::Tensor x, torch::Tensor qcodes,
   TORCH_CHECK(n % 32 == 0, "N % 32");
   TORCH_CHECK(qcodes.numel() == n * (k >> 1), "qpn codes size");
   TORCH_CHECK(qscales.numel() == n * (k >> 4), "qpn scales size");
+  check_alignment(x, qcodes, qscales);
+  check_global_scale(gscale);
   auto y = torch::empty({m, n}, x.options());
   auto stream = at::cuda::getCurrentCUDAStream();
   const Nvfp4QpnPolicy::Params params = {qcodes.data_ptr<uint8_t>(),
                                          qscales.data_ptr<uint8_t>(),
                                          (int)(k / 16), (float)gscale};
-  if (m <= 8)
-    vllm::sm70_skinny::qpn_kernel<Nvfp4QpnPolicy, 1>
-        <<<dim3((int)(n / 32)), dim3(128), 0, stream>>>(
-            params, reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
-            reinterpret_cast<half*>(y.data_ptr<at::Half>()), (int)n, (int)k,
-            (int)m);
-  else
-    vllm::sm70_skinny::qpn_kernel<Nvfp4QpnPolicy, 2>
-        <<<dim3((int)(n / 32)), dim3(128), 0, stream>>>(
-            params, reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
-            reinterpret_cast<half*>(y.data_ptr<at::Half>()), (int)n, (int)k,
-            (int)m);
+
+  const int k_splits = vllm::sm70_skinny::qpn_choose_k_splits(
+      (int)k, (int)n, vllm::sm70_skinny::kQpnTargetBlocks);
+  torch::Tensor workspace;
+  float* workspace_ptr = nullptr;
+  if (k_splits > 1) {
+    workspace =
+        torch::empty({k_splits, m, n}, x.options().dtype(torch::kFloat32));
+    workspace_ptr = workspace.data_ptr<float>();
+  }
+  const half* x_ptr = reinterpret_cast<const half*>(x.data_ptr<at::Half>());
+  half* y_ptr = reinterpret_cast<half*>(y.data_ptr<at::Half>());
+
+  if (m <= 8) {
+    vllm::sm70_skinny::launch_qpn_kernel<Nvfp4QpnPolicy, 1>(
+        params, x_ptr, y_ptr, workspace_ptr, (int)n, (int)k, (int)m, k_splits,
+        stream);
+  } else {
+    vllm::sm70_skinny::launch_qpn_kernel<Nvfp4QpnPolicy, 2>(
+        params, x_ptr, y_ptr, workspace_ptr, (int)n, (int)k, (int)m, k_splits,
+        stream);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;
 }

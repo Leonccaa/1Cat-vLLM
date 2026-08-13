@@ -7,6 +7,8 @@
 #include <torch/all.h>
 #include <torch/library.h>
 
+#include <cstdint>
+
 #include "formats/awq.cuh"
 #include "qpn.cuh"
 #include "simt.cuh"
@@ -15,6 +17,21 @@ using vllm::sm70_skinny::AwqG128QpnPolicy;
 using vllm::sm70_skinny::AwqG128SimtPolicy;
 
 namespace {
+
+// The kernels issue uint4 loads against the activation and uint2 loads against
+// the packed codes. is_contiguous() alone does not guarantee that: a
+// contiguous view carved out of a larger buffer can start at any element
+// offset. Check the pointers rather than rely on the caller's row width.
+void check_alignment(const torch::Tensor& input, const torch::Tensor& codes,
+                     const torch::Tensor& scales, const torch::Tensor& biases) {
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0,
+              "SM70 Skinny AWQ activation must be 16-byte aligned.");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(codes.data_ptr()) % 8 == 0,
+              "SM70 Skinny AWQ codes must be 8-byte aligned.");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(scales.data_ptr()) % 4 == 0 &&
+                  reinterpret_cast<uintptr_t>(biases.data_ptr()) % 4 == 0,
+              "SM70 Skinny AWQ metadata must be 4-byte aligned.");
+}
 
 void check_simt_inputs(const torch::Tensor& input, const torch::Tensor& codes,
                        const torch::Tensor& scales, const torch::Tensor& biases,
@@ -42,6 +59,7 @@ void check_simt_inputs(const torch::Tensor& input, const torch::Tensor& codes,
   TORCH_CHECK(scales.size(0) == output_size &&
                   scales.size(1) * group_size == input_size,
               "SM70 Skinny AWQ metadata shape mismatch.");
+  check_alignment(input, codes, scales, biases);
 }
 
 torch::Tensor skinny_awq_gemm_simt(torch::Tensor input, torch::Tensor codes,
@@ -58,9 +76,8 @@ torch::Tensor skinny_awq_gemm_simt(torch::Tensor input, torch::Tensor codes,
   constexpr int kChunkK = 1024;
   auto output = torch::empty({rows, output_size}, input.options());
   const bool two_rows_per_warp = input_size <= 2048 && output_size % 16 == 0;
-  const dim3 grid(two_rows_per_warp ? output_size / 16 : output_size / 8);
-  const dim3 block(256);
-  const int shared_bytes = rows * (kChunkK / 2) * sizeof(half2);
+  const int shared_bytes =
+      vllm::sm70_skinny::simt_shared_bytes(static_cast<int>(rows), kChunkK);
   const auto stream = at::cuda::getCurrentCUDAStream();
   const AwqG128SimtPolicy::Params params = {
       codes.data_ptr<uint8_t>(),
@@ -68,37 +85,31 @@ torch::Tensor skinny_awq_gemm_simt(torch::Tensor input, torch::Tensor codes,
       reinterpret_cast<const half*>(biases.data_ptr<at::Half>()),
       static_cast<int>(input_size),
   };
-
-#define LAUNCH_AWQ_SIMT(MM)                                                    \
-  if (two_rows_per_warp)                                                       \
-    vllm::sm70_skinny::simt_kernel<AwqG128SimtPolicy, MM, kChunkK, 2>          \
-        <<<grid, block, shared_bytes, stream>>>(                               \
-            params, reinterpret_cast<const half*>(input.data_ptr<at::Half>()), \
-            reinterpret_cast<half*>(output.data_ptr<at::Half>()),              \
-            static_cast<int>(output_size), static_cast<int>(input_size),       \
-            nullptr, nullptr);                                                 \
-  else                                                                         \
-    vllm::sm70_skinny::simt_kernel<AwqG128SimtPolicy, MM, kChunkK, 1>          \
-        <<<grid, block, shared_bytes, stream>>>(                               \
-            params, reinterpret_cast<const half*>(input.data_ptr<at::Half>()), \
-            reinterpret_cast<half*>(output.data_ptr<at::Half>()),              \
-            static_cast<int>(output_size), static_cast<int>(input_size),       \
-            nullptr, nullptr)
+  const half* input_ptr =
+      reinterpret_cast<const half*>(input.data_ptr<at::Half>());
+  half* output_ptr = reinterpret_cast<half*>(output.data_ptr<at::Half>());
+  const int n = static_cast<int>(output_size);
+  const int k = static_cast<int>(input_size);
 
   switch (rows) {
     case 1:
-      LAUNCH_AWQ_SIMT(1);
+      vllm::sm70_skinny::launch_simt_kernel<AwqG128SimtPolicy, 1, kChunkK>(
+          params, input_ptr, output_ptr, n, k, two_rows_per_warp, shared_bytes,
+          stream);
       break;
     case 2:
-      LAUNCH_AWQ_SIMT(2);
+      vllm::sm70_skinny::launch_simt_kernel<AwqG128SimtPolicy, 2, kChunkK>(
+          params, input_ptr, output_ptr, n, k, two_rows_per_warp, shared_bytes,
+          stream);
       break;
     case 3:
-      LAUNCH_AWQ_SIMT(3);
+      vllm::sm70_skinny::launch_simt_kernel<AwqG128SimtPolicy, 3, kChunkK>(
+          params, input_ptr, output_ptr, n, k, two_rows_per_warp, shared_bytes,
+          stream);
       break;
     default:
       TORCH_CHECK(false, "unreachable AWQ SIMT M");
   }
-#undef LAUNCH_AWQ_SIMT
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }
@@ -129,6 +140,7 @@ torch::Tensor skinny_awq_gemm_qpn(torch::Tensor input, torch::Tensor codes,
   TORCH_CHECK(scales.numel() == output_size * input_size / group_size &&
                   biases.numel() == scales.numel(),
               "SM70 Skinny AWQ QPN metadata size mismatch.");
+  check_alignment(input, codes, scales, biases);
 
   auto output = torch::empty({rows, output_size}, input.options());
   const auto stream = at::cuda::getCurrentCUDAStream();
@@ -138,20 +150,31 @@ torch::Tensor skinny_awq_gemm_qpn(torch::Tensor input, torch::Tensor codes,
       reinterpret_cast<const half*>(biases.data_ptr<at::Half>()),
       static_cast<int>(input_size / 16),
   };
+
+  const int k_splits = vllm::sm70_skinny::qpn_choose_k_splits(
+      static_cast<int>(input_size), static_cast<int>(output_size),
+      vllm::sm70_skinny::kQpnTargetBlocks);
+  torch::Tensor workspace;
+  float* workspace_ptr = nullptr;
+  if (k_splits > 1) {
+    workspace = torch::empty({k_splits, rows, output_size},
+                             input.options().dtype(torch::kFloat32));
+    workspace_ptr = workspace.data_ptr<float>();
+  }
+  const half* input_ptr =
+      reinterpret_cast<const half*>(input.data_ptr<at::Half>());
+  half* output_ptr = reinterpret_cast<half*>(output.data_ptr<at::Half>());
+  const int n = static_cast<int>(output_size);
+  const int k = static_cast<int>(input_size);
+
   if (rows <= 8) {
-    vllm::sm70_skinny::qpn_kernel<AwqG128QpnPolicy, 1>
-        <<<dim3(static_cast<int>(output_size / 32)), dim3(128), 0, stream>>>(
-            params, reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
-            reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-            static_cast<int>(output_size), static_cast<int>(input_size),
-            static_cast<int>(rows));
+    vllm::sm70_skinny::launch_qpn_kernel<AwqG128QpnPolicy, 1>(
+        params, input_ptr, output_ptr, workspace_ptr, n, k,
+        static_cast<int>(rows), k_splits, stream);
   } else {
-    vllm::sm70_skinny::qpn_kernel<AwqG128QpnPolicy, 2>
-        <<<dim3(static_cast<int>(output_size / 32)), dim3(128), 0, stream>>>(
-            params, reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
-            reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-            static_cast<int>(output_size), static_cast<int>(input_size),
-            static_cast<int>(rows));
+    vllm::sm70_skinny::launch_qpn_kernel<AwqG128QpnPolicy, 2>(
+        params, input_ptr, output_ptr, workspace_ptr, n, k,
+        static_cast<int>(rows), k_splits, stream);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
@@ -200,6 +223,8 @@ void skinny_awq_moe_gemm_simt_out(torch::Tensor output, torch::Tensor input,
     return;
   }
 
+  check_alignment(input, codes, scales, biases);
+
   constexpr int kChunkK = 1024;
   const AwqG128SimtPolicy::Params params = {
       codes.data_ptr<uint8_t>(),
@@ -207,10 +232,14 @@ void skinny_awq_moe_gemm_simt_out(torch::Tensor output, torch::Tensor input,
       reinterpret_cast<const half*>(biases.data_ptr<at::Half>()),
       static_cast<int>(input_size),
   };
+  // Each MoE block stages exactly one routed token's activation. This path is
+  // a default-off prototype with no performance evidence behind it, so it
+  // keeps the plain chunked staging rather than the dense path's tuning.
+  const dim3 grid(static_cast<int>(output_size / 8), static_cast<int>(rows));
+  const dim3 block(256);
+  const auto stream = at::cuda::getCurrentCUDAStream();
   vllm::sm70_skinny::moe_simt_kernel<AwqG128SimtPolicy, kChunkK>
-      <<<dim3(static_cast<int>(output_size / 8), static_cast<int>(rows)),
-         dim3(256), (kChunkK / 2) * sizeof(half2),
-         at::cuda::getCurrentCUDAStream()>>>(
+      <<<grid, block, (kChunkK / 2) * sizeof(half2), stream>>>(
           params, reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
           expert_ids.data_ptr<int>(),
           reinterpret_cast<half*>(output.data_ptr<at::Half>()),

@@ -269,3 +269,66 @@ def test_ct_w4a16_preserves_non_sm70_marlin_base(monkeypatch):
     scheme.process_weights_after_loading(layer)
 
     assert calls == ["marlin"]
+
+
+def test_nvfp4_fp32_reference_matches_elementwise_dequant():
+    """Check the ground truth itself against an explicit per-element decode.
+
+    The reference deliberately avoids the kernel's 16384 exponent trick and its
+    bit-shuffle FP8 path, so this test pins it to the plain E2M1 x E4M3
+    definition rather than to the kernel it is meant to police.
+    """
+    torch.manual_seed(0)
+    n, k = 16, 128
+    codes = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8)
+    scales = torch.randint(40, 80, (n, k // 16), dtype=torch.uint8)
+    x = (torch.rand(2, k) - 0.5).to(torch.float16)
+    gscale = 0.037
+
+    actual = skinny.nvfp4_fp32_reference(codes, scales, gscale, x)
+
+    magnitude = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    expected = torch.zeros(2, n, dtype=torch.float32)
+    for col in range(n):
+        for kk in range(k):
+            byte = int(codes[col, kk // 2])
+            nib = byte & 0xF if kk % 2 == 0 else byte >> 4
+            value = magnitude[nib & 0x7]
+            if nib & 0x8:
+                value = -value
+            group_scale = float(scales[col, kk // 16].view(torch.float8_e4m3fn).float())
+            weight = value * group_scale * gscale
+            for row in range(2):
+                expected[row, col] += float(x[row, kk]) * weight
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_nvfp4_fp32_reference_chunking_is_transparent():
+    torch.manual_seed(2)
+    n, k = 64, 128
+    codes = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8)
+    scales = torch.randint(40, 80, (n, k // 16), dtype=torch.uint8)
+    x = (torch.rand(1, k) - 0.5).to(torch.float16)
+
+    whole = skinny.nvfp4_fp32_reference(codes, scales, 0.5, x, chunk=n)
+    chunked = skinny.nvfp4_fp32_reference(codes, scales, 0.5, x, chunk=5)
+    torch.testing.assert_close(whole, chunked)
+
+
+def test_nvfp4_release_route_frees_disabled_layout():
+    codes, scales, qcodes, qscales = _native_buffers(32, 128)
+    layer = SimpleNamespace(
+        skinny_codes=torch.nn.Parameter(codes, requires_grad=False),
+        skinny_scales=torch.nn.Parameter(scales, requires_grad=False),
+        skinny_qpn_codes=torch.nn.Parameter(qcodes, requires_grad=False),
+        skinny_qpn_scales=torch.nn.Parameter(qscales, requires_grad=False),
+        skinny_disabled_routes=set(),
+    )
+
+    skinny._release_route(layer, "simt")
+
+    assert layer.skinny_codes.numel() == 0
+    assert layer.skinny_scales.numel() == 0
+    assert layer.skinny_qpn_codes.numel() != 0
+    assert layer.skinny_disabled_routes == {"simt"}

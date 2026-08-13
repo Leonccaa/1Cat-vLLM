@@ -412,9 +412,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_SM70_SKINNY_SRCS}"
       CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+    # No --use_fast_math here on purpose: these kernels contain no division,
+    # sqrt or transcendental, so it buys nothing while costing bit-exact
+    # reproducibility across toolchains. -lineinfo is kept for Nsight.
     set_property(
       SOURCE ${VLLM_SM70_SKINNY_SRCS}
-      APPEND PROPERTY COMPILE_OPTIONS "--use_fast_math" "-lineinfo")
+      APPEND PROPERTY COMPILE_OPTIONS "-lineinfo")
     list(APPEND VLLM_SM70_TURBOMIND_SRCS ${VLLM_SM70_SKINNY_SRCS})
 
     set_source_files_properties(

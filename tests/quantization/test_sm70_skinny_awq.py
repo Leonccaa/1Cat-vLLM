@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm import _sm70_ops, envs
@@ -16,7 +17,18 @@ def _pack_awq_rows(logical: torch.Tensor) -> torch.Tensor:
     return byte_view.contiguous().view(logical.shape[0], -1).view(torch.int32)
 
 
-def _native_awq(n: int, k: int):
+def _overlay_device() -> torch.device:
+    """Device the graph-safe overlay ops can actually dispatch on.
+
+    ``direct_register_custom_op`` registers these ops for CUDA and Meta only,
+    so feeding them CPU tensors raises NotImplementedError on any machine that
+    has a GPU. Tests that go through ``torch.ops.vllm.*`` must therefore follow
+    the available device rather than assume CPU.
+    """
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _native_awq(n: int, k: int, device: torch.device | None = None):
     logical_weight = (
         torch.arange(k * n, dtype=torch.int64).remainder(16).to(torch.uint8)
     )
@@ -27,7 +39,13 @@ def _native_awq(n: int, k: int):
         torch.arange((k // 128) * n, dtype=torch.float16).view(k // 128, n) / 1024
         + 0.125
     )
-    return _pack_awq_rows(logical_weight), scales, _pack_awq_rows(logical_zeros)
+    qweight = _pack_awq_rows(logical_weight)
+    qzeros = _pack_awq_rows(logical_zeros)
+    if device is not None:
+        qweight = qweight.to(device)
+        scales = scales.to(device)
+        qzeros = qzeros.to(device)
+    return qweight, scales, qzeros
 
 
 def _unpack_code(codes: torch.Tensor, row: int, column: int) -> int:
@@ -103,6 +121,14 @@ def test_prepare_awq_state_respects_resident_layout(monkeypatch):
     assert both.has_qpn
 
 
+def test_qpn_split_geometry_matches_cuda_policy_for_real_awq_shapes():
+    assert sm70_skinny.qpn_k_splits(1536, 5120) == 1
+    assert sm70_skinny.qpn_k_splits(4352, 5120) == 1
+    assert sm70_skinny.qpn_k_splits(5120, 8704) == 1
+    assert sm70_skinny.qpn_k_splits(5120, 4096) == 2
+    assert sm70_skinny.qpn_k_splits(5120, 1792) == 4
+
+
 def test_prepare_awq_moe_bank_is_one_n_major_layout():
     n, k, experts = 32, 128, 3
     native = [_native_awq(n, k) for _ in range(experts)]
@@ -128,7 +154,10 @@ def test_prepare_awq_moe_bank_is_one_n_major_layout():
 
 def test_awq_overlay_dispatches_simt_qpn_then_delegates_base(monkeypatch):
     n, k = 32, 128
-    qweight, scales, qzeros = _native_awq(n, k)
+    # Goes through torch.ops.vllm.sm70_skinny_awq_linear, which is registered
+    # for CUDA/Meta only.
+    device = _overlay_device()
+    qweight, scales, qzeros = _native_awq(n, k, device)
     monkeypatch.setenv("VLLM_SM70_SKINNY_AWQ_LAYOUT", "both")
     state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
     calls: list[str] = []
@@ -148,7 +177,7 @@ def test_awq_overlay_dispatches_simt_qpn_then_delegates_base(monkeypatch):
 
     for m in (1, 8, 17):
         out = sm70_skinny.try_apply_awq_state(
-            state, torch.ones((m, k), dtype=torch.float16)
+            state, torch.ones((m, k), dtype=torch.float16, device=device)
         )
         if out is None:
             calls.append("selected_base")
@@ -302,5 +331,251 @@ def test_awq_self_check_disables_only_failing_route(monkeypatch):
     )
 
     assert state.disabled_routes == {"simt"}
+    assert state.codes.numel() == 0
+    assert state.scales.numel() == 0
+    assert state.biases.numel() == 0
     assert sm70_skinny.select_awq_route(state, 1) is None
     assert sm70_skinny.select_awq_route(state, 8) == "qpn"
+
+
+def test_awq_force_on_fails_closed_on_self_check_error(monkeypatch):
+    qweight, scales, qzeros = _native_awq(32, 128)
+    monkeypatch.setenv("VLLM_SM70_SKINNY", "on")
+    monkeypatch.setenv("VLLM_SM70_SKINNY_AWQ_LAYOUT", "simt")
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+    monkeypatch.setattr(
+        _sm70_ops,
+        "skinny_awq_gemm_simt",
+        lambda x, *_: torch.full((x.shape[0], 32), 100.0, dtype=x.dtype),
+    )
+
+    with pytest.raises(RuntimeError, match="requires the AWQ simt self-check"):
+        sm70_skinny.validate_awq_state(
+            state,
+            lambda x: torch.zeros((x.shape[0], 32), dtype=x.dtype),
+            "fake-base",
+        )
+
+    assert state.codes.numel() == 0
+
+
+def test_awq_fp32_reference_matches_elementwise_dequant():
+    """The FP32 ground truth is only worth having if it is itself checked.
+
+    Compare the vectorized reference against an explicit per-element walk of
+    the packed bytes, so a nibble-order or group-cadence slip in the reference
+    cannot silently bless a matching slip in the kernel.
+    """
+    torch.manual_seed(0)
+    n, k, group = 24, 256, 128
+    codes = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8)
+    scales = (torch.rand(n, k // group) * 0.02 + 0.002).to(torch.float16)
+    biases = (-torch.rand(n, k // group) * 0.1).to(torch.float16)
+    x = (torch.rand(2, k) - 0.5).to(torch.float16)
+
+    actual = sm70_skinny.awq_fp32_reference(codes, scales, biases, x)
+
+    expected = torch.zeros(2, n, dtype=torch.float32)
+    for col in range(n):
+        for kk in range(k):
+            byte = int(codes[col, kk // 2])
+            quant = byte & 0xF if kk % 2 == 0 else byte >> 4
+            weight = quant * float(scales[col, kk // group]) + float(
+                biases[col, kk // group]
+            )
+            for row in range(2):
+                expected[row, col] += float(x[row, kk]) * weight
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_awq_fp32_reference_chunking_is_transparent():
+    torch.manual_seed(1)
+    n, k = 64, 256
+    codes = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8)
+    scales = (torch.rand(n, k // 128) * 0.02 + 0.002).to(torch.float16)
+    biases = (-torch.rand(n, k // 128) * 0.1).to(torch.float16)
+    x = (torch.rand(1, k) - 0.5).to(torch.float16)
+
+    whole = sm70_skinny.awq_fp32_reference(codes, scales, biases, x, chunk=n)
+    chunked = sm70_skinny.awq_fp32_reference(codes, scales, biases, x, chunk=7)
+    torch.testing.assert_close(whole, chunked)
+
+
+def test_residency_policy_drops_shape_below_roi_threshold(monkeypatch):
+    """A shape whose overlay wins nothing must release its VRAM."""
+    qweight, scales, qzeros = _native_awq(32, 128)
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+    assert state.has_simt
+
+    monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
+    monkeypatch.setattr(
+        sm70_skinny, "_time_apply", lambda fn, iterations=12, device=None: 10.0
+    )
+    monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "1.0")
+
+    kept = sm70_skinny.apply_residency_policy(state, lambda x: x)
+
+    assert kept is False
+    assert state.codes.numel() == 0
+    assert state.scales.numel() == 0
+    assert "simt" in state.disabled_routes
+    assert sm70_skinny.select_awq_route(state, 1) is None
+
+
+def test_residency_policy_keeps_shape_that_earns_its_memory(monkeypatch):
+    qweight, scales, qzeros = _native_awq(32, 128)
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+
+    monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
+    timings = iter([500.0, 10.0])  # base slow, skinny fast
+    monkeypatch.setattr(
+        sm70_skinny,
+        "_time_apply",
+        lambda fn, iterations=12, device=None: next(timings),
+    )
+    monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "0")
+
+    assert sm70_skinny.apply_residency_policy(state, lambda x: x) is True
+    assert state.codes.numel() != 0
+    assert state.disabled_routes == set()
+
+
+def test_force_on_bypasses_performance_residency_gate(monkeypatch):
+    qweight, scales, qzeros = _native_awq(32, 128)
+    monkeypatch.setenv("VLLM_SM70_SKINNY", "on")
+    monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "999")
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+    monkeypatch.setattr(
+        sm70_skinny,
+        "_time_apply",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("force-on must not run the performance gate")
+        ),
+    )
+
+    assert sm70_skinny.apply_residency_policy(state, lambda x: x) is True
+    assert state.has_simt
+
+
+def test_tp_consensus_propagates_a_peer_failure(monkeypatch):
+    import vllm.distributed
+
+    group = SimpleNamespace(world_size=4, device_group=object())
+    monkeypatch.setattr(vllm.distributed, "get_tp_group", lambda: group)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: "cpu")
+
+    def peer_failed(tensor, op, group):
+        del op, group
+        assert tensor.tolist() == [1.0, 12.5]
+        tensor[0] = 0.0
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", peer_failed)
+    assert sm70_skinny._agree_across_tp(12.5) is None
+
+
+def test_residency_decision_is_cached_per_shape(monkeypatch):
+    qweight, scales, qzeros = _native_awq(32, 128)
+    calls = []
+
+    monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
+    monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "0")
+
+    def _timer(fn, iterations=12, device=None):
+        calls.append(1)
+        return 500.0 if len(calls) % 2 else 10.0
+
+    monkeypatch.setattr(sm70_skinny, "_time_apply", _timer)
+    for _ in range(4):
+        state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+        sm70_skinny.apply_residency_policy(state, lambda x: x)
+
+    # Two timed measurements for the first layer, none for the repeats.
+    assert len(calls) == 2
+
+
+def test_residency_scores_simt_and_qpn_independently(monkeypatch):
+    """SIMT and QPN serve different M and must be kept or dropped separately.
+
+    Coupling them means an MTP-only win pays for a decode layout that earns
+    nothing, or the reverse.
+    """
+    qweight, scales, qzeros = _native_awq(32, 128)
+    monkeypatch.setenv("VLLM_SM70_SKINNY_AWQ_LAYOUT", "both")
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+    assert state.has_simt and state.has_qpn
+
+    monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
+    monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "0.001")
+
+    # simt: base 10 vs skinny 10 -> no gain.  qpn: base 500 vs skinny 10 -> big.
+    seq = iter([10.0, 10.0, 500.0, 10.0])
+    monkeypatch.setattr(
+        sm70_skinny, "_time_apply", lambda fn, iterations=12, device=None: next(seq)
+    )
+
+    assert sm70_skinny.apply_residency_policy(state, lambda x: x) is True
+    assert state.codes.numel() == 0, "SIMT should have been released"
+    assert state.qpn_codes.numel() != 0, "QPN earned its memory and must stay"
+    assert state.disabled_routes == {"simt"}
+    assert sm70_skinny.select_awq_route(state, 1) is None
+    assert sm70_skinny.select_awq_route(state, 8) == "qpn"
+
+
+def test_residency_measures_qpn_when_simt_is_not_resident(monkeypatch):
+    """With layout=qpn there is no SIMT buffer; the gate must still apply."""
+    qweight, scales, qzeros = _native_awq(32, 128)
+    monkeypatch.setenv("VLLM_SM70_SKINNY_AWQ_LAYOUT", "qpn")
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+    assert not state.has_simt and state.has_qpn
+
+    monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
+    monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "1.0")
+    calls = []
+
+    def _timer(fn, iterations=12, device=None):
+        calls.append(1)
+        return 10.0  # no gain -> must drop
+
+    monkeypatch.setattr(sm70_skinny, "_time_apply", _timer)
+
+    kept = sm70_skinny.apply_residency_policy(state, lambda x: x)
+
+    assert calls, "QPN-only layout was silently skipped instead of measured"
+    assert kept is False
+    assert state.qpn_codes.numel() == 0
+    assert state.disabled_routes == {"qpn"}
+
+
+def test_awq_native_fp32_reference_matches_skinny_layout_reference():
+    """The native-tensor ground truth must agree with the Skinny-layout one.
+
+    They start from different representations - int32 checkpoint packing vs the
+    prepacked N-major bytes - so agreement exercises the prepack itself.
+
+    They are not bit-identical by construction: the Skinny layout folds the
+    zero point into an FP16 ``bias = -z*s`` computed at prepack time, whereas
+    the native form evaluates ``(q - z) * s`` directly, so they differ by the
+    FP16 rounding of that bias. Use a random fixture rather than the correlated
+    arange one, which drives the output to near-zero and lets that 1-ulp term
+    dominate a relative comparison.
+    """
+    torch.manual_seed(0)
+    n, k = 32, 256
+    logical_weight = torch.randint(0, 16, (k, n), dtype=torch.uint8)
+    logical_zeros = torch.randint(0, 4, (k // 128, n), dtype=torch.uint8)
+    scales = (torch.rand(k // 128, n) * 0.02 + 0.01).to(torch.float16)
+    qweight = _pack_awq_rows(logical_weight)
+    qzeros = _pack_awq_rows(logical_zeros)
+
+    codes, logical_scales, biases = sm70_skinny.unpack_awq_dense(
+        qweight, scales, qzeros, 128
+    )
+    x = (torch.rand(2, k) - 0.5).to(torch.float16)
+
+    from_native = sm70_skinny.awq_native_fp32_reference(qweight, scales, qzeros, 128, x)
+    from_skinny = sm70_skinny.awq_fp32_reference(codes, logical_scales, biases, x)
+
+    scale = from_native.abs().max().clamp(min=1e-6)
+    relative = (from_native - from_skinny).abs().max() / scale
+    assert relative < 1e-3, f"references disagree by {relative:.3e}"

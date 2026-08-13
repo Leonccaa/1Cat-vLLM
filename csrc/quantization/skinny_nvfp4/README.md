@@ -13,8 +13,15 @@ multiplicative global scale. It provides two SM70-only operators:
   fragment-order prepack.
 
 The Python adapter owns runtime dispatch. BF16 is converted explicitly to
-FP16 at the adapter boundary and restored on output. Larger M, unsupported
-shapes, or a failed validation use the existing SM70 TurboMind kernel. The
-skinny backend is opt-in through `VLLM_SM70_QUANT_BACKEND=skinny`; it is not a
-global `--linear-backend` because mixed-format models still need their normal
-per-format backends.
+FP16 at the adapter boundary and restored on output.
+
+Skinny is an overlay, not a backend. Larger M, unsupported shapes, and failed
+validation fall back to the *selected base backend*, which is TurboMind or
+Marlin depending on `VLLM_SM70_QUANT_BACKEND`; TurboMind is not hardcoded. The
+overlay itself is controlled independently by `VLLM_SM70_SKINNY`
+(`auto` / `on` / `off`, default `auto`). The legacy value
+`VLLM_SM70_QUANT_BACKEND=skinny` is kept only as an alias for
+"base=`auto`, overlay=`on`".
+
+Skinny is deliberately not a global `--linear-backend`: mixed-format models
+still need their normal per-format backends.
