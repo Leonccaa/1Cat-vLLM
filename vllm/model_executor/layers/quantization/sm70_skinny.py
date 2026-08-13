@@ -597,6 +597,63 @@ def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float(error.item())
 
 
+def _error_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    """Report more than one number.
+
+    A single max-relative scalar hides exactly the failures worth catching: a
+    handful of bad elements disappear into the max over a large output, and
+    near-zero outputs look fine relative to the tensor-wide maximum.
+    """
+    difference = (actual.float() - expected.float()).abs()
+    denominator = expected.float().abs().max().clamp(min=1e-6)
+    quantiles = torch.quantile(
+        difference.flatten().float(),
+        torch.tensor([0.5, 0.99, 1.0], device=difference.device),
+    )
+    return {
+        "max_rel": float((difference.max() / denominator).item()),
+        "rms": float(difference.pow(2).mean().sqrt().item()),
+        "p50": float(quantiles[0].item()),
+        "p99": float(quantiles[1].item()),
+        "max_abs": float(quantiles[2].item()),
+    }
+
+
+def awq_fp32_reference(
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    biases: torch.Tensor,
+    x: torch.Tensor,
+    chunk: int = 4096,
+) -> torch.Tensor:
+    """Independent FP32 ground truth for the AWQ g128 Skinny layout.
+
+    Deliberately shares no code with the kernels or with the base backends:
+    comparing Skinny against TurboMind or Marlin cannot catch an error that
+    both make, and both consume the same checkpoint through similar unpack
+    logic. This walks the packed bytes directly in FP32.
+
+    ``codes`` is uint8 [N, K/2] with the low nibble at even k, ``scales`` and
+    ``biases`` are FP16 [N, K/128], and ``x`` is [M, K]. Chunked over N so a
+    vocabulary-sized projection does not materialize an N*K FP32 weight.
+    """
+    n, packed_k = codes.shape
+    k = packed_k * 2
+    groups = scales.shape[1]
+    out = x.new_empty((x.shape[0], n), dtype=torch.float32)
+    x32 = x.float()
+    for start in range(0, n, chunk):
+        stop = min(start + chunk, n)
+        block = codes[start:stop]
+        nibbles = torch.stack((block & 0xF, block >> 4), dim=-1)
+        quantized = nibbles.reshape(stop - start, k).float()
+        weight = quantized * scales[start:stop].float().repeat_interleave(
+            k // groups, dim=1
+        ) + biases[start:stop].float().repeat_interleave(k // groups, dim=1)
+        out[:, start:stop] = x32 @ weight.t()
+    return out
+
+
 def validate_awq_state(
     state: SM70SkinnyAwqState,
     reference_apply: Callable[[torch.Tensor], torch.Tensor],
@@ -652,6 +709,33 @@ def validate_awq_state(
                     f"{route} relative error {relative_error:.3e} exceeds "
                     f"{_SELF_CHECK_TOL:.3e}"
                 )
+            if envs.use_sm70_skinny_strict_check():
+                # The comparison above is circular: it checks Skinny against a
+                # backend that consumes the same checkpoint through similar
+                # unpack logic, so a shared misreading of the format passes.
+                # Compare against an independent FP32 dequant as well.
+                truth = awq_fp32_reference(state.codes, state.scales, state.biases, x)
+                stats = _error_stats(actual, truth)
+                logger.info(
+                    "SM70 Skinny AWQ %s FP32 ground truth N=%d K=%d: "
+                    "max_rel=%.3e rms=%.3e p50=%.3e p99=%.3e max_abs=%.3e",
+                    route,
+                    state.output_size,
+                    state.input_size,
+                    stats["max_rel"],
+                    stats["rms"],
+                    stats["p50"],
+                    stats["p99"],
+                    stats["max_abs"],
+                )
+                if (
+                    not math.isfinite(stats["max_rel"])
+                    or stats["max_rel"] > _SELF_CHECK_TOL
+                ):
+                    raise RuntimeError(
+                        f"{route} FP32 ground-truth relative error "
+                        f"{stats['max_rel']:.3e} exceeds {_SELF_CHECK_TOL:.3e}"
+                    )
         except Exception:
             state.disabled_routes.add(route)
             logger.exception(
@@ -671,6 +755,163 @@ def validate_awq_state(
             state.input_size,
             base_backend,
         )
+
+
+@dataclass
+class _ResidencyDecision:
+    """Per-(N, K) verdict on whether the overlay earns its VRAM."""
+
+    roi: float  # microseconds saved per MiB of overlay
+    mib: float
+    saved_us: float
+    keep: bool
+
+
+_residency_decisions: dict[tuple[int, int], _ResidencyDecision] = {}
+
+
+def _time_apply(fn: Callable[[], torch.Tensor], iterations: int = 20) -> float:
+    """Median-of-three timing of a single GEMM, in microseconds."""
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    samples: list[float] = []
+    for _ in range(3):
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iterations):
+            fn()
+        stop.record()
+        stop.synchronize()
+        samples.append(start.elapsed_time(stop) * 1000.0 / iterations)
+    samples.sort()
+    return samples[1]
+
+
+def overlay_mib(output_size: int, input_size: int, has_qpn: bool) -> float:
+    """Resident overlay bytes for one dense layer, in MiB.
+
+    AWQ g128 costs 0.5 byte/weight of codes plus an FP16 scale and an FP16 bias
+    per 128 weights, i.e. 0.53125 byte/weight. QPN residency adds a second copy
+    of the same payload in fragment order.
+    """
+    per_weight = 0.53125 * (2.0 if has_qpn else 1.0)
+    return output_size * input_size * per_weight / (1024.0 * 1024.0)
+
+
+def apply_residency_policy(
+    state: SM70SkinnyAwqState,
+    reference_apply: Callable[[torch.Tensor], torch.Tensor],
+) -> bool:
+    """Keep the overlay for this layer only if it earns its memory.
+
+    The overlay holds a second full copy of every weight it covers, so on a
+    32 GiB V100 it trades directly against KV cache and context length. That
+    trade is not uniform across layers: where the base backend already
+    saturates HBM there is no latency left to win, but the memory cost is the
+    same as anywhere else.
+
+    Measure this shape once against the selected base backend at M=1 (the
+    dominant decode case), express the result as microseconds saved per MiB of
+    overlay, and drop the overlay when it falls below the configured floor.
+    The decision is cached per (N, K), so the cost is a few timed GEMMs per
+    distinct shape rather than per layer.
+
+    Returns True when the overlay stays resident. On False the Skinny tensors
+    have been released and the caller must fall back to the base backend.
+    """
+    key = (state.output_size, state.input_size)
+    decision = _residency_decisions.get(key)
+    if decision is None:
+        if not state.has_simt or "simt" in state.disabled_routes:
+            # Nothing measurable resident; leave the state alone and let the
+            # normal route selection handle it.
+            return state.has_simt or state.has_qpn
+        from vllm import _sm70_ops as sm70_ops
+
+        values = torch.arange(
+            state.input_size, device=state.codes.device, dtype=torch.int32
+        )
+        x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(
+            1, state.input_size
+        )
+        try:
+            base_us = _time_apply(lambda: reference_apply(x))
+            skinny_us = _time_apply(
+                lambda: sm70_ops.skinny_awq_gemm_simt(
+                    x, state.codes, state.scales, state.biases, state.group_size
+                )
+            )
+        except Exception:
+            # Never let a timing failure cost correctness; keep the overlay and
+            # let the self-check own validity.
+            logger.exception(
+                "SM70 Skinny AWQ residency measurement failed for N=%d K=%d; "
+                "keeping the overlay.",
+                state.output_size,
+                state.input_size,
+            )
+            return True
+        mib = overlay_mib(state.output_size, state.input_size, state.has_qpn)
+        saved = base_us - skinny_us
+        roi = saved / mib if mib > 0 else 0.0
+        decision = _ResidencyDecision(
+            roi=roi,
+            mib=mib,
+            saved_us=saved,
+            keep=roi >= envs.get_sm70_skinny_min_roi(),
+        )
+        _residency_decisions[key] = decision
+        logger.info(
+            "SM70 Skinny AWQ residency N=%d K=%d: base=%.1fus skinny=%.1fus "
+            "saved=%.1fus overlay=%.1fMiB roi=%.3fus/MiB -> %s",
+            state.output_size,
+            state.input_size,
+            base_us,
+            skinny_us,
+            saved,
+            mib,
+            roi,
+            "keep" if decision.keep else "drop",
+        )
+
+    if decision.keep:
+        return True
+
+    empty_codes = state.codes.new_empty(0)
+    empty_meta = state.scales.new_empty(0)
+    state.codes = empty_codes
+    state.scales = empty_meta
+    state.biases = empty_meta
+    state.qpn_codes = empty_codes
+    state.qpn_scales = empty_meta
+    state.qpn_biases = empty_meta
+    state.disabled_routes.update({"simt", "qpn"})
+    return False
+
+
+def log_residency_summary() -> None:
+    """One ranked table so a real threshold can be chosen from real numbers."""
+    if not _residency_decisions:
+        return
+    kept = sum(d.mib for d in _residency_decisions.values() if d.keep)
+    dropped = sum(d.mib for d in _residency_decisions.values() if not d.keep)
+    lines = [
+        f"  N={key[0]:>6} K={key[1]:>6}  roi={d.roi:8.3f}us/MiB  "
+        f"saved={d.saved_us:7.1f}us  overlay={d.mib:8.1f}MiB  "
+        f"{'keep' if d.keep else 'drop'}"
+        for key, d in sorted(_residency_decisions.items(), key=lambda kv: -kv[1].roi)
+    ]
+    logger.info(
+        "SM70 Skinny AWQ residency summary (per distinct shape, per layer "
+        "instance; threshold VLLM_SM70_SKINNY_MIN_ROI=%.3f):\n%s\n"
+        "  kept %.1f MiB/layer-set, dropped %.1f MiB/layer-set",
+        envs.get_sm70_skinny_min_roi(),
+        "\n".join(lines),
+        kept,
+        dropped,
+    )
 
 
 def select_awq_route(state: SM70SkinnyAwqState, rows: int) -> str | None:

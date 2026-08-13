@@ -304,3 +304,103 @@ def test_awq_self_check_disables_only_failing_route(monkeypatch):
     assert state.disabled_routes == {"simt"}
     assert sm70_skinny.select_awq_route(state, 1) is None
     assert sm70_skinny.select_awq_route(state, 8) == "qpn"
+
+
+def test_awq_fp32_reference_matches_elementwise_dequant():
+    """The FP32 ground truth is only worth having if it is itself checked.
+
+    Compare the vectorized reference against an explicit per-element walk of
+    the packed bytes, so a nibble-order or group-cadence slip in the reference
+    cannot silently bless a matching slip in the kernel.
+    """
+    torch.manual_seed(0)
+    n, k, group = 24, 256, 128
+    codes = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8)
+    scales = (torch.rand(n, k // group) * 0.02 + 0.002).to(torch.float16)
+    biases = (-torch.rand(n, k // group) * 0.1).to(torch.float16)
+    x = (torch.rand(2, k) - 0.5).to(torch.float16)
+
+    actual = sm70_skinny.awq_fp32_reference(codes, scales, biases, x)
+
+    expected = torch.zeros(2, n, dtype=torch.float32)
+    for col in range(n):
+        for kk in range(k):
+            byte = int(codes[col, kk // 2])
+            quant = byte & 0xF if kk % 2 == 0 else byte >> 4
+            weight = quant * float(scales[col, kk // group]) + float(
+                biases[col, kk // group]
+            )
+            for row in range(2):
+                expected[row, col] += float(x[row, kk]) * weight
+
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_awq_fp32_reference_chunking_is_transparent():
+    torch.manual_seed(1)
+    n, k = 64, 256
+    codes = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8)
+    scales = (torch.rand(n, k // 128) * 0.02 + 0.002).to(torch.float16)
+    biases = (-torch.rand(n, k // 128) * 0.1).to(torch.float16)
+    x = (torch.rand(1, k) - 0.5).to(torch.float16)
+
+    whole = sm70_skinny.awq_fp32_reference(codes, scales, biases, x, chunk=n)
+    chunked = sm70_skinny.awq_fp32_reference(codes, scales, biases, x, chunk=7)
+    torch.testing.assert_close(whole, chunked)
+
+
+def test_residency_policy_drops_shape_below_roi_threshold(monkeypatch):
+    """A shape whose overlay wins nothing must release its VRAM."""
+    qweight, scales, qzeros = _native_awq(32, 128)
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+    assert state.has_simt
+
+    monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
+    # Base and Skinny take the same time -> zero saving -> negative ROI floor
+    # is the only thing that could keep it.
+    monkeypatch.setattr(sm70_skinny, "_time_apply", lambda fn, iterations=20: 10.0)
+    monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "1.0")
+
+    kept = sm70_skinny.apply_residency_policy(state, lambda x: x)
+
+    assert kept is False
+    assert state.codes.numel() == 0
+    assert state.scales.numel() == 0
+    assert state.disabled_routes == {"simt", "qpn"}
+    assert sm70_skinny.select_awq_route(state, 1) is None
+
+
+def test_residency_policy_keeps_shape_that_earns_its_memory(monkeypatch):
+    qweight, scales, qzeros = _native_awq(32, 128)
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+
+    monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
+    timings = iter([500.0, 10.0])  # base slow, skinny fast
+    monkeypatch.setattr(
+        sm70_skinny, "_time_apply", lambda fn, iterations=20: next(timings)
+    )
+    monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "0")
+
+    assert sm70_skinny.apply_residency_policy(state, lambda x: x) is True
+    assert state.codes.numel() != 0
+    assert state.disabled_routes == set()
+
+
+def test_residency_decision_is_cached_per_shape(monkeypatch):
+    qweight, scales, qzeros = _native_awq(32, 128)
+    calls = []
+
+    monkeypatch.setattr(sm70_skinny, "_residency_decisions", {})
+    monkeypatch.setenv("VLLM_SM70_SKINNY_MIN_ROI", "0")
+
+    def _timer(fn, iterations=20):
+        calls.append(1)
+        return 500.0 if len(calls) % 2 else 10.0
+
+    monkeypatch.setattr(sm70_skinny, "_time_apply", _timer)
+    for _ in range(4):
+        state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+        sm70_skinny.apply_residency_policy(state, lambda x: x)
+
+    # Two timed measurements for the first layer, none for the repeats.
+    assert len(calls) == 2

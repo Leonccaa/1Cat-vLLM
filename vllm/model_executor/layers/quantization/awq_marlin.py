@@ -664,10 +664,12 @@ class AWQMarlinLinearMethod(LinearMethodBase):
                     )
                     return out
 
-                layer._awq_sm70_skinny = skinny_state
                 sm70_skinny.validate_awq_state(
                     skinny_state, reference_apply, "turbomind"
                 )
+                if sm70_skinny.apply_residency_policy(skinny_state, reference_apply):
+                    layer._awq_sm70_skinny = skinny_state
+                sm70_skinny.log_residency_summary()
 
             layer.qweight = torch.nn.Parameter(
                 torch.empty(0, dtype=torch.int32, device=tm_weight.device),
@@ -694,17 +696,23 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         self.kernel.process_weights_after_loading(layer)
         if skinny_state is not None:
             assert use_marlin_base
-            layer._awq_sm70_skinny = skinny_state
+
+            def marlin_reference(x: torch.Tensor) -> torch.Tensor:
+                return self.kernel.apply_weights(layer, x, None)
+
             sm70_skinny.validate_awq_state(
                 skinny_state,
-                lambda x: self.kernel.apply_weights(layer, x, None),
+                marlin_reference,
                 type(self.kernel).__name__,
             )
-            logger.info_once(
-                "SM70 Skinny AWQ dense overlay enabled: layout=%s, base=%s.",
-                envs.get_sm70_skinny_awq_layout(),
-                type(self.kernel).__name__,
-            )
+            if sm70_skinny.apply_residency_policy(skinny_state, marlin_reference):
+                layer._awq_sm70_skinny = skinny_state
+                logger.info_once(
+                    "SM70 Skinny AWQ dense overlay enabled: layout=%s, base=%s.",
+                    envs.get_sm70_skinny_awq_layout(),
+                    type(self.kernel).__name__,
+                )
+            sm70_skinny.log_residency_summary()
 
     def apply(
         self,
