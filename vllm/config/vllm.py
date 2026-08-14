@@ -96,6 +96,14 @@ IS_DENSE = False
 # See https://github.com/vllm-project/vllm/issues/25689.
 
 
+def _sm70_flash_v100_plain_capture_sizes(max_num_seqs: int) -> list[int]:
+    """Return the bounded low-concurrency graph set for plain SM70 decode."""
+    sizes = [1, 2]
+    if max_num_seqs >= 3:
+        sizes.append(3)
+    return sizes
+
+
 def enable_norm_fusion(cfg: "VllmConfig") -> bool:
     """Enable if either RMS norm or quant FP8 custom op is active;
     otherwise Inductor handles fusion."""
@@ -1324,7 +1332,9 @@ class VllmConfig:
                     CUDAGraphMode.FULL_AND_PIECEWISE
                 )
                 if self.compilation_config.cudagraph_capture_sizes is None:
-                    cudagraph_capture_sizes = [1, 2]
+                    cudagraph_capture_sizes = _sm70_flash_v100_plain_capture_sizes(
+                        int(self.scheduler_config.max_num_seqs)
+                    )
                     if (
                         self.speculative_config is not None
                         and self.speculative_config.num_speculative_tokens

@@ -243,6 +243,41 @@ def test_awq_overlay_dispatches_simt_qpn_then_delegates_base(monkeypatch):
     assert calls == ["simt", "qpn", "selected_base"]
 
 
+def test_awq_route_ledger_keeps_distinct_shapes(monkeypatch):
+    monkeypatch.setattr(sm70_skinny, "_awq_route_log_seen", set())
+
+    def simt(input, codes, scales, biases, group_size):
+        del scales, biases, group_size
+        return input.new_zeros((input.shape[0], codes.shape[0]))
+
+    monkeypatch.setattr(_sm70_ops, "skinny_awq_gemm_simt", simt)
+    for n in (32, 64):
+        k = 128
+        qweight, scales, qzeros = _native_awq(n, k)
+        codes, logical_scales, biases = sm70_skinny.unpack_awq_dense(
+            qweight, scales, qzeros, 128
+        )
+        empty = torch.empty(0)
+        out = sm70_skinny._try_awq_skinny_linear(
+            torch.ones((1, k), dtype=torch.float16),
+            codes,
+            logical_scales,
+            biases,
+            empty,
+            empty,
+            empty,
+            n,
+            k,
+            128,
+        )
+        assert out is not None
+
+    assert sm70_skinny._awq_route_log_seen == {
+        ("simt", 1, 32, 128, torch.float16),
+        ("simt", 1, 64, 128, torch.float16),
+    }
+
+
 def test_awq_bf16_is_explicitly_converted_and_restored(monkeypatch):
     n, k = 32, 128
     qweight, scales, qzeros = _native_awq(n, k)

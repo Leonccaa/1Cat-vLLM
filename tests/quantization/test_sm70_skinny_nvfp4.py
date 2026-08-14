@@ -137,6 +137,31 @@ def test_turbomind_hybrid_op_dispatches_on_runtime_rows(monkeypatch):
     assert torch.equal(large, torch.full_like(large, 2))
 
 
+def test_nvfp4_route_ledger_keeps_distinct_shapes(monkeypatch):
+    monkeypatch.setattr(skinny, "_route_log_seen", set())
+
+    def simt(input, codes, scales, global_scale):
+        del scales, global_scale
+        return input.new_zeros((input.shape[0], codes.shape[0]))
+
+    monkeypatch.setattr(_sm70_ops, "skinny_nvfp4_gemm_simt", simt)
+    for n in (32, 64):
+        k = 128
+        out = skinny._try_skinny_nvfp4_linear(
+            torch.ones((1, k), dtype=torch.float16),
+            *_native_buffers(n, k),
+            1.0,
+            n,
+            k,
+        )
+        assert out is not None
+
+    assert skinny._route_log_seen == {
+        ("simt", 1, 32, 128, torch.float16),
+        ("simt", 1, 64, 128, torch.float16),
+    }
+
+
 def test_large_m_delegates_to_selected_base_without_dtype_rewrite(monkeypatch):
     n, k, m = 32, 128, 17
     buffers = _native_buffers(n, k)

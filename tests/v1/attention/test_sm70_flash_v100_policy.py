@@ -18,6 +18,16 @@ if str(REPO_ROOT) not in sys.path:
 VLLM_C_EXTENSIONS = ("vllm._C", "vllm._C_stable_libtorch")
 
 
+@pytest.mark.parametrize(
+    ("max_num_seqs", "expected"),
+    [(1, [1, 2]), (2, [1, 2]), (3, [1, 2, 3]), (8, [1, 2, 3])],
+)
+def test_sm70_plain_capture_sizes_include_exact_three(max_num_seqs, expected):
+    from vllm.config.vllm import _sm70_flash_v100_plain_capture_sizes
+
+    assert _sm70_flash_v100_plain_capture_sizes(max_num_seqs) == expected
+
+
 @pytest.fixture
 def local_flash_v100_model(tmp_path: Path) -> Callable[[], str]:
     def make_model() -> str:

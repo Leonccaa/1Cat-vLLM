@@ -22,7 +22,7 @@ _AWQ_REVERSE_PACK_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
 _QPN_K_ORDER = (0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15)
 _QPN_TARGET_BLOCKS = 160
 
-_awq_route_log_seen: set[tuple[str, int, torch.dtype]] = set()
+_awq_route_log_seen: set[tuple[str, int, int, int, torch.dtype]] = set()
 
 
 def qpn_k_splits(
@@ -400,7 +400,7 @@ def _try_awq_skinny_linear(
     # logger/set side effects would otherwise turn an opaque runtime-M dispatch
     # into a graph break.
     if not torch.compiler.is_compiling():
-        route_key = (route, m, output_dtype)
+        route_key = (route, m, n, k, output_dtype)
         if route_key not in _awq_route_log_seen:
             _awq_route_log_seen.add(route_key)
             logger.info(

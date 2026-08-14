@@ -19,7 +19,7 @@ from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
 logger = init_logger(__name__)
 
 _SELF_CHECK_TOL = 3e-2
-_route_log_seen: set[tuple[str, int, torch.dtype]] = set()
+_route_log_seen: set[tuple[str, int, int, int, torch.dtype]] = set()
 
 
 def qpn_prepack(
@@ -159,7 +159,7 @@ def _try_skinny_nvfp4_linear(
     # logger/set side effects would otherwise turn an opaque runtime-M dispatch
     # into a graph break.
     if not torch.compiler.is_compiling():
-        route_key = (route, m, output_dtype)
+        route_key = (route, m, n, k, output_dtype)
         if route_key not in _route_log_seen:
             _route_log_seen.add(route_key)
             logger.info(

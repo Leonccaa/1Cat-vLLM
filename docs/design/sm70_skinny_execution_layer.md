@@ -81,6 +81,34 @@ The Dense overlay does not alter the MoE selector. Unsupported formats,
 non-SM70 devices, MoE layers, unsupported shapes, and larger batches keep
 their normal selected route.
 
+## Pre-one-copy boundary audit (2026-08-14 UTC)
+
+The stage-2 boundary pass found one independent graph fix and one important
+limit of load-time kernel A/B:
+
+- Plain `max_num_seqs=3` had no exact M=3 CUDA Graph. Adding only capture size
+  3 raised the Qwen3.6-27B AWQ TP4 base from 41.64 to 80.47 aggregate decode
+  tok/s. With ROI=1 Skinny it reached 81.62 tok/s. This was primarily a graph
+  cliff, not a Skinny gain.
+- A same-source MTP2 causal probe measured 79.91 tok/s with Skinny off, 78.58
+  with SIMT at M=1..3, and 79.96 when only M=3 fell back to the selected base.
+  All three arms had the same 86.17% speculative acceptance. M=3 routing was
+  therefore causal for this regression.
+- A proposed automatic exact-M classifier was then tested and rejected. Its
+  paired L2-cold CUDA Graph microbench marked both resident M=3 shapes as
+  faster under Skinny (1.045x and 1.282x), yet the resulting full-model MTP2
+  run fell further to 77.78 tok/s. The prototype was removed instead of tuning
+  a threshold around one checkpoint.
+
+Consequently, `auto` still measures the per-shape layout residency decision;
+the supported SIMT M range remains a static kernel capability. Route logging
+now includes N and K so every observed `(M,N,K)` is auditable. A one-copy solo
+mode is not admitted by this pass: removing the base layout would also remove
+the proven M=3 escape path. One-copy needs a generic small-M fallback or a
+full-model-aware decision mechanism before it can replace the two-copy state.
+Evidence is under
+`/mnt/llm_hfs/skinny-stage2-preonecopy-20260814T0324Z/`.
+
 ## Grouped MoE memory policy
 
 `VLLM_SM70_SKINNY_AWQ_MOE=1` independently enables an experimental
