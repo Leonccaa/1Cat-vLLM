@@ -827,6 +827,17 @@ def get_sm70_skinny_mode() -> SM70SkinnyMode:
     return cast(SM70SkinnyMode, value)
 
 
+def get_sm70_skinny_simt_max_rows() -> int:
+    """Return the conservative runtime boundary for the SIMT overlay.
+
+    Full-model evidence is consistently positive at M=1..2, while M=3 changes
+    sign between plain decode and MTP graph contexts. ``auto`` therefore stops
+    at two. Explicit ``on`` remains the research opt-in for the kernel's M=3
+    capability without adding another environment variable.
+    """
+    return 3 if get_sm70_skinny_mode() == "on" else 2
+
+
 def use_sm70_turbomind(default_enabled: bool) -> bool:
     backend = get_sm70_quant_base_backend()
     if backend == "marlin":
@@ -1584,9 +1595,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_QUANT_BACKEND": get_sm70_quant_backend,
     # Small-M overlay is independent from the existing base-backend selector.
     "VLLM_SM70_SKINNY": get_sm70_skinny_mode,
-    # Resident layouts for the dense AWQ Skinny overlay. SIMT covers ordinary
-    # M<=3 decode with one additional weight-sized prepack; QPN covers M=4..16
-    # verification, and "both" deliberately pays for both layouts.
+    # Resident layouts for the dense AWQ Skinny overlay. In auto mode SIMT
+    # covers M<=2 with one additional weight-sized prepack; explicit on also
+    # admits the context-sensitive M=3 research route. QPN covers M=4..16, and
+    # "both" deliberately pays for both layouts.
     "VLLM_SM70_SKINNY_AWQ_LAYOUT": get_sm70_skinny_awq_layout,
     # Replacement-layout grouped MoE prototype. It is deliberately separate
     # from the dense overlay because it trades TurboMind prefill throughput for

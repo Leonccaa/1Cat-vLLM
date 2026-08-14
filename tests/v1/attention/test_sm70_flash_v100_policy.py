@@ -20,9 +20,17 @@ VLLM_C_EXTENSIONS = ("vllm._C", "vllm._C_stable_libtorch")
 
 @pytest.mark.parametrize(
     ("max_num_seqs", "expected"),
-    [(1, [1, 2]), (2, [1, 2]), (3, [1, 2, 3]), (8, [1, 2, 3])],
+    [
+        (1, [1, 2]),
+        (2, [1, 2]),
+        (3, [1, 2, 3]),
+        (4, [1, 2, 3, 4]),
+        (5, [1, 2, 3, 4, 5]),
+        (8, [1, 2, 3, 4, 8]),
+        (16, [1, 2, 3, 4, 8, 16]),
+    ],
 )
-def test_sm70_plain_capture_sizes_include_exact_three(max_num_seqs, expected):
+def test_sm70_plain_capture_sizes_cover_configured_concurrency(max_num_seqs, expected):
     from vllm.config.vllm import _sm70_flash_v100_plain_capture_sizes
 
     assert _sm70_flash_v100_plain_capture_sizes(max_num_seqs) == expected

@@ -243,6 +243,56 @@ def test_awq_overlay_dispatches_simt_qpn_then_delegates_base(monkeypatch):
     assert calls == ["simt", "qpn", "selected_base"]
 
 
+def test_awq_m3_requires_explicit_on(monkeypatch):
+    n, k = 32, 128
+    qweight, scales, qzeros = _native_awq(n, k)
+    monkeypatch.setenv("VLLM_SM70_SKINNY_AWQ_LAYOUT", "simt")
+    state = sm70_skinny.prepare_awq_state(qweight, scales, qzeros, 128)
+    calls: list[str] = []
+
+    def simt(input, codes, scales, biases, group_size):
+        del codes, scales, biases, group_size
+        calls.append("simt")
+        return input.new_ones((input.shape[0], n))
+
+    def base(out, input, weight, scales, group_size, k_ld, q_ld):
+        del input, weight, scales, group_size, k_ld, q_ld
+        calls.append("base")
+        out.zero_()
+
+    monkeypatch.setattr(_sm70_ops, "skinny_awq_gemm_simt", simt)
+    monkeypatch.setattr(_sm70_ops, "awq_gemm_sm70_out", base)
+    base_weight = torch.empty((1, 1), dtype=torch.int32)
+    base_scales = torch.empty((1, 1), dtype=torch.float16)
+
+    for mode, expected_route in (("auto", "base"), ("on", "simt")):
+        monkeypatch.setenv("VLLM_SM70_SKINNY", mode)
+        calls.clear()
+        out = sm70_skinny._skinny_awq_turbomind_linear_impl(
+            torch.ones((3, k), dtype=torch.float16),
+            state.codes,
+            state.scales,
+            state.biases,
+            state.qpn_codes,
+            state.qpn_scales,
+            state.qpn_biases,
+            base_weight,
+            base_scales,
+            n,
+            k,
+            128,
+            0,
+            0,
+        )
+        assert calls == [expected_route]
+        assert sm70_skinny.select_awq_route(state, 3) == (
+            "simt" if mode == "on" else None
+        )
+        assert torch.equal(
+            out, torch.ones_like(out) if mode == "on" else torch.zeros_like(out)
+        )
+
+
 def test_awq_route_ledger_keeps_distinct_shapes(monkeypatch):
     monkeypatch.setattr(sm70_skinny, "_awq_route_log_seen", set())
 

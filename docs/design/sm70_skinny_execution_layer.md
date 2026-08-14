@@ -58,9 +58,10 @@ two controls above.
 | Dense NVFP4, explicit `on` | 1-3 | Skinny SIMT |
 | Dense NVFP4, explicit `on` | 4-16 | Skinny QPN |
 | Dense NVFP4, `auto` or rows 17+ | any | selected base backend |
-| Dense AWQ, SIMT resident | 1-3 | Skinny SIMT |
+| Dense AWQ, `auto`, SIMT resident | 1-2 | Skinny SIMT |
+| Dense AWQ, explicit `on`, SIMT resident | 1-3 | Skinny SIMT |
 | Dense AWQ, QPN resident | 4-16 | Skinny QPN |
-| Dense AWQ | unsupported shape/rows | selected base backend |
+| Dense AWQ, `auto` | M=3 or unsupported shape/rows | selected base backend |
 | Grouped AWQ MoE prototype | routed rows | Skinny grouped SIMT |
 
 Dense AWQ accepts `VLLM_SM70_SKINNY_AWQ_LAYOUT=simt|qpn|both`:
@@ -83,13 +84,19 @@ their normal selected route.
 
 ## Pre-one-copy boundary audit (2026-08-14 UTC)
 
-The stage-2 boundary pass found one independent graph fix and one important
-limit of load-time kernel A/B:
+The stage-2 boundary pass found one independent graph fix and a hard limit of
+load-time kernel A/B:
 
 - Plain `max_num_seqs=3` had no exact M=3 CUDA Graph. Adding only capture size
   3 raised the Qwen3.6-27B AWQ TP4 base from 41.64 to 80.47 aggregate decode
   tok/s. With ROI=1 Skinny it reached 81.62 tok/s. This was primarily a graph
-  cliff, not a Skinny gain.
+  cliff, not a Skinny gain. The finalized policy uses a logarithmic capture
+  set plus the exact configured maximum: max 8 becomes `[1,2,3,4,8]`, max 16
+  becomes `[1,2,3,4,8,16]`, and non-power-of-two maxima are included exactly.
+  Intermediate request counts pad upward to a captured graph instead of
+  silently falling into the same dynamic-path cliff. Only B=3 has a measured
+  end-to-end speedup; the larger sizes are a coverage fix, not a performance
+  claim.
 - A same-source MTP2 causal probe measured 79.91 tok/s with Skinny off, 78.58
   with SIMT at M=1..3, and 79.96 when only M=3 fell back to the selected base.
   All three arms had the same 86.17% speculative acceptance. M=3 routing was
@@ -97,17 +104,26 @@ limit of load-time kernel A/B:
 - A proposed automatic exact-M classifier was then tested and rejected. Its
   paired L2-cold CUDA Graph microbench marked both resident M=3 shapes as
   faster under Skinny (1.045x and 1.282x), yet the resulting full-model MTP2
-  run fell further to 77.78 tok/s. The prototype was removed instead of tuning
+  run fell further to 77.78 tok/s. More decisively, exact-graph plain B=3 was
+  `+1.43%` while exact-graph MTP2 at the same M=3 was negative. The deciding
+  variable is graph context, not M or shape, and graph context is unavailable
+  to a load-time residency gate. The prototype was removed instead of tuning
   a threshold around one checkpoint.
 
-Consequently, `auto` still measures the per-shape layout residency decision;
-the supported SIMT M range remains a static kernel capability. Route logging
-now includes N and K so every observed `(M,N,K)` is auditable. A one-copy solo
-mode is not admitted by this pass: removing the base layout would also remove
-the proven M=3 escape path. One-copy needs a generic small-M fallback or a
-full-model-aware decision mechanism before it can replace the two-copy state.
-Evidence is under
-`/mnt/llm_hfs/skinny-stage2-preonecopy-20260814T0324Z/`.
+Cross-session throughput drift in these arms was about 1%. The P1 prototype
+and the plain M=1..3 arm had equivalent routing but differed by another 1%.
+Therefore a future decision at the 1-2% scale must state its repeat count and
+use at least three independent serving sessions per arm; repeated requests in
+one server lifetime do not establish a cross-session result.
+
+Consequently, `auto` still measures only per-shape layout residency and uses a
+conservative static route boundary: SIMT M=1..2, M=3 selected base. Explicit
+`VLLM_SM70_SKINNY=on` remains the research opt-in for the kernel's M=3
+capability. Route logging includes N and K so every observed `(M,N,K)` is
+auditable. A one-copy solo mode is deferred: removing the base layout would
+also remove the proven M=3 escape path for any profile that can reach it. No
+new classifier or kernel work is planned under this project scope. Evidence is
+under `/mnt/llm_hfs/skinny-stage2-preonecopy-20260814T0324Z/`.
 
 ## Grouped MoE memory policy
 

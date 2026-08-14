@@ -53,6 +53,29 @@ version of this harness hammered a single buffer, which gave any shape under
 which were really just measuring whether `__ldcs` defeated an L2 reuse pattern
 that does not exist in production. Do not remove the rotation.
 
+## End-to-end causal attribution
+
+An isolated kernel win is not evidence that a route helps a captured serving
+graph. When attributing a full-model regression to one route, use a same-source
+three-arm probe:
+
+1. selected base only;
+2. the complete candidate route set;
+3. the same candidate with exactly one suspected route or boundary returned
+   to the selected base.
+
+Hold the source SHA, checkpoint, graph sizes, scheduler settings, request set,
+and speculative acceptance constant. The third arm must restore performance
+to the base range before the route is called causal. This base/full/single-
+fallback pattern is the default contract for future attribution claims.
+
+Serving results at the 1-2% scale require at least three independent server
+sessions per arm and must report the repeat count and distribution. Multiple
+requests within one server lifetime do not measure cross-session drift. If an
+isolated microbenchmark and the three-arm serving probe disagree, the serving
+probe owns the execution-policy decision; do not tune a load-time threshold to
+fit one checkpoint.
+
 ## Results that shaped the current kernels
 
 Measured on V100-PCIE-32GB, min of 3 interleaved rounds, application clocks not

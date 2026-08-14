@@ -377,6 +377,7 @@ def _try_awq_skinny_linear(
     output_dtype = x.dtype
     kernel_x = x if x.dtype == torch.float16 else x.to(torch.float16)
     m = kernel_x.shape[0]
+    simt_max_rows = envs.get_sm70_skinny_simt_max_rows()
     use_qpn = (
         4 <= m <= 16
         and k % AWQ_GROUP_SIZE == 0
@@ -386,7 +387,7 @@ def _try_awq_skinny_linear(
         and qpn_biases.numel() == qpn_scales.numel()
     )
     use_simt = (
-        1 <= m <= 3
+        1 <= m <= simt_max_rows
         and k % AWQ_GROUP_SIZE == 0
         and n % 8 == 0
         and codes.numel() == n * (k // 2)
@@ -1030,7 +1031,11 @@ def log_residency_summary() -> None:
 
 
 def select_awq_route(state: SM70SkinnyAwqState, rows: int) -> str | None:
-    if 1 <= rows <= 3 and state.has_simt and "simt" not in state.disabled_routes:
+    if (
+        1 <= rows <= envs.get_sm70_skinny_simt_max_rows()
+        and state.has_simt
+        and "simt" not in state.disabled_routes
+    ):
         return "simt"
     if 4 <= rows <= 16 and state.has_qpn and "qpn" not in state.disabled_routes:
         return "qpn"

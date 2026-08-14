@@ -132,6 +132,7 @@ def _try_skinny_nvfp4_linear(
     output_dtype = x.dtype
     kernel_x = x if x.dtype == torch.float16 else x.to(torch.float16)
     m = kernel_x.shape[0]
+    simt_max_rows = envs.get_sm70_skinny_simt_max_rows()
 
     use_qpn = (
         4 <= m <= 16
@@ -141,7 +142,7 @@ def _try_skinny_nvfp4_linear(
         and qpn_scales.numel() == n * (k // 16)
     )
     use_simt = (
-        1 <= m <= 3
+        1 <= m <= simt_max_rows
         and k % 128 == 0
         and n % 8 == 0
         and codes.numel() == n * (k // 2)
@@ -695,7 +696,9 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
         if not retained:
             return
         logger.info_once(
-            "SM70 Skinny NVFP4 dense overlay enabled: SIMT M<=3, QPN M=4..16, base=%s.",
+            "SM70 Skinny NVFP4 dense overlay enabled: SIMT M<=%d, "
+            "QPN M=4..16, base=%s.",
+            envs.get_sm70_skinny_simt_max_rows(),
             type(self.base_kernel).__name__,
         )
 
@@ -872,7 +875,7 @@ class SkinnyNvFp4LinearKernel(NvFp4LinearKernel):
         # kernels. Production SM70 selection currently resolves to one of the
         # two graph-safe hybrid paths above.
         use_simt = (
-            1 <= rows <= 3
+            1 <= rows <= envs.get_sm70_skinny_simt_max_rows()
             and "simt" not in layer.skinny_disabled_routes
             and k % 128 == 0
             and n % 8 == 0

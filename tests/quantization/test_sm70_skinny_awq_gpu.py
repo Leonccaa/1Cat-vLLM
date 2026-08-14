@@ -26,6 +26,7 @@ def test_sm70_skinny_awq_routes_and_matches_turbomind(monkeypatch):
         pytest.skip("missing SM70 extension ops: " + ", ".join(missing))
 
     torch.manual_seed(20260812)
+    monkeypatch.setenv("VLLM_SM70_SKINNY", "auto")
     monkeypatch.setenv("VLLM_SM70_SKINNY_AWQ_LAYOUT", "both")
     device = torch.device("cuda:0")
     n, k = 5120, 1536
@@ -75,7 +76,7 @@ def test_sm70_skinny_awq_routes_and_matches_turbomind(monkeypatch):
 
     cases = (
         (1, torch.float16, "simt"),
-        (3, torch.float16, "simt"),
+        (3, torch.float16, "turbomind"),
         (4, torch.float16, "qpn"),
         (8, torch.float16, "qpn"),
         (9, torch.float16, "qpn"),

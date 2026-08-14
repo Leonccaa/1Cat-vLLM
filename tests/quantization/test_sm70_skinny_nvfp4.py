@@ -137,6 +137,47 @@ def test_turbomind_hybrid_op_dispatches_on_runtime_rows(monkeypatch):
     assert torch.equal(large, torch.full_like(large, 2))
 
 
+def test_nvfp4_m3_requires_explicit_on(monkeypatch):
+    n, k = 32, 128
+    buffers = _native_buffers(n, k)
+    calls: list[str] = []
+
+    def simt(input, codes, scales, global_scale):
+        del codes, scales, global_scale
+        calls.append("simt")
+        return input.new_ones((input.shape[0], n))
+
+    def base(out, input, weight, scales, group_size, k_ld, q_ld):
+        del input, weight, scales, group_size, k_ld, q_ld
+        calls.append("base")
+        out.zero_()
+
+    monkeypatch.setattr(_sm70_ops, "skinny_nvfp4_gemm_simt", simt)
+    monkeypatch.setattr(_sm70_ops, "nvfp4_gemm_sm70_out", base)
+    base_weight = torch.empty((1, 1), dtype=torch.int32)
+    base_scales = torch.empty((1, 1), dtype=torch.float16)
+
+    for mode, expected_route in (("auto", "base"), ("on", "simt")):
+        monkeypatch.setenv("VLLM_SM70_SKINNY", mode)
+        calls.clear()
+        out = skinny._skinny_nvfp4_turbomind_linear_impl(
+            torch.ones((3, k), dtype=torch.float16),
+            *buffers,
+            1.0,
+            base_weight,
+            base_scales,
+            n,
+            k,
+            16,
+            0,
+            0,
+        )
+        assert calls == [expected_route]
+        assert torch.equal(
+            out, torch.ones_like(out) if mode == "on" else torch.zeros_like(out)
+        )
+
+
 def test_nvfp4_route_ledger_keeps_distinct_shapes(monkeypatch):
     monkeypatch.setattr(skinny, "_route_log_seen", set())
 

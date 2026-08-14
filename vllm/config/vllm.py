@@ -97,11 +97,25 @@ IS_DENSE = False
 
 
 def _sm70_flash_v100_plain_capture_sizes(max_num_seqs: int) -> list[int]:
-    """Return the bounded low-concurrency graph set for plain SM70 decode."""
-    sizes = [1, 2]
-    if max_num_seqs >= 3:
-        sizes.append(3)
-    return sizes
+    """Return a logarithmic graph set covering plain SM70 decode concurrency.
+
+    Keep exact M=3 because padding it to four caused a measured graph cliff.
+    Above four, powers of two bound the number of captured graphs while the
+    exact configured maximum closes the final gap for non-power-of-two limits.
+    The legacy M=2 graph is retained even when ``max_num_seqs`` is one.
+    """
+    configured_max = max(int(max_num_seqs), 2)
+    sizes = {1, 2}
+    if configured_max >= 3:
+        sizes.add(3)
+
+    power_of_two = 4
+    while power_of_two < configured_max:
+        sizes.add(power_of_two)
+        power_of_two *= 2
+    if configured_max >= 4:
+        sizes.add(configured_max)
+    return sorted(sizes)
 
 
 def enable_norm_fusion(cfg: "VllmConfig") -> bool:
