@@ -15,7 +15,7 @@ COMPRESSED_UINT4_GROUP_SIZES = (32, 128)
 MXFP4_GROUP_SIZE = 32
 NVFP4_GROUP_SIZE = 16
 STATE_ATTR = "_sm70_turbomind_linear"
-SM70QuantBackend = Literal["auto", "marlin", "turbomind"]
+SM70QuantBackend = Literal["auto", "marlin", "turbomind", "skinny"]
 
 
 @dataclass

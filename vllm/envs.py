@@ -112,7 +112,12 @@ if TYPE_CHECKING:
     VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS: bool = False
-    VLLM_SM70_QUANT_BACKEND: Literal["auto", "marlin", "turbomind"] = "auto"
+    VLLM_SM70_QUANT_BACKEND: Literal["auto", "marlin", "turbomind", "skinny"] = "auto"
+    VLLM_SM70_SKINNY: Literal["auto", "on", "off"] = "auto"
+    VLLM_SM70_SKINNY_AWQ_LAYOUT: Literal["simt", "qpn", "both"] = "simt"
+    VLLM_SM70_SKINNY_AWQ_MOE: bool = False
+    VLLM_SM70_SKINNY_MIN_ROI: float = 0.0
+    VLLM_SM70_SKINNY_STRICT_CHECK: bool = False
     VLLM_SM70_AWQ_TURBOMIND: bool = True
     VLLM_SM70_GPTQ_TURBOMIND: bool = False
     VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND: bool = False
@@ -795,22 +800,71 @@ def env_with_choices(
     return _get_validated_env
 
 
-SM70_QUANT_BACKENDS = ("auto", "marlin", "turbomind")
-SM70QuantBackend = Literal["auto", "marlin", "turbomind"]
+SM70_QUANT_BACKENDS = ("auto", "marlin", "turbomind", "skinny")
+SM70QuantBackend = Literal["auto", "marlin", "turbomind", "skinny"]
+SM70_SKINNY_MODES = ("auto", "on", "off")
+SM70SkinnyMode = Literal["auto", "on", "off"]
 
 
 def get_sm70_quant_backend() -> SM70QuantBackend:
+    """Read the legacy combined selector.
+
+    New code treats this as the base-backend selector and uses
+    :func:`get_sm70_skinny_mode` for the independent overlay. The historical
+    ``skinny`` value remains a compatibility alias for ``auto`` plus overlay
+    ``on``.
+    """
     value = os.getenv("VLLM_SM70_QUANT_BACKEND", "auto").strip().lower()
     if value not in SM70_QUANT_BACKENDS:
         raise ValueError(
-            "VLLM_SM70_QUANT_BACKEND must be one of auto, marlin, turbomind; "
+            "VLLM_SM70_QUANT_BACKEND must be one of auto, marlin, "
+            "turbomind, skinny; "
             f"got {value!r}."
         )
     return cast(SM70QuantBackend, value)
 
 
+def get_sm70_quant_base_backend() -> Literal["auto", "marlin", "turbomind"]:
+    """Return the base backend selected by the existing SM70 variable."""
+    value = get_sm70_quant_backend()
+    if value == "skinny":
+        return "auto"
+    return cast(Literal["auto", "marlin", "turbomind"], value)
+
+
+def get_sm70_skinny_mode() -> SM70SkinnyMode:
+    """Return the independent Skinny overlay mode.
+
+    With no new variable, legacy ``skinny`` means ``on``. Every other value
+    keeps the new default ``auto`` behavior, so choosing a base backend does
+    not silently disable the orthogonal overlay.
+    """
+    raw = os.getenv("VLLM_SM70_SKINNY")
+    if raw is None:
+        legacy = get_sm70_quant_backend()
+        value = "on" if legacy == "skinny" else "auto"
+    else:
+        value = raw.strip().lower()
+    if value not in SM70_SKINNY_MODES:
+        raise ValueError(
+            f"VLLM_SM70_SKINNY must be one of auto, on, off; got {value!r}."
+        )
+    return cast(SM70SkinnyMode, value)
+
+
+def get_sm70_skinny_simt_max_rows() -> int:
+    """Return the conservative runtime boundary for the SIMT overlay.
+
+    Full-model evidence is consistently positive at M=1..2, while M=3 changes
+    sign between plain decode and MTP graph contexts. ``auto`` therefore stops
+    at two. Explicit ``on`` remains the research opt-in for the kernel's M=3
+    capability without adding another environment variable.
+    """
+    return 3 if get_sm70_skinny_mode() == "on" else 2
+
+
 def use_sm70_turbomind(default_enabled: bool) -> bool:
-    backend = get_sm70_quant_backend()
+    backend = get_sm70_quant_base_backend()
     if backend == "marlin":
         return False
     if backend == "turbomind":
@@ -819,7 +873,74 @@ def use_sm70_turbomind(default_enabled: bool) -> bool:
 
 
 def force_sm70_marlin() -> bool:
-    return get_sm70_quant_backend() == "marlin"
+    return get_sm70_quant_base_backend() == "marlin"
+
+
+def use_sm70_skinny_nvfp4() -> bool:
+    """Use the skinny small-M overlay for SM70 NVFP4 dense layers.
+
+    NVFP4 currently retains both a SIMT-native and a QPN-prepacked copy in
+    addition to the selected base layout.  Real Qwen3.6-27B TP4 testing showed
+    that the per-shape ROI gate can still retain 4.54 GiB/card at ROI=1, so
+    ``auto`` must not opt into that residency contract.  Keep the route
+    available through explicit ``on`` (and the legacy ``backend=skinny``
+    alias) until the overlay has a bounded or one-copy memory policy.
+    """
+    return get_sm70_skinny_mode() == "on"
+
+
+def use_sm70_skinny_awq() -> bool:
+    """Use the format-independent Skinny small-M core for dense SM70 AWQ."""
+    return get_sm70_skinny_mode() in ("auto", "on")
+
+
+def get_sm70_skinny_awq_layout() -> Literal["simt", "qpn", "both"]:
+    """Select resident AWQ Skinny layouts to balance latency and VRAM."""
+    value = os.getenv("VLLM_SM70_SKINNY_AWQ_LAYOUT", "simt").strip().lower()
+    if value not in ("simt", "qpn", "both"):
+        raise ValueError(
+            "VLLM_SM70_SKINNY_AWQ_LAYOUT must be one of simt, qpn, both; "
+            f"got {value!r}."
+        )
+    return cast(Literal["simt", "qpn", "both"], value)
+
+
+def use_sm70_skinny_awq_moe() -> bool:
+    """Enable the replacement-layout grouped AWQ MoE prototype."""
+    return bool(int(os.getenv("VLLM_SM70_SKINNY_AWQ_MOE", "0")))
+
+
+def get_sm70_skinny_min_roi() -> float:
+    """Minimum overlay return-on-investment, in microseconds saved per MiB.
+
+    The overlay keeps a second copy of every covered weight, so it trades VRAM
+    (and therefore KV cache) for decode latency. Not every layer earns that
+    trade: a shape where the base backend already saturates HBM has nothing
+    left to win, yet still pays full price in memory.
+
+    At load time each distinct (N, K) is timed against the selected base
+    backend and admitted only if it clears this threshold. The default of 0.0
+    keeps any shape with a measurable win and drops the rest. Raise it to trade
+    more decode latency for more VRAM; the per-shape table is logged at load so
+    a target can be picked from real numbers instead of guessed.
+    """
+    raw = os.getenv("VLLM_SM70_SKINNY_MIN_ROI", "0")
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"VLLM_SM70_SKINNY_MIN_ROI must be a float; got {raw!r}."
+        ) from exc
+
+
+def use_sm70_skinny_strict_check() -> bool:
+    """Validate the overlay against an independent FP32 dequant reference.
+
+    The routine self-check compares Skinny against the selected base backend,
+    which cannot catch an error both share. This enables a slower, pure-PyTorch
+    FP32 ground truth instead. Off by default because it costs load time.
+    """
+    return bool(int(os.getenv("VLLM_SM70_SKINNY_STRICT_CHECK", "0")))
 
 
 def env_list_with_choices(
@@ -1494,9 +1615,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS": lambda: bool(
         int(os.getenv("VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS", "0"))
     ),
-    # Unified V100/SM70 quantized linear backend selector. "auto" resolves to
-    # TurboMind for supported SM70 quant routes; only "marlin" forces Marlin.
+    # Existing V100 base-backend selector. The historical "skinny" value is a
+    # compatibility alias for base=auto plus VLLM_SM70_SKINNY=on.
     "VLLM_SM70_QUANT_BACKEND": get_sm70_quant_backend,
+    # Small-M overlay is independent from the existing base-backend selector.
+    "VLLM_SM70_SKINNY": get_sm70_skinny_mode,
+    # Resident layouts for the dense AWQ Skinny overlay. In auto mode SIMT
+    # covers M<=2 with one additional weight-sized prepack; explicit on also
+    # admits the context-sensitive M=3 research route. QPN covers M=4..16, and
+    # "both" deliberately pays for both layouts.
+    "VLLM_SM70_SKINNY_AWQ_LAYOUT": get_sm70_skinny_awq_layout,
+    # Replacement-layout grouped MoE prototype. It is deliberately separate
+    # from the dense overlay because it trades TurboMind prefill throughput for
+    # a single-copy expert bank and needs its own end-to-end acceptance gate.
+    "VLLM_SM70_SKINNY_AWQ_MOE": lambda: bool(
+        int(os.getenv("VLLM_SM70_SKINNY_AWQ_MOE", "0"))
+    ),
+    # Minimum microseconds saved per MiB of overlay for a shape to stay
+    # resident. The overlay doubles the weight footprint of every layer it
+    # covers, so shapes where the base backend already saturates HBM are pure
+    # VRAM cost. Load-time measurement decides; 0.0 keeps any measurable win.
+    "VLLM_SM70_SKINNY_MIN_ROI": get_sm70_skinny_min_roi,
+    # Validate against an independent FP32 dequant reference instead of only
+    # cross-checking against the selected base backend.
+    "VLLM_SM70_SKINNY_STRICT_CHECK": use_sm70_skinny_strict_check,
     # V100/SM70 AWQ dense path using the local TurboMind backend. This matches
     # the 0.0.3 route semantics: enable by default on SM70 and allow an explicit
     # opt-out with VLLM_SM70_AWQ_TURBOMIND=0.

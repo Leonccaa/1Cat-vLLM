@@ -401,6 +401,25 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_SM70_TURBOMIND_SRCS}"
       CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+
+    # The skinny kernels are small-M overlays on the SM70 TurboMind dense
+    # backend. Keep the format policies and shared execution cores in the same
+    # _C extension and compile them for Volta only; unsupported dtypes/shapes
+    # stay with the selected base backend.
+    set(VLLM_SM70_SKINNY_SRCS
+        "csrc/quantization/skinny_nvfp4/skinny_nvfp4.cu"
+        "csrc/quantization/sm70_skinny/skinny_awq.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${VLLM_SM70_SKINNY_SRCS}"
+      CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
+    # No --use_fast_math here on purpose: these kernels contain no division,
+    # sqrt or transcendental, so it buys nothing while costing bit-exact
+    # reproducibility across toolchains. -lineinfo is kept for Nsight.
+    set_property(
+      SOURCE ${VLLM_SM70_SKINNY_SRCS}
+      APPEND PROPERTY COMPILE_OPTIONS "-lineinfo")
+    list(APPEND VLLM_SM70_TURBOMIND_SRCS ${VLLM_SM70_SKINNY_SRCS})
+
     set_source_files_properties(
       csrc/torch_bindings.cpp
       PROPERTIES COMPILE_DEFINITIONS ENABLE_SM70_TURBOMIND=1)

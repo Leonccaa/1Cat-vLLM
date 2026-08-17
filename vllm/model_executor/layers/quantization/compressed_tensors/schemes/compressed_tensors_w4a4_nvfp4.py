@@ -25,10 +25,7 @@ __all__ = ["CompressedTensorsW4A4Fp4"]
 
 
 def _explicit_nvfp4_emulation_requested() -> bool:
-    if (
-        envs.VLLM_USE_NVFP4_CT_EMULATIONS
-        or envs.VLLM_NVFP4_GEMM_BACKEND == "emulation"
-    ):
+    if envs.VLLM_USE_NVFP4_CT_EMULATIONS or envs.VLLM_NVFP4_GEMM_BACKEND == "emulation":
         return True
 
     from vllm.config import get_current_vllm_config_or_none
@@ -147,26 +144,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             layer.input_global_scale * layer.weight_global_scale, requires_grad=False
         )
 
-        if sm70_tm.should_prepare_turbomind(
-            layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
-        ):
-            logger.info_once(
-                "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path enabled."
-            )
-            sm70_tm.prepare_nvfp4_linear(layer)
-            layer.weight = Parameter(
-                torch.empty(0, dtype=torch.uint8, device=layer.weight.device),
-                requires_grad=False,
-            )
-            layer.weight_scale = Parameter(
-                torch.empty(
-                    0, dtype=torch.float8_e4m3fn, device=layer.weight_scale.device
-                ),
-                requires_grad=False,
-            )
-            return
-
-        # Convert layer to NVFP4 linear kernel format
+        # Select the base first, then let the SM70 selector optionally decorate
+        # it with Skinny. The overlay never owns the large-M fallback policy.
         self._fallback_kernel().process_weights_after_loading(layer)
 
     def _fallback_kernel(self):
@@ -180,6 +159,4 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if sm70_tm.has_prepared_linear(layer):
-            return sm70_tm.apply_prepared_linear(layer, x, bias)
         return self._fallback_kernel().apply_weights(layer=layer, x=x, bias=bias)

@@ -8,6 +8,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
@@ -48,6 +49,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -1050,6 +1052,11 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
 
     @classmethod
     def get_min_capability(cls) -> int:
+        base_backend = envs.get_sm70_quant_base_backend()
+        if base_backend in ("turbomind", "marlin"):
+            return 70
+        if envs.use_sm70_skinny_nvfp4() or envs.VLLM_SM70_NVFP4_TURBOMIND:
+            return 70
         return 75
 
     @classmethod
@@ -1261,12 +1268,15 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         # backend == "marlin"; we don't set that since we pin the kernel
         # below, but we keep the attribute for shape parity.
         self.marlin_input_dtype = None
-        # Direct-instantiate the Marlin NVFP4 adapter rather than going through
-        # init_nvfp4_linear_kernel(): the latter's priority list returns a
-        # cutlass W4A4 kernel as first-pick on this hardware, which would
-        # silently try to quantize activations (we have no input_scale). For
-        # W4A16 there is exactly one valid kernel, so we pin it.
-        self.kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())
+        # Keep W4A16 on Marlin away from V100. Exact SM70 uses the common base
+        # selector so the optional Skinny decorator can wrap that base.
+        if sm70_tm.is_exact_sm70_cuda_platform() and (
+            envs.use_sm70_skinny_nvfp4()
+            or envs.get_sm70_quant_base_backend() in ("auto", "turbomind")
+        ):
+            self.kernel = init_nvfp4_linear_kernel()
+        else:
+            self.kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())
 
     def create_weights(
         self,

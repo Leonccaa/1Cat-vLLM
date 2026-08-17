@@ -6,7 +6,7 @@ from torch.nn.parameter import Parameter
 
 import vllm.model_executor.kernels.linear.nvfp4.emulation as nvfp4_emulation
 from vllm import envs
-from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
+from vllm.config import DeviceConfig, KernelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.kernels.linear.nvfp4.base import NvFp4LinearLayerConfig
 from vllm.model_executor.kernels.linear.nvfp4.emulation import (
     EmulationNvFp4LinearKernel,
@@ -18,6 +18,9 @@ from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     compressed_tensors_w4a4_mxfp4 as mxfp4_scheme,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+    compressed_tensors_w4a4_nvfp4 as nvfp4_scheme,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_mxfp4 import (  # noqa: E501
     CompressedTensorsW4A4Mxfp4,
 )
@@ -26,11 +29,21 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 )
 
 
+def _cpu_vllm_config(linear_backend: str) -> VllmConfig:
+    """Keep selector-only tests independent of local CUDA discovery."""
+    return VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        kernel_config=KernelConfig(linear_backend=linear_backend),
+    )
+
+
 def test_sm70_quant_backend_auto_respects_route_default(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_QUANT_BACKEND", raising=False)
+    monkeypatch.delenv("VLLM_SM70_SKINNY", raising=False)
 
     assert envs.use_sm70_turbomind(True)
     assert not envs.use_sm70_turbomind(False)
+    assert not envs.use_sm70_skinny_nvfp4()
 
     monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "turbomind")
     assert envs.use_sm70_turbomind(False)
@@ -38,49 +51,89 @@ def test_sm70_quant_backend_auto_respects_route_default(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "marlin")
     assert not envs.use_sm70_turbomind(True)
 
+    monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "skinny")
+    assert not envs.use_sm70_turbomind(False)
+    assert envs.get_sm70_quant_base_backend() == "auto"
+    assert envs.use_sm70_skinny_nvfp4()
+
+    monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "auto")
+    monkeypatch.setenv("VLLM_SM70_SKINNY", "on")
+    assert envs.use_sm70_skinny_nvfp4()
+
 
 def test_nvfp4_min_capability_honors_linear_backend_emulation(monkeypatch):
     monkeypatch.delenv("VLLM_USE_NVFP4_CT_EMULATIONS", raising=False)
     monkeypatch.delenv("VLLM_NVFP4_GEMM_BACKEND", raising=False)
     monkeypatch.delenv("VLLM_SM70_QUANT_BACKEND", raising=False)
 
-    with set_current_vllm_config(
-        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
-    ):
+    with set_current_vllm_config(_cpu_vllm_config("auto")):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
 
     monkeypatch.setenv("VLLM_SM70_NVFP4_TURBOMIND", "0")
-    with set_current_vllm_config(
-        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
-    ):
+    with set_current_vllm_config(_cpu_vllm_config("auto")):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 75
 
     monkeypatch.delenv("VLLM_SM70_NVFP4_TURBOMIND", raising=False)
     monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "marlin")
-    with set_current_vllm_config(
-        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
-    ):
+    with set_current_vllm_config(_cpu_vllm_config("auto")):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
 
     monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "turbomind")
-    with set_current_vllm_config(
-        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
-    ):
+    with set_current_vllm_config(_cpu_vllm_config("auto")):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
 
-    with set_current_vllm_config(
-        VllmConfig(kernel_config=KernelConfig(linear_backend="emulation"))
-    ):
+    with set_current_vllm_config(_cpu_vllm_config("emulation")):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
 
 
 def test_nvfp4_min_capability_honors_legacy_emulation_env(monkeypatch):
     monkeypatch.setenv("VLLM_NVFP4_GEMM_BACKEND", "emulation")
 
-    with set_current_vllm_config(
-        VllmConfig(kernel_config=KernelConfig(linear_backend="auto"))
-    ):
+    with set_current_vllm_config(_cpu_vllm_config("auto")):
         assert CompressedTensorsW4A4Fp4.get_min_capability() == 70
+
+
+def test_nvfp4_w4a4_skinny_route_precedes_turbomind(monkeypatch):
+    layer = torch.nn.Module()
+    layer.input_size_per_partition = 4
+    layer.output_size_per_partition = 2
+    layer.weight_packed = Parameter(
+        torch.tensor([[0x10, 0x32], [0x54, 0x76]], dtype=torch.uint8),
+        requires_grad=False,
+    )
+    layer.weight_scale = Parameter(
+        torch.ones((2, 1), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_global_scale = Parameter(torch.tensor([2.0]), requires_grad=False)
+    layer.input_global_scale = Parameter(torch.tensor([4.0]), requires_grad=False)
+    calls = []
+
+    class FakeSkinnyKernel:
+        def process_weights_after_loading(self, loaded_layer):
+            calls.append("process")
+            loaded_layer.skinny_codes = loaded_layer.weight
+
+        def apply_weights(self, layer, x, bias=None):
+            calls.append("apply")
+            return torch.zeros((x.shape[0], 2), dtype=x.dtype) + (bias or 0)
+
+    monkeypatch.setattr(
+        nvfp4_scheme.sm70_tm,
+        "prepare_nvfp4_linear",
+        lambda layer: (_ for _ in ()).throw(AssertionError("unexpected TurboMind")),
+    )
+    monkeypatch.setattr(
+        CompressedTensorsW4A4Fp4,
+        "_fallback_kernel",
+        lambda self: FakeSkinnyKernel(),
+    )
+    scheme = CompressedTensorsW4A4Fp4()
+
+    scheme.process_weights_after_loading(layer)
+    out = scheme.apply_weights(layer, torch.ones((1, 4), dtype=torch.float16))
+
+    assert calls == ["process", "apply"]
+    assert out.shape == (1, 2)
 
 
 def test_flashinfer_nvfp4_backends_reject_sm70():

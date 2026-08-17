@@ -112,6 +112,12 @@ from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
 from vllm.model_executor.kernels.linear.nvfp4.marlin import (
     MarlinNvFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.nvfp4.skinny import (
+    SkinnyNvFp4LinearKernel,
+)
+from vllm.model_executor.kernels.linear.nvfp4.turbomind import (
+    TurboMindNvFp4LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm import (
     Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearKernel,
@@ -837,6 +843,39 @@ def init_nvfp4_linear_kernel() -> NvFp4LinearKernel:
     """Select and instantiate the best NVFP4 linear kernel for the
     current platform."""
     config = NvFp4LinearLayerConfig()
+    skinny_mode = envs.get_sm70_skinny_mode()
+    exact_sm70 = current_platform.is_cuda() and current_platform.is_device_capability(
+        (7, 0)
+    )
+
+    if skinny_mode == "on" and not exact_sm70:
+        raise ValueError("VLLM_SM70_SKINNY=on requires exact CUDA capability 7.0.")
+
+    def maybe_overlay(base_kernel: NvFp4LinearKernel) -> NvFp4LinearKernel:
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            or not envs.use_sm70_skinny_nvfp4()
+            or not exact_sm70
+        ):
+            return base_kernel
+        supported, reason = SkinnyNvFp4LinearKernel.is_supported()
+        if not supported:
+            if skinny_mode == "on":
+                raise ValueError(
+                    "VLLM_SM70_SKINNY=on requested NVFP4 overlay, but it is "
+                    f"unavailable: {reason}."
+                )
+            logger.warning_once(
+                "SM70 Skinny NVFP4 auto overlay unavailable; retaining base=%s: %s",
+                type(base_kernel).__name__,
+                reason,
+            )
+            return base_kernel
+        logger.info_once(
+            "Wrapping NVFP4 base %s with the SM70 Skinny small-M overlay.",
+            type(base_kernel).__name__,
+        )
+        return SkinnyNvFp4LinearKernel(config, base_kernel)
 
     # VLLM_BATCH_INVARIANT forces deterministic execution. Prefer the
     # batch-invariant CUTLASS implementation when available, otherwise fall
@@ -873,7 +912,24 @@ def init_nvfp4_linear_kernel() -> NvFp4LinearKernel:
                 reason,
             )
             force_kernel = EmulationNvFp4LinearKernel
-    elif linear_backend == "auto":
+    else:
+        sm70_base = envs.get_sm70_quant_base_backend()
+        if exact_sm70 and sm70_base == "turbomind":
+            force_kernel = TurboMindNvFp4LinearKernel
+        elif exact_sm70 and sm70_base == "marlin":
+            force_kernel = MarlinNvFp4LinearKernel
+        elif exact_sm70 and sm70_base == "auto" and linear_backend == "auto":
+            tm_supported, reason = TurboMindNvFp4LinearKernel.is_supported()
+            if tm_supported:
+                force_kernel = TurboMindNvFp4LinearKernel
+            else:
+                logger.warning_once(
+                    "SM70 NVFP4 auto base could not select TurboMind; "
+                    "continuing with the generic selector: %s",
+                    reason,
+                )
+
+    if force_kernel is None and linear_backend == "auto":
         # Deprecated env-var overrides — only honoured when --linear-backend
         # is "auto". Deprecation warnings are emitted from vllm/envs.py.
         if envs.VLLM_USE_FBGEMM:
@@ -898,7 +954,7 @@ def init_nvfp4_linear_kernel() -> NvFp4LinearKernel:
                 f"supported: {reason}"
             )
         logger.info_once("Using %s for NVFP4 GEMM", force_kernel.__name__)
-        return force_kernel(config)
+        return maybe_overlay(force_kernel(config))
 
     # Auto-select from registry (or --linear-backend filtered).
     platform = current_platform._enum
@@ -943,7 +999,7 @@ def init_nvfp4_linear_kernel() -> NvFp4LinearKernel:
             )
 
         logger.info_once("Using %s for NVFP4 GEMM", kernel_cls.__name__)
-        return kernel_cls(config)
+        return maybe_overlay(kernel_cls(config))
 
     raise ValueError(
         "Failed to find a kernel that can implement the "
@@ -1013,6 +1069,8 @@ __all__ = [
     "AiterPerTokenFp8ScaledMMLinearKernel",
     "NvFp4LinearKernel",
     "NvFp4LinearLayerConfig",
+    "SkinnyNvFp4LinearKernel",
+    "TurboMindNvFp4LinearKernel",
     "AiterInt8ScaledMMLinearKernel",
     "CPUInt8ScaledMMLinearKernel",
     "CutlassFP8ScaledMMLinearKernel",

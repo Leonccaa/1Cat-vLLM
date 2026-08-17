@@ -695,9 +695,7 @@ class GroupCoordinator:
             raise RuntimeError("Device communicator lacks SM70 fused AR RMSNorm")
         return fused_op(input_, residual, weight, epsilon)
 
-    def sm70_awq_mlp_down_tile_all_reduce(
-        self, input_: torch.Tensor
-    ) -> torch.Tensor:
+    def sm70_awq_mlp_down_tile_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         if self.world_size == 1:
             return input_
 
@@ -2063,6 +2061,11 @@ def prepare_communication_buffer_for_model(model: torch.nn.Module):
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
     return _TP is not None and _PP is not None
+
+
+def tensor_model_parallel_is_initialized() -> bool:
+    """Check whether the tensor-parallel group alone is initialized."""
+    return _TP is not None
 
 
 _TP_STATE_PATCHED = False

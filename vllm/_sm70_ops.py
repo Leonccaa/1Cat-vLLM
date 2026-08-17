@@ -625,6 +625,136 @@ if hasattr(torch.ops._C, "nvfp4_gemm_sm70_out"):
         return None
 
 
+def skinny_nvfp4_gemm_simt(
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+) -> torch.Tensor:
+    return _op("skinny_nvfp4_gemm_simt")(input, codes, scales, global_scale)
+
+
+if hasattr(torch.ops._C, "skinny_nvfp4_gemm_simt"):
+
+    @register_fake("_C::skinny_nvfp4_gemm_simt")
+    def _skinny_nvfp4_gemm_simt_fake(
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+        global_scale: float,
+    ) -> torch.Tensor:
+        del scales, global_scale
+        return input.new_empty((input.shape[0], codes.shape[0]))
+
+
+def skinny_nvfp4_gemm_qpn(
+    input: torch.Tensor,
+    qcodes: torch.Tensor,
+    qscales: torch.Tensor,
+    global_scale: float,
+    output_size: int,
+) -> torch.Tensor:
+    return _op("skinny_nvfp4_gemm_qpn")(
+        input, qcodes, qscales, global_scale, output_size
+    )
+
+
+if hasattr(torch.ops._C, "skinny_nvfp4_gemm_qpn"):
+
+    @register_fake("_C::skinny_nvfp4_gemm_qpn")
+    def _skinny_nvfp4_gemm_qpn_fake(
+        input: torch.Tensor,
+        qcodes: torch.Tensor,
+        qscales: torch.Tensor,
+        global_scale: float,
+        output_size: int,
+    ) -> torch.Tensor:
+        del qcodes, qscales, global_scale
+        return input.new_empty((input.shape[0], output_size))
+
+
+def skinny_awq_gemm_simt(
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    biases: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    return _op("skinny_awq_gemm_simt")(input, codes, scales, biases, group_size)
+
+
+if hasattr(torch.ops._C, "skinny_awq_gemm_simt"):
+
+    @register_fake("_C::skinny_awq_gemm_simt")
+    def _skinny_awq_gemm_simt_fake(
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+        biases: torch.Tensor,
+        group_size: int,
+    ) -> torch.Tensor:
+        del scales, biases, group_size
+        return input.new_empty((input.shape[0], codes.shape[0]))
+
+
+def skinny_awq_gemm_qpn(
+    input: torch.Tensor,
+    qcodes: torch.Tensor,
+    qscales: torch.Tensor,
+    qbiases: torch.Tensor,
+    group_size: int,
+    output_size: int,
+) -> torch.Tensor:
+    return _op("skinny_awq_gemm_qpn")(
+        input, qcodes, qscales, qbiases, group_size, output_size
+    )
+
+
+if hasattr(torch.ops._C, "skinny_awq_gemm_qpn"):
+
+    @register_fake("_C::skinny_awq_gemm_qpn")
+    def _skinny_awq_gemm_qpn_fake(
+        input: torch.Tensor,
+        qcodes: torch.Tensor,
+        qscales: torch.Tensor,
+        qbiases: torch.Tensor,
+        group_size: int,
+        output_size: int,
+    ) -> torch.Tensor:
+        del qcodes, qscales, qbiases, group_size
+        return input.new_empty((input.shape[0], output_size))
+
+
+def skinny_awq_moe_gemm_simt_out(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    expert_ids: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    biases: torch.Tensor,
+    group_size: int,
+) -> None:
+    _op("skinny_awq_moe_gemm_simt_out")(
+        output, input, expert_ids, codes, scales, biases, group_size
+    )
+
+
+if hasattr(torch.ops._C, "skinny_awq_moe_gemm_simt_out"):
+
+    @register_fake("_C::skinny_awq_moe_gemm_simt_out")
+    def _skinny_awq_moe_gemm_simt_out_fake(
+        output: torch.Tensor,
+        input: torch.Tensor,
+        expert_ids: torch.Tensor,
+        codes: torch.Tensor,
+        scales: torch.Tensor,
+        biases: torch.Tensor,
+        group_size: int,
+    ) -> None:
+        del output, input, expert_ids, codes, scales, biases, group_size
+        return None
+
+
 def nvfp4_gemv_sm70_raw_out(
     out: torch.Tensor,
     input: torch.Tensor,

@@ -5,15 +5,14 @@ from collections.abc import Callable
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm import envs
-from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
+from vllm.model_executor.kernels.linear.nvfp4 import NvFp4LinearLayerConfig
+from vllm.model_executor.kernels.linear.nvfp4.marlin import (
+    MarlinNvFp4LinearKernel,
+)
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
-)
-from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-    apply_fp4_marlin_linear,
-    prepare_fp4_layer_for_marlin,
 )
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
@@ -22,8 +21,6 @@ from vllm.model_executor.parameter import (
 )
 
 __all__ = ["CompressedTensorsW4A16Fp4"]
-
-logger = init_logger(__name__)
 
 
 class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
@@ -88,32 +85,22 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
         # Rename weight_packed to weight that marlin expects
         layer.weight = Parameter(layer.weight_packed.data, requires_grad=False)
         del layer.weight_packed
-        # ct stores the inverse of what is expected by the marlin kernel
+        # CT stores the inverse of what the selected kernel expects.
         layer.weight_global_scale = Parameter(
-            1.0 / layer.weight_global_scale.max().to(torch.float32), requires_grad=False
+            1.0 / layer.weight_global_scale.max().to(torch.float32),
+            requires_grad=False,
         )
 
-        if sm70_tm.should_prepare_turbomind(
-            layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
-        ):
-            logger.info_once(
-                "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path "
-                "enabled."
-            )
-            sm70_tm.prepare_nvfp4_linear(layer)
-            layer.weight = Parameter(
-                torch.empty(0, dtype=torch.uint8, device=layer.weight.device),
-                requires_grad=False,
-            )
-            layer.weight_scale = Parameter(
-                torch.empty(
-                    0, dtype=torch.float8_e4m3fn, device=layer.weight_scale.device
-                ),
-                requires_grad=False,
-            )
-            return
-
-        prepare_fp4_layer_for_marlin(layer)
+        # This on-disk scheme is weight-only W4A16. Preserve its existing
+        # Marlin behavior away from V100: the generic NVFP4 registry also
+        # contains W4A4 kernels that require activation-scale state this
+        # scheme intentionally does not create. Exact SM70 alone uses the
+        # base selector plus optional Skinny decorator.
+        if sm70_tm.is_exact_sm70_cuda_platform():
+            self.nvfp4_kernel = init_nvfp4_linear_kernel()
+        else:
+            self.nvfp4_kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())
+        self.nvfp4_kernel.process_weights_after_loading(layer)
 
     def apply_weights(
         self,
@@ -121,15 +108,4 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if sm70_tm.has_prepared_linear(layer):
-            return sm70_tm.apply_prepared_linear(layer, x, bias)
-        return apply_fp4_marlin_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            weight_global_scale=layer.weight_global_scale,
-            workspace=layer.workspace,
-            size_n=layer.output_size_per_partition,
-            size_k=layer.input_size_per_partition,
-            bias=bias,
-        )
+        return self.nvfp4_kernel.apply_weights(layer, x, bias)
