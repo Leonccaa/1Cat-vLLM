@@ -415,9 +415,6 @@ class Scheduler(SchedulerInterface):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        assert num_external_computed_tokens == 0, (
-            "External KV connector is not verified yet"
-        )
         num_computed_tokens = (
             request.num_computed_tokens
             + num_new_local_computed_tokens
@@ -923,7 +920,8 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled.
                             break
 
-                if self.need_mamba_block_aligned_split:
+                # Skip block alignment when setting up async receive (no local work).
+                if self.need_mamba_block_aligned_split and not load_kv_async:
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
                         num_new_tokens,
@@ -1120,6 +1118,9 @@ class Scheduler(SchedulerInterface):
             if self.needs_kv_cache_zeroing
             else None
         )
+        # A Mamba ``align`` table is not append-only. Drain exact committed
+        # boundary-state block IDs before the connector builds store jobs.
+        boundary_state_offloads = self.kv_cache_manager.take_boundary_state_offloads()
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -1138,6 +1139,9 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            boundary_state_offloads=(
+                boundary_state_offloads if self.connector is not None else None
+            ),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1147,6 +1151,9 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+
+        # Exact source IDs are scheduler-side connector inputs only.
+        scheduler_output.boundary_state_offloads = None
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
@@ -2397,7 +2404,10 @@ class Scheduler(SchedulerInterface):
             total_computed_tokens=request.num_computed_tokens,
         )
 
-        block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
+        block_ids = self.kv_cache_manager.get_block_ids_for_computed_tokens(
+            request_id=request.request_id,
+            num_computed_tokens=request.num_computed_tokens,
+        )
 
         if not isinstance(self.connector, SupportsHMA):
             # NOTE(Kuntai): We should deprecate this code path after we enforce

@@ -8,10 +8,14 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    CrossAttentionSpec,
+    EncoderOnlyAttentionSpec,
     KVCacheConfig,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
@@ -541,6 +545,26 @@ class KVCacheManager:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
 
+    def get_block_ids_for_computed_tokens(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+    ) -> tuple[list[int], ...]:
+        """Get block ids covering the request's computed tokens."""
+        block_ids = self.get_block_ids(request_id)
+        clipped_block_ids: list[list[int]] = []
+        for group, ids in zip(self.kv_cache_config.kv_cache_groups, block_ids):
+            spec = group.kv_cache_spec
+            if not isinstance(spec, AttentionSpec) or isinstance(
+                spec, (CrossAttentionSpec, EncoderOnlyAttentionSpec)
+            ):
+                clipped_block_ids.append(ids)
+                continue
+
+            num_valid_blocks = cdiv(num_computed_tokens, spec.block_size)
+            clipped_block_ids.append(ids[:num_valid_blocks])
+        return tuple(clipped_block_ids)
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled.
 
@@ -564,6 +588,28 @@ class KVCacheManager:
         for mgr in self.coordinator.single_type_managers:
             ids.extend(mgr.take_new_block_ids())
         return ids
+
+    def take_boundary_state_offloads(
+        self,
+    ) -> dict[str, list[tuple[int, int, int]]]:
+        """Drain exact Mamba ``align`` state blocks for KV connectors.
+
+        Returns ``{request_id: [(group_id, block_id, boundary_tokens), ...]}``.
+        These scheduler-local handoffs avoid reconstructing mutable Mamba block
+        tables from a connector's append-only block-ID mirror.
+        """
+        offloads: dict[str, list[tuple[int, int, int]]] = {}
+        for mgr in self.coordinator.single_type_managers:
+            for (
+                request_id,
+                group_id,
+                block,
+                boundary_tokens,
+            ) in mgr.take_pending_boundary_state_offloads():
+                offloads.setdefault(request_id, []).append(
+                    (group_id, block.block_id, boundary_tokens)
+                )
+        return offloads
 
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
