@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 v100-skinny contributors
+// Derived from https://github.com/dnv2003/v100-skinny (MIT License).
 // Adapted for 1Cat-vLLM's format-independent SM70 execution layer.
 
 #pragma once

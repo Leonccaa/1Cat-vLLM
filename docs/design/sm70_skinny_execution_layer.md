@@ -8,6 +8,10 @@ selection. It keeps weight loading, model configuration, tensor parallelism,
 attention, scheduling, and the selected base kernel in 1Cat-vLLM, then
 overlays a format policy on shared SIMT and QPN execution cores.
 
+The shared SIMT and QPN cores derive from
+[dnv2003/v100-skinny](https://github.com/dnv2003/v100-skinny) under the MIT
+License and are adapted here into a format-policy overlay for AWQ and NVFP4.
+
 The initial formats are:
 
 - NVFP4 group 16, using E2M1 decode and FP8 E4M3 group scales;
