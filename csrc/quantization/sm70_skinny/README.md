@@ -18,4 +18,5 @@ This is currently an explicit dual-copy integration gate:
 - `VLLM_SM70_SKINNY=on` enables eligible block-128 FP8 dense layers.
 - `auto` and `off` retain the selected base backend.
 - It is not a linear backend and does not change MoE routing.
-- Default-auto requires full-model validation and a bounded one-copy policy.
+- Default-auto requires a bounded one-copy residency policy; the dual-copy
+  explicit-on path has passed its real-model integration gate.

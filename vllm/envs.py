@@ -825,9 +825,11 @@ def get_sm70_skinny_mode() -> SM70SkinnyMode:
 def use_sm70_skinny_fp8() -> bool:
     """Enable the dual-copy block-128 FP8 integration gate.
 
-    The micro-kernel has passed real-shape tests, but full-model behavior and
-    a one-copy residency policy have not. Keep FP8 explicit-on until both
-    gates pass; ``auto`` therefore leaves the selected base backend unchanged.
+    The kernel and full-model path have passed the explicit-on integration
+    gates, but the validation layout still duplicates dense FP8 weights. Keep
+    FP8 explicit-on until a one-copy residency policy passes its memory and
+    fallback gates; ``auto`` therefore leaves the selected base backend
+    unchanged.
     """
     return get_sm70_skinny_mode() == "on"
 
@@ -1521,8 +1523,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TurboMind for supported SM70 quant routes; only "marlin" forces Marlin.
     "VLLM_SM70_QUANT_BACKEND": get_sm70_quant_backend,
     # Orthogonal small-M execution overlay. FP8 remains explicit-on while its
-    # full-model and one-copy gates are open; this variable is intentionally
-    # separate from VLLM_SM70_QUANT_BACKEND.
+    # one-copy memory and fallback gates are open; this variable is
+    # intentionally separate from VLLM_SM70_QUANT_BACKEND.
     "VLLM_SM70_SKINNY": get_sm70_skinny_mode,
     # V100/SM70 AWQ dense path using the local TurboMind backend. This matches
     # the 0.0.3 route semantics: enable by default on SM70 and allow an explicit

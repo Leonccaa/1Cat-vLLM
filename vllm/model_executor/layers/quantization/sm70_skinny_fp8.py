@@ -5,8 +5,8 @@
 The selected base linear kernel remains authoritative. This module keeps a
 second, QPN8-prepacked copy only when ``VLLM_SM70_SKINNY=on``. A graph-opaque
 hybrid op sends supported FP16 M=1..8 calls to QPN8 and every other call to the
-already-selected Marlin base. ``auto`` remains base-only until full-model and
-one-copy gates pass.
+already-selected base backend. ``auto`` remains base-only until a bounded
+one-copy residency policy passes its memory and fallback gates.
 """
 
 from __future__ import annotations
