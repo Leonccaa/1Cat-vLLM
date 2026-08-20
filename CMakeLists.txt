@@ -454,7 +454,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
        "csrc/quantization/marlin/sm70_marlin_u8b128_gemm.cu"
        "csrc/quantization/marlin/sm70_marlin_fp8_gemm.cu"
        "csrc/quantization/marlin/sm70_marlin_nvfp4_gemm.cu"
-       "csrc/quantization/marlin/sm70_marlin_mxfp4_gemm.cu")
+       "csrc/quantization/marlin/sm70_marlin_mxfp4_gemm.cu"
+       "csrc/quantization/sm70_skinny/skinny_fp8_b128.cu")
     set_gencode_flags_for_srcs(
       SRCS "${MARLIN_SM70_SRCS}"
       CUDA_ARCHS "${MARLIN_SM70_ARCHS}")

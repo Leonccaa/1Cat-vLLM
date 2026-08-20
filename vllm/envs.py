@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS: bool = False
     VLLM_SM70_QUANT_BACKEND: Literal["auto", "marlin", "turbomind"] = "auto"
+    VLLM_SM70_SKINNY: Literal["auto", "on", "off"] = "auto"
     VLLM_SM70_AWQ_TURBOMIND: bool = True
     VLLM_SM70_GPTQ_TURBOMIND: bool = False
     VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND: bool = False
@@ -797,6 +798,8 @@ def env_with_choices(
 
 SM70_QUANT_BACKENDS = ("auto", "marlin", "turbomind")
 SM70QuantBackend = Literal["auto", "marlin", "turbomind"]
+SM70_SKINNY_MODES = ("auto", "on", "off")
+SM70SkinnyMode = Literal["auto", "on", "off"]
 
 
 def get_sm70_quant_backend() -> SM70QuantBackend:
@@ -807,6 +810,28 @@ def get_sm70_quant_backend() -> SM70QuantBackend:
             f"got {value!r}."
         )
     return cast(SM70QuantBackend, value)
+
+
+def get_sm70_skinny_mode() -> SM70SkinnyMode:
+    """Return the small-M overlay mode, independent of the base backend."""
+    value = os.getenv("VLLM_SM70_SKINNY", "auto").strip().lower()
+    if value not in SM70_SKINNY_MODES:
+        raise ValueError(
+            f"VLLM_SM70_SKINNY must be one of auto, on, off; got {value!r}."
+        )
+    return cast(SM70SkinnyMode, value)
+
+
+def use_sm70_skinny_fp8() -> bool:
+    """Enable the dual-copy block-128 FP8 integration gate.
+
+    The kernel and full-model path have passed the explicit-on integration
+    gates, but the validation layout still duplicates dense FP8 weights. Keep
+    FP8 explicit-on until a one-copy residency policy passes its memory and
+    fallback gates; ``auto`` therefore leaves the selected base backend
+    unchanged.
+    """
+    return get_sm70_skinny_mode() == "on"
 
 
 def use_sm70_turbomind(default_enabled: bool) -> bool:
@@ -1497,6 +1522,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Unified V100/SM70 quantized linear backend selector. "auto" resolves to
     # TurboMind for supported SM70 quant routes; only "marlin" forces Marlin.
     "VLLM_SM70_QUANT_BACKEND": get_sm70_quant_backend,
+    # Orthogonal small-M execution overlay. FP8 remains explicit-on while its
+    # one-copy memory and fallback gates are open; this variable is
+    # intentionally separate from VLLM_SM70_QUANT_BACKEND.
+    "VLLM_SM70_SKINNY": get_sm70_skinny_mode,
     # V100/SM70 AWQ dense path using the local TurboMind backend. This matches
     # the 0.0.3 route semantics: enable by default on SM70 and allow an explicit
     # opt-out with VLLM_SM70_AWQ_TURBOMIND=0.

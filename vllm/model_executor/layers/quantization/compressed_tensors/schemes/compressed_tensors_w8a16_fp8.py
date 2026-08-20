@@ -117,6 +117,13 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm.model_executor.layers.quantization import sm70_skinny_fp8
+
+        skinny_state = sm70_skinny_fp8.prepare_state(
+            layer.weight.data,
+            layer.weight_scale.data,
+            layer.weight_block_size,
+        )
         if self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
             # MarlinFP8ScaledMMLinearKernel uses "weight_scale_inv" for block
@@ -138,6 +145,9 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 )
 
         self.linear_kernel.process_weights_after_loading(layer)
+        sm70_skinny_fp8.validate_and_attach_state(
+            layer, self.linear_kernel, skinny_state
+        )
 
     def apply_weights(
         self,
@@ -145,4 +155,8 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from vllm.model_executor.layers.quantization import sm70_skinny_fp8
+
+        if hasattr(layer, sm70_skinny_fp8.STATE_ATTR):
+            return sm70_skinny_fp8.apply_weights(layer, self.linear_kernel, x, bias)
         return self.linear_kernel.apply_weights(layer, x, bias)

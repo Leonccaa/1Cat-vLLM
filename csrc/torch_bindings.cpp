@@ -147,6 +147,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor");
   // conditionally compiled so impl registration is in source file
 
+  ops.def(
+      "sm70_fp8_qpn8_b128_gemm(Tensor x, Tensor codes, Tensor scales256, "
+      "Tensor ratios, SymInt size_n, int split_k, int nacc) -> Tensor");
+  // SM70-only implementation is registered by skinny_fp8_b128.cu.
+
   // gptq_marlin repack from GPTQ.
   ops.def(
       "gptq_marlin_repack(Tensor b_q_weight, Tensor perm, "
