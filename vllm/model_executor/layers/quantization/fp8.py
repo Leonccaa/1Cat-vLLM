@@ -503,12 +503,25 @@ class Fp8LinearMethod(LinearMethodBase):
         if getattr(layer, "sm70_fp8_turbomind", False):
             return
 
+        from vllm.model_executor.layers.quantization import sm70_skinny_fp8
+
+        skinny_state = None
+        if self.block_quant and not getattr(layer, "is_bmm", False):
+            skinny_state = sm70_skinny_fp8.prepare_state(
+                layer.weight.data,
+                layer.weight_scale_inv.data,
+                layer.weight_block_size,
+            )
+
         if self.use_marlin:
             # Only Marlin kernels support `marlin_input_dtype`; guard to avoid
             # AttributeError if backend selection changes.
             if hasattr(self.fp8_linear, "marlin_input_dtype"):
                 self.fp8_linear.marlin_input_dtype = self.marlin_input_dtype
             self.fp8_linear.process_weights_after_loading(layer)
+            sm70_skinny_fp8.validate_and_attach_state(
+                layer, self.fp8_linear, skinny_state
+            )
             return
 
         input_scale = None
@@ -644,6 +657,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         "85 MiB workspace."
                     )
             logger.info_once("SM70 FP8 TurboMind W8A16 dense path enabled.")
+            sm70_skinny_fp8.validate_and_attach_turbomind_state(layer, skinny_state)
             return
 
         if self.block_quant:
@@ -758,6 +772,12 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if getattr(layer, "sm70_fp8_turbomind", False):
+            from vllm.model_executor.layers.quantization import sm70_skinny_fp8
+
+            if hasattr(layer, sm70_skinny_fp8.STATE_ATTR):
+                return sm70_skinny_fp8.apply_turbomind_weights(
+                    layer, x, bias, _SM70_FP8_PREFILL_DENSE_MIN_M
+                )
             if getattr(layer, "sm70_fp8_bmm", False):
                 group_count = int(layer.sm70_fp8_bmm_groups)
                 output_size = int(layer.sm70_fp8_bmm_output_size)

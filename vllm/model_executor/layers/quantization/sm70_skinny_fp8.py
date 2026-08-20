@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import torch
 
 import vllm._custom_ops as ops
+from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
@@ -251,6 +252,71 @@ def validate_and_attach_state(
     return True
 
 
+def validate_and_attach_turbomind_state(
+    layer: torch.nn.Module,
+    state: SM70Fp8Qpn8State | None,
+) -> bool:
+    """Cross-check QPN8 against the already-prepared TurboMind base."""
+    if state is None:
+        return False
+
+    n, k = state.output_size, state.input_size
+    try:
+        values = torch.arange(8 * k, device=state.codes.device, dtype=torch.int32)
+        x = ((values.remainder(31) - 15).to(torch.float16) * 1e-3).view(8, k)
+        expected = torch.empty((8, n), device=x.device, dtype=x.dtype)
+        sm70_ops.fp8_gemm_sm70_out(
+            expected,
+            x,
+            layer.weight,
+            layer.weight_scale_inv,
+            128,
+            int(layer.sm70_fp8_k_ld),
+            int(layer.sm70_fp8_q_ld),
+            False,
+        )
+        if getattr(layer, "sm70_fp8_gated_silu_primary", False):
+            expected = expected.reshape(8, n // 2, 2).transpose(1, 2).reshape(8, n)
+        actual = ops.sm70_fp8_qpn8_b128_gemm(
+            x,
+            state.codes,
+            state.scales256,
+            state.ratios,
+            n,
+            state.split_k,
+            state.nacc,
+        )
+        error = _relative_error(actual, expected)
+        if not bool(torch.isfinite(actual).all()) or not math.isfinite(error):
+            raise RuntimeError("non-finite QPN8 output or error")
+        if error > _SELF_CHECK_TOL:
+            raise RuntimeError(
+                f"relative error {error:.3e} exceeds {_SELF_CHECK_TOL:.3e}"
+            )
+    except Exception:
+        logger.exception(
+            "SM70 FP8 QPN8 self-check failed for N=%d K=%d against TurboMind.",
+            n,
+            k,
+        )
+        raise
+
+    setattr(layer, STATE_ATTR, state)
+    shape_key = (n, k, state.split_k, state.nacc)
+    if shape_key not in _logged_shapes:
+        _logged_shapes.add(shape_key)
+        logger.info(
+            "SM70 FP8 QPN8 enabled for N=%d K=%d: M=1..8, split-K=%d, "
+            "NACC=%d, overlay=%.1f MiB, base=TurboMind.",
+            n,
+            k,
+            state.split_k,
+            state.nacc,
+            state.overlay_mib,
+        )
+    return True
+
+
 def _sm70_skinny_fp8_marlin_linear_impl(
     x: torch.Tensor,
     codes: torch.Tensor,
@@ -316,6 +382,105 @@ direct_register_custom_op(
 )
 
 
+def _sm70_skinny_fp8_turbomind_linear_impl(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales256: torch.Tensor,
+    ratios: torch.Tensor,
+    base_weight: torch.Tensor,
+    base_scales: torch.Tensor,
+    bias: torch.Tensor | None,
+    n: int,
+    k: int,
+    split_k: int,
+    nacc: int,
+    k_ld: int,
+    q_ld: int,
+    gated_silu_primary: bool,
+    prefill_workspace_ptr: int,
+    prefill_min_m: int,
+) -> torch.Tensor:
+    if x.dtype == torch.float16 and bias is None and 1 <= x.shape[0] <= MAX_ROWS:
+        return ops.sm70_fp8_qpn8_b128_gemm(
+            x, codes, scales256, ratios, n, split_k, nacc
+        )
+
+    out = torch.empty((x.shape[0], n), device=x.device, dtype=x.dtype)
+    if prefill_workspace_ptr and x.dtype == torch.float16:
+        sm70_ops.fp8_gemm_sm70_prefill_dispatch_out(
+            out,
+            prefill_workspace_ptr,
+            x,
+            base_weight,
+            base_scales,
+            128,
+            k_ld,
+            q_ld,
+            False,
+            prefill_min_m,
+        )
+    else:
+        sm70_ops.fp8_gemm_sm70_out(
+            out,
+            x,
+            base_weight,
+            base_scales,
+            128,
+            k_ld,
+            q_ld,
+            False,
+        )
+    if gated_silu_primary:
+        out = out.reshape(x.shape[0], n // 2, 2).transpose(1, 2).reshape(x.shape[0], n)
+    if bias is not None:
+        out.add_(bias)
+    return out
+
+
+def _sm70_skinny_fp8_turbomind_linear_fake(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales256: torch.Tensor,
+    ratios: torch.Tensor,
+    base_weight: torch.Tensor,
+    base_scales: torch.Tensor,
+    bias: torch.Tensor | None,
+    n: int,
+    k: int,
+    split_k: int,
+    nacc: int,
+    k_ld: int,
+    q_ld: int,
+    gated_silu_primary: bool,
+    prefill_workspace_ptr: int,
+    prefill_min_m: int,
+) -> torch.Tensor:
+    del (
+        codes,
+        scales256,
+        ratios,
+        base_weight,
+        base_scales,
+        bias,
+        k,
+        split_k,
+        nacc,
+        k_ld,
+        q_ld,
+        gated_silu_primary,
+        prefill_workspace_ptr,
+        prefill_min_m,
+    )
+    return x.new_empty((x.shape[0], n))
+
+
+direct_register_custom_op(
+    op_name="sm70_skinny_fp8_turbomind_linear",
+    op_func=_sm70_skinny_fp8_turbomind_linear_impl,
+    fake_impl=_sm70_skinny_fp8_turbomind_linear_fake,
+)
+
+
 def apply_weights(
     layer: torch.nn.Module,
     base_kernel: object,
@@ -343,5 +508,39 @@ def apply_weights(
         state.input_size,
         state.split_k,
         state.nacc,
+    )
+    return out.reshape(output_shape)
+
+
+def apply_turbomind_weights(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+    prefill_min_m: int,
+) -> torch.Tensor:
+    """Apply QPN8 over a TurboMind base while preserving its large-M path."""
+    state = getattr(layer, STATE_ATTR, None)
+    if not isinstance(state, SM70Fp8Qpn8State):
+        raise RuntimeError("SM70 FP8 TurboMind overlay called without QPN8 state.")
+
+    output_shape = x.shape[:-1] + (state.output_size,)
+    x_2d = x.reshape(-1, state.input_size).contiguous()
+    out = torch.ops.vllm.sm70_skinny_fp8_turbomind_linear(
+        x_2d,
+        state.codes,
+        state.scales256,
+        state.ratios,
+        layer.weight,
+        layer.weight_scale_inv,
+        bias,
+        state.output_size,
+        state.input_size,
+        state.split_k,
+        state.nacc,
+        int(layer.sm70_fp8_k_ld),
+        int(layer.sm70_fp8_q_ld),
+        bool(getattr(layer, "sm70_fp8_gated_silu_primary", False)),
+        int(getattr(layer, "sm70_fp8_prefill_exact_dense_workspace_ptr", 0)),
+        prefill_min_m,
     )
     return out.reshape(output_shape)
