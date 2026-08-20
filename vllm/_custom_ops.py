@@ -1446,6 +1446,36 @@ if hasattr(torch.ops._C, "marlin_gemm"):
         return torch.empty((size_m, size_n), device=a.device, dtype=dtype)
 
 
+def sm70_fp8_qpn8_b128_gemm(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    scales256: torch.Tensor,
+    ratios: torch.Tensor,
+    size_n: int,
+    split_k: int,
+    nacc: int,
+) -> torch.Tensor:
+    return torch.ops._C.sm70_fp8_qpn8_b128_gemm(
+        x, codes, scales256, ratios, size_n, split_k, nacc
+    )
+
+
+if hasattr(torch.ops._C, "sm70_fp8_qpn8_b128_gemm"):
+
+    @register_fake("_C::sm70_fp8_qpn8_b128_gemm")
+    def _sm70_fp8_qpn8_b128_gemm_fake(
+        x: torch.Tensor,
+        codes: torch.Tensor,
+        scales256: torch.Tensor,
+        ratios: torch.Tensor,
+        size_n: torch.SymInt,
+        split_k: int,
+        nacc: int,
+    ) -> torch.Tensor:
+        del codes, scales256, ratios, split_k, nacc
+        return x.new_empty((x.shape[0], size_n))
+
+
 # machete
 def machete_supported_schedules(
     a_type: torch.dtype,
