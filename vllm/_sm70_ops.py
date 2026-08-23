@@ -541,6 +541,50 @@ if hasattr(torch.ops._C, "mxfp4_moe_dense_stage_sm70_out"):
         return None
 
 
+def nvfp4_moe_dense_stage_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    dense_expert_ids: torch.Tensor,
+    ptrs_w: torch.Tensor,
+    ptrs_s: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    group_size: int,
+) -> None:
+    _op("nvfp4_moe_dense_stage_sm70_out")(
+        out,
+        input,
+        expert_offsets,
+        dense_expert_ids,
+        ptrs_w,
+        ptrs_s,
+        num_experts,
+        k,
+        n,
+        group_size,
+    )
+
+
+if hasattr(torch.ops._C, "nvfp4_moe_dense_stage_sm70_out"):
+
+    @register_fake("_C::nvfp4_moe_dense_stage_sm70_out")
+    def _nvfp4_moe_dense_stage_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        dense_expert_ids: torch.Tensor,
+        ptrs_w: torch.Tensor,
+        ptrs_s: torch.Tensor,
+        num_experts: int,
+        k: int,
+        n: int,
+        group_size: int,
+    ) -> None:
+        return None
+
+
 def mxfp4_moe_single_token_prepare_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,

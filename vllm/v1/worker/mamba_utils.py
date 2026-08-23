@@ -659,6 +659,55 @@ class MambaSpecDecodeGPUContext:
             HAS_DDTREE_ACCEPTED_NODES=has_ddtree,
         )
 
+    def warmup_fused_postprocess(self) -> bool:
+        """Compile the non-DDTree MTP signature without copying model state."""
+        if not self.is_initialized:
+            return False
+
+        device = self.state_base_addrs.device
+        num_accepted_tokens = torch.ones(1, dtype=torch.int32, device=device)
+        spec_state_slot_selectors = torch.ones(1, dtype=torch.int32, device=device)
+        mamba_state_idx = torch.zeros(1, dtype=torch.int32, device=device)
+        num_scheduled_tokens = torch.ones(1, dtype=torch.int32, device=device)
+        # Make the running length one token past a block boundary. The kernel
+        # therefore exits before dereferencing state or block-table pointers,
+        # while compiling the exact MTP specialization used at runtime.
+        num_computed_tokens = torch.full(
+            (1,), self.block_size, dtype=torch.int32, device=device
+        )
+        num_draft_tokens = torch.zeros(1, dtype=torch.int32, device=device)
+        ddtree_accepted_node_indices = torch.empty(
+            (1, 1), dtype=torch.int32, device=device
+        )
+
+        total_states = self.num_layers * self.num_state_types
+        postprocess_mamba_fused_kernel[(1, total_states)](
+            num_accepted_tokens,
+            spec_state_slot_selectors,
+            ddtree_accepted_node_indices,
+            ddtree_accepted_node_indices.stride(0),
+            mamba_state_idx,
+            num_scheduled_tokens,
+            num_computed_tokens,
+            num_draft_tokens,
+            self.block_table_ptrs,
+            self.block_table_stride_req,
+            self.state_base_addrs,
+            self.state_block_strides,
+            self.state_elem_sizes,
+            self.state_inner_sizes,
+            self.state_conv_widths,
+            self.state_group_indices,
+            self.num_accepted_tokens_out,
+            self.spec_state_slot_selectors_out,
+            1,
+            block_size=self.block_size,
+            COPY_BLOCK_SIZE=1024,
+            HAS_DDTREE_ACCEPTED_NODES=False,
+        )
+        torch.accelerator.synchronize()
+        return True
+
 
 @dataclasses.dataclass
 class MambaBuffers:

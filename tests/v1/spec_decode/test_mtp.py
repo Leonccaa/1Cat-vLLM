@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -26,9 +27,47 @@ from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.llm_base_proposer import (
+    SpecDecodeBaseProposer,
+    _sm70_mtp_moe_warmup_sizes,
+)
 
 mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_sm70_mtp_moe_warmup_sizes():
+    assert _sm70_mtp_moe_warmup_sizes(256, 8, 8192) == (9, 33, 257)
+    assert _sm70_mtp_moe_warmup_sizes(256, 8, 32) == (9,)
+    assert _sm70_mtp_moe_warmup_sizes(0, 8, 8192) == ()
+
+
+def test_sm70_mtp_moe_warmup_runs_each_shape_once():
+    dummy_run = mock.Mock()
+    draft_model_config = SimpleNamespace(
+        is_moe=True,
+        hf_text_config=SimpleNamespace(num_experts_per_tok=8),
+        get_num_experts=lambda: 256,
+    )
+    proposer = SimpleNamespace(
+        method="mtp",
+        device=torch.device("cuda"),
+        draft_model_config=draft_model_config,
+        max_num_tokens=8192,
+        dummy_run=dummy_run,
+        _sm70_mtp_moe_warmed=False,
+    )
+
+    with (
+        mock.patch.object(current_platform, "is_device_capability", return_value=True),
+        mock.patch.object(torch.accelerator, "synchronize"),
+    ):
+        assert SpecDecodeBaseProposer.warmup_sm70_mtp_moe_kernels(proposer) == (
+            "mtp_draft_moe",
+        )
+
+    assert [call.args[0] for call in dummy_run.call_args_list] == [9, 33, 257]
+    assert all(call.kwargs["spec_step_idx"] == 0 for call in dummy_run.call_args_list)
 
 
 def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:

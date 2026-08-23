@@ -2132,10 +2132,33 @@ class GPUModelRunner(
             and mamba_utils.warmup_batch_memcpy_kernel(self.device)
         ):
             warmed.append("mamba_batch_memcpy")
+        if (
+            self.cache_config.mamba_cache_mode == "align"
+            and self.speculative_config is not None
+            and self.model_config.is_hybrid
+        ):
+            mamba_bufs = self._get_mamba_bufs()
+            postprocess_ctx = mamba_bufs.postprocess_align
+            assert postprocess_ctx is not None
+            if not postprocess_ctx.is_initialized:
+                postprocess_ctx.initialize_from_forward_context(
+                    self.kv_cache_config,
+                    self.compilation_config.static_forward_context,
+                    self.model.get_mamba_state_copy_func(),
+                    [
+                        self.input_batch.block_table[group_id].get_device_tensor(1)
+                        for group_id in postprocess_ctx.mamba_group_ids
+                    ],
+                )
+            if postprocess_ctx.warmup_fused_postprocess():
+                warmed.append("mamba_spec_postprocess")
         drafter = getattr(self, "drafter", None)
         mtp_warmup = getattr(drafter, "warmup_sm70_mtp_hotpath_kernels", None)
         if mtp_warmup is not None:
             warmed.extend(mtp_warmup())
+        mtp_moe_warmup = getattr(drafter, "warmup_sm70_mtp_moe_kernels", None)
+        if mtp_moe_warmup is not None:
+            warmed.extend(mtp_moe_warmup())
         dflash_warmup = getattr(drafter, "warmup_sm70_dflash_hotpath_kernels", None)
         if dflash_warmup is not None:
             warmed.extend(dflash_warmup())
@@ -10826,6 +10849,21 @@ class GPUModelRunner(
                 draft_probs,
                 logits,
                 dummy_metadata,
+            )
+            # The mixed-sampling warmup above passes a non-null is_greedy
+            # tensor. Pure greedy serving passes None and otherwise triggers a
+            # separate Triton compile during the first decode verifier step.
+            greedy_metadata = replace(
+                dummy_metadata,
+                temperature=torch.zeros_like(dummy_metadata.temperature),
+                all_greedy=True,
+                all_random=False,
+            )
+            self.rejection_sampler(
+                dummy_spec_decode_metadata,
+                None,
+                logits,
+                greedy_metadata,
             )
         return sampler_output
 

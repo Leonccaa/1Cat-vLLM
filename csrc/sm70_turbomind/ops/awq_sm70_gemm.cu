@@ -911,6 +911,7 @@ enum class TuneKeyKind : int {
   kMxfp4Dense = 6,
   kNvfp4Dense = 7,
   kMxfp4Moe = 8,
+  kNvfp4Moe = 9,
 };
 
 struct DenseTuneKey {
@@ -1046,6 +1047,9 @@ turbomind::gemm::DispatchPolicy select_fp8_moe_dispatch_policy(
 turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
     int device, int total_tokens, int n, int k, int num_experts, int group_size,
     cudaStream_t stream);
+turbomind::gemm::DispatchPolicy select_nvfp4_moe_dispatch_policy(
+    int device, int total_tokens, int n, int k, int num_experts, int group_size,
+    cudaStream_t stream);
 
 bool tune_small_shapes_enabled() {
   const char* raw = std::getenv("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES");
@@ -1084,6 +1088,11 @@ bool mxfp4_moe_grouped_m8_fast_selector_enabled() {
 
 bool nvfp4_tune_small_shapes_enabled() {
   const char* raw = std::getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES");
+  return raw == nullptr || std::atoi(raw) != 0;
+}
+
+bool nvfp4_moe_grouped_prefill_enabled() {
+  const char* raw = std::getenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL");
   return raw == nullptr || std::atoi(raw) != 0;
 }
 
@@ -1360,6 +1369,14 @@ turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
   return select_moe_dispatch_policy_impl(
       device, total_tokens, n, k, num_experts, group_size, stream,
       TuneKeyKind::kMxfp4Moe, mxfp4_tune_small_shapes_enabled());
+}
+
+turbomind::gemm::DispatchPolicy select_nvfp4_moe_dispatch_policy(
+    int device, int total_tokens, int n, int k, int num_experts, int group_size,
+    cudaStream_t stream) {
+  return select_moe_dispatch_policy_impl(
+      device, total_tokens, n, k, num_experts, group_size, stream,
+      TuneKeyKind::kNvfp4Moe, nvfp4_tune_small_shapes_enabled());
 }
 
 WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
@@ -7578,6 +7595,232 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
     torch::Tensor offsets = expert_offsets.narrow(0, expert, 2);
     torch::Tensor expert_idx = dense_expert_ids.narrow(0, expert, 1);
     mxfp4_moe_gemm_sm70_out_impl(out, input, offsets, ptrs_w, ptrs_s, 1, k, n,
+                                 group_size, expert_idx);
+  }
+}
+
+void nvfp4_moe_gemm_sm70_out_impl(
+    torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
+    torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
+    int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
+    torch::Tensor b_group_indices, bool compact_grouped_rows = false) {
+  TORCH_CHECK(
+      sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
+      "nvfp4_moe_gemm_sm70: input must be CUDA float16.");
+  TORCH_CHECK(
+      expert_offsets.is_cuda() &&
+          expert_offsets.scalar_type() == torch::kInt32 &&
+          expert_offsets.is_contiguous(),
+      "nvfp4_moe_gemm_sm70: expert_offsets must be contiguous CUDA int32.");
+  TORCH_CHECK(strided_ptrs_w.is_cuda() && strided_ptrs_s.is_cuda(),
+              "nvfp4_moe_gemm_sm70: strided_ptrs must be CUDA.");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16,
+              "nvfp4_moe_gemm_sm70: output must be CUDA float16.");
+  TORCH_CHECK(num_experts > 0 && k > 0 && n > 0,
+              "nvfp4_moe_gemm_sm70: invalid dimensions.");
+  TORCH_CHECK(group_size == 16,
+              "nvfp4_moe_gemm_sm70: only group_size=16 is supported.");
+  TORCH_CHECK(k % group_size == 0,
+              "nvfp4_moe_gemm_sm70: k must be divisible by group_size.");
+  TORCH_CHECK(sorted_input.dim() == 2 && sorted_input.size(1) == k,
+              "nvfp4_moe_gemm_sm70: input shape mismatch.");
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == sorted_input.size(0) &&
+                  out.size(1) == n && out.stride(1) == 1,
+              "nvfp4_moe_gemm_sm70: output must be contiguous [tokens, n].");
+  TORCH_CHECK(expert_offsets.numel() >= num_experts + 1,
+              "nvfp4_moe_gemm_sm70: expert_offsets too small.");
+  TORCH_CHECK(b_group_indices.is_cuda() &&
+                  b_group_indices.scalar_type() == torch::kInt32 &&
+                  b_group_indices.is_contiguous() &&
+                  b_group_indices.numel() >= num_experts,
+              "nvfp4_moe_gemm_sm70: B group indices must be contiguous CUDA "
+              "int32.");
+
+  const int64_t total_tokens = sorted_input.size(0);
+  if (total_tokens == 0) {
+    return;
+  }
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(sorted_input));
+  const int device = sorted_input.get_device();
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  const auto fp4_converters = turbomind::gemm::GetConverters(
+      turbomind::kHalf, turbomind::kFloat4_e2m1, turbomind::kHalf, true, 70);
+  const auto fp8_converters = turbomind::gemm::GetConverters(
+      turbomind::kHalf, turbomind::kFloat8_e4m3, turbomind::kHalf, true, 70);
+  const auto* conv_w = fp4_converters[0];
+  const auto* conv_s = fp8_converters[1];
+  TORCH_CHECK(conv_w && conv_s,
+              "nvfp4_moe_gemm_sm70: no compatible TurboMind converters.");
+
+  turbomind::gemm::MatrixLayout desc_A{
+      turbomind::kHalf,
+      turbomind::gemm::kRowMajor,
+      static_cast<int>(total_tokens),
+      static_cast<int>(k),
+      static_cast<int>(sorted_input.stride(0)),
+  };
+  desc_A.num = static_cast<int>(num_experts);
+  desc_A.offsets = expert_offsets.data_ptr<int>();
+  turbomind::gemm::MatrixLayout desc_U{};
+
+  const auto order_w = conv_w->order;
+  const bool is_a_w = turbomind::gemm::get_operand_tag(conv_w->pack) ==
+                      turbomind::gemm::OPERAND_A;
+  const bool is_b_w = !is_a_w;
+  turbomind::gemm::MatrixLayout weight_desc{
+      turbomind::kHalf,
+      order_w,
+      static_cast<int>(n),
+      static_cast<int>(k),
+      order_w == turbomind::gemm::kRowMajor ? static_cast<int>(k)
+                                            : static_cast<int>(n),
+  };
+  if (is_b_w) {
+    std::swap(weight_desc.rows, weight_desc.cols);
+    weight_desc.order = ~weight_desc.order;
+  }
+  turbomind::gemm::MatrixLayout desc_B = weight_desc;
+  desc_B.type = turbomind::kFloat4_e2m1;
+  desc_B.pack = conv_w->pack;
+  if (is_a_w) {
+    desc_B = turbomind::gemm::transpose(desc_B);
+  }
+  desc_B.ld = 0;
+  desc_B.num = static_cast<int>(num_experts);
+  desc_B.group_idxs = b_group_indices.data_ptr<int>();
+
+  const auto order_s = conv_s->order;
+  const bool is_a_s = turbomind::gemm::get_operand_tag(conv_s->pack) ==
+                      turbomind::gemm::OPERAND_U;
+  const bool is_b_s = !is_a_s;
+  const int64_t num_groups = k / group_size;
+  turbomind::gemm::MatrixLayout scale_desc{
+      turbomind::kUint16,  order_s,
+      static_cast<int>(n), static_cast<int>(num_groups),
+      static_cast<int>(n),
+  };
+  if (is_b_s) {
+    std::swap(scale_desc.rows, scale_desc.cols);
+    scale_desc.order = ~scale_desc.order;
+  }
+  turbomind::gemm::MatrixLayout desc_V = scale_desc;
+  desc_V.pack = conv_s->pack;
+  if (is_a_s) {
+    desc_V = turbomind::gemm::transpose(desc_V);
+  }
+  desc_V.ld = 0;
+  desc_V.num = static_cast<int>(num_experts);
+  desc_V.group_idxs = b_group_indices.data_ptr<int>();
+
+  turbomind::gemm::MatrixLayout desc_D{
+      turbomind::kHalf,
+      turbomind::gemm::kRowMajor,
+      static_cast<int>(total_tokens),
+      static_cast<int>(n),
+      static_cast<int>(out.stride(0)),
+  };
+  desc_D.num = static_cast<int>(num_experts);
+  desc_D.offsets = expert_offsets.data_ptr<int>();
+
+  turbomind::gemm::Operation op{};
+  op.dispatch = vllm::awq_sm70::select_nvfp4_moe_dispatch_policy(
+      device, static_cast<int>(total_tokens), static_cast<int>(n),
+      static_cast<int>(k), static_cast<int>(num_experts),
+      static_cast<int>(group_size), stream);
+  op.epilogue = turbomind::gemm::Epilogue::kNone;
+  op.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
+  op.batch_dim = 0;
+  op.dispatch_num_override = compact_grouped_rows ? 1 : 0;
+  op.active_group_count =
+      compact_grouped_rows ? -static_cast<int>(num_experts) : 0;
+
+  auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
+  auto& gemm = vllm::awq_sm70::get_gemm(device);
+  const int ec =
+      gemm.Run(op, 1.f, sorted_input.data_ptr(), desc_A, nullptr, desc_U,
+               strided_ptrs_w.data_ptr(), desc_B, strided_ptrs_s.data_ptr(),
+               desc_V, 0.f, out.data_ptr(), desc_D, out.data_ptr(), desc_D,
+               workspace_holder.workspace, stream);
+  TORCH_CHECK(ec == 0,
+              "nvfp4_moe_gemm_sm70: TurboMind batched GEMM failed (ec=", ec,
+              ").");
+}
+
+void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
+                                    torch::Tensor expert_offsets,
+                                    torch::Tensor dense_expert_ids,
+                                    torch::Tensor ptrs_w, torch::Tensor ptrs_s,
+                                    int64_t num_experts, int64_t k, int64_t n,
+                                    int64_t group_size) {
+  TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16,
+              "nvfp4_moe_dense_stage_sm70_out: input must be CUDA float16.");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16,
+              "nvfp4_moe_dense_stage_sm70_out: out must be CUDA float16.");
+  TORCH_CHECK(expert_offsets.is_cuda() &&
+                  expert_offsets.scalar_type() == torch::kInt32 &&
+                  expert_offsets.is_contiguous(),
+              "nvfp4_moe_dense_stage_sm70_out: expert_offsets must be "
+              "contiguous CUDA int32.");
+  TORCH_CHECK(dense_expert_ids.is_cuda() &&
+                  dense_expert_ids.scalar_type() == torch::kInt32 &&
+                  dense_expert_ids.is_contiguous(),
+              "nvfp4_moe_dense_stage_sm70_out: dense_expert_ids must be "
+              "contiguous CUDA int32.");
+  TORCH_CHECK(ptrs_w.is_cuda() && ptrs_s.is_cuda(),
+              "nvfp4_moe_dense_stage_sm70_out: ptr rows must be CUDA.");
+  TORCH_CHECK(num_experts > 0,
+              "nvfp4_moe_dense_stage_sm70_out: num_experts must be positive.");
+  TORCH_CHECK(group_size == 16,
+              "nvfp4_moe_dense_stage_sm70_out: only group_size=16 is "
+              "supported.");
+  TORCH_CHECK(input.dim() == 2 && input.size(1) == k,
+              "nvfp4_moe_dense_stage_sm70_out: input shape mismatch.");
+  TORCH_CHECK(
+      out.dim() == 2 && out.size(0) == input.size(0) && out.size(1) == n,
+      "nvfp4_moe_dense_stage_sm70_out: out shape mismatch.");
+  TORCH_CHECK(expert_offsets.numel() >= num_experts + 1,
+              "nvfp4_moe_dense_stage_sm70_out: expert_offsets too small.");
+  TORCH_CHECK(dense_expert_ids.numel() >= num_experts,
+              "nvfp4_moe_dense_stage_sm70_out: dense_expert_ids too small.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  static std::atomic<unsigned> logged_nvfp4_dense_stage{0u};
+  maybe_log_sm70_moe_route_once(
+      logged_nvfp4_dense_stage,
+      "SM70 NVFP4 MoE CUDA-graph-safe TurboMind path enabled C++ op reached",
+      input, input.size(0), num_experts);
+  constexpr int kNvfp4MaxCompactGroups = 8 * 8;
+  const bool compact_decode_shape =
+      input.size(0) == num_experts && num_experts <= kNvfp4MaxCompactGroups;
+  if (compact_decode_shape) {
+    nvfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
+                                 num_experts, k, n, group_size,
+                                 dense_expert_ids, true);
+    return;
+  }
+  const bool exact_qwen36_prefill_shape =
+      input.size(0) > kNvfp4MaxCompactGroups && num_experts == 256 &&
+      ((k == 2048 && (n == 1024 || n == 512 || n == 256)) ||
+       (n == 2048 && (k == 512 || k == 256 || k == 128)));
+  if (vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled() &&
+      exact_qwen36_prefill_shape) {
+    static std::atomic<unsigned> logged_nvfp4_grouped_prefill{0u};
+    maybe_log_sm70_moe_route_once(
+        logged_nvfp4_grouped_prefill,
+        "SM70 NVFP4 MoE grouped TurboMind prefill path enabled C++ op reached",
+        input, input.size(0), num_experts);
+    nvfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
+                                 num_experts, k, n, group_size,
+                                 dense_expert_ids);
+    return;
+  }
+  for (int expert = 0; expert < static_cast<int>(num_experts); ++expert) {
+    torch::Tensor offsets = expert_offsets.narrow(0, expert, 2);
+    torch::Tensor expert_idx = dense_expert_ids.narrow(0, expert, 1);
+    nvfp4_moe_gemm_sm70_out_impl(out, input, offsets, ptrs_w, ptrs_s, 1, k, n,
                                  group_size, expert_idx);
   }
 }

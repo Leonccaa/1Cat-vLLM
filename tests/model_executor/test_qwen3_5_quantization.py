@@ -8,6 +8,7 @@ class _QuantConfig:
     def __init__(self) -> None:
         self.ignore: list[str] = []
         self.config: dict[str, object] = {}
+        self.quantized_layers: dict[str, dict[str, str]] = {}
 
 
 def test_qwen3_5_split_gdn_detects_compressed_tensors_ignore():
@@ -36,6 +37,53 @@ def test_qwen3_5_split_gdn_detects_compressed_tensors_config_ignore():
             "model.language_model.layers.0.linear_attn.in_proj_b",
             "model.language_model.layers.0.linear_attn.in_proj_a",
         ],
+    }
+
+    assert _uses_split_gdn_input_projections(quant_config)
+
+
+def test_qwen3_5_split_gdn_detects_modelopt_mixed_unquantized_ba():
+    from vllm.model_executor.models.qwen3_5 import (
+        _uses_split_gdn_input_projections,
+    )
+
+    quant_config = _QuantConfig()
+    prefix = "model.language_model.layers.0.linear_attn"
+    quant_config.quantized_layers = {
+        f"{prefix}.in_proj_qkv": {"quant_algo": "FP8"},
+        f"{prefix}.in_proj_z": {"quant_algo": "FP8"},
+    }
+
+    assert _uses_split_gdn_input_projections(quant_config)
+
+
+def test_qwen3_5_split_gdn_keeps_same_precision_projections_fused():
+    from vllm.model_executor.models.qwen3_5 import (
+        _uses_split_gdn_input_projections,
+    )
+
+    quant_config = _QuantConfig()
+    prefix = "model.language_model.layers.0.linear_attn"
+    quant_config.quantized_layers = {
+        f"{prefix}.{name}": {"quant_algo": "FP8"}
+        for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+    }
+
+    assert not _uses_split_gdn_input_projections(quant_config)
+
+
+def test_qwen3_5_split_gdn_detects_different_modelopt_algorithms():
+    from vllm.model_executor.models.qwen3_5 import (
+        _uses_split_gdn_input_projections,
+    )
+
+    quant_config = _QuantConfig()
+    prefix = "model.language_model.layers.0.linear_attn"
+    quant_config.quantized_layers = {
+        f"{prefix}.in_proj_qkv": {"quant_algo": "FP8"},
+        f"{prefix}.in_proj_z": {"quant_algo": "FP8"},
+        f"{prefix}.in_proj_b": {"quant_algo": "W4A16_NVFP4"},
+        f"{prefix}.in_proj_a": {"quant_algo": "W4A16_NVFP4"},
     }
 
     assert _uses_split_gdn_input_projections(quant_config)

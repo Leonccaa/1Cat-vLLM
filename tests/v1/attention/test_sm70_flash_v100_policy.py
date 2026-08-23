@@ -245,6 +245,7 @@ def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
         "VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE",
         "VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS",
         "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD",
+        "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
@@ -254,6 +255,7 @@ def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE is True
     assert envs.VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS is True
     assert envs.VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD is True
+    assert envs.VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD is True
     assert envs.VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN == 61633
 
     for name in names:
@@ -263,6 +265,7 @@ def test_sm70_e5m2_decode_fast_route_envs_are_default_on(monkeypatch):
     assert envs.VLLM_FLASH_V100_XQA_E5M2_G6_SPLIT_REDUCE is False
     assert envs.VLLM_FLASH_V100_XQA_E5M2_PARTITION_PAGE_IDS is False
     assert envs.VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD is False
+    assert envs.VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD is False
 
     monkeypatch.setenv("VLLM_FLASH_V100_XQA_E5M2_P1024_BEGIN", "49152")
     envs.disable_envs_cache()

@@ -87,6 +87,33 @@ def _sm70_mtp_profile_interval() -> int:
     return envs.VLLM_SM70_MTP_PROFILE_INTERVAL
 
 
+def _sm70_mtp_moe_warmup_sizes(
+    num_experts: int, top_k: int, max_num_tokens: int
+) -> tuple[int, ...]:
+    """Pick one token count for each SM70 Triton MoE dispatch region."""
+    if num_experts <= 0 or top_k <= 0 or max_num_tokens <= 0:
+        return ()
+
+    def prefer_unaligned(size: int) -> int:
+        # Triton otherwise specializes another kernel when token_count * top_k
+        # first loses 16-byte divisibility. This cannot happen when top_k is
+        # itself a multiple of 16.
+        if top_k % 16:
+            while size * top_k % 16 == 0:
+                size += 1
+        return size
+
+    sizes = {
+        # First sorted-assignment shape after the naive small-token path.
+        prefer_unaligned(num_experts // (top_k * 4) + 1),
+        # First shape whose sorted-token allocation is not block aligned.
+        prefer_unaligned((num_experts + top_k - 1) // top_k),
+        # First shape using the large-M SM70 0.0.3 MoE tile.
+        prefer_unaligned(num_experts + 1),
+    }
+    return tuple(sorted(size for size in sizes if size <= max_num_tokens))
+
+
 def _is_dflash_method(method: str | None) -> bool:
     return method in ("dflash", "dflash_ddtree", "dspark")
 
@@ -970,6 +997,45 @@ class SpecDecodeBaseProposer:
             "mtp_rejection_expand",
             "mtp_step_slot_mapping",
         )
+
+    def warmup_sm70_mtp_moe_kernels(self) -> tuple[str, ...]:
+        """Warm the finite Triton-MoE shape specializations used by MTP."""
+        if (
+            self.method != "mtp"
+            or self.device.type != "cuda"
+            or not current_platform.is_device_capability(70)
+            or not envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG
+            or not self.draft_model_config.is_moe
+        ):
+            return ()
+        if getattr(self, "_sm70_mtp_moe_warmed", False):
+            return ()
+        self._sm70_mtp_moe_warmed = True
+
+        text_config = self.draft_model_config.hf_text_config
+        top_k = int(getattr(text_config, "num_experts_per_tok", 0))
+        sizes = _sm70_mtp_moe_warmup_sizes(
+            self.draft_model_config.get_num_experts(),
+            top_k,
+            self.max_num_tokens,
+        )
+        if not sizes:
+            return ()
+
+        try:
+            for num_tokens in sizes:
+                self.dummy_run(
+                    num_tokens,
+                    use_cudagraphs=False,
+                    spec_step_idx=0,
+                )
+            torch.accelerator.synchronize()
+        except Exception as err:  # pragma: no cover - best-effort warmup
+            logger.warning_once("SM70 MTP MoE warmup skipped: %s", err)
+            return ()
+
+        logger.info_once("SM70 MTP MoE warmup finished: token_counts=%s", sizes)
+        return ("mtp_draft_moe",)
 
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs

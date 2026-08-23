@@ -683,6 +683,10 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD",
         True,
     )
+    e5m2_batch_wide_load = _env_bool(
+        "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD",
+        True,
+    )
     decode_dynamic_partitions = _env_bool(
         "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS",
         True,
@@ -798,6 +802,10 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD"
         ),
         "e5m2_pair_load_effective": e5m2_pair_load,
+        "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD"
+        ),
+        "e5m2_batch_wide_load_effective": e5m2_batch_wide_load,
         "exact_mtp5_fp8_p1024_dual_cta_policy": (
             smallq_decode_use_xqa
             and mtp5_xqa_dual_cta

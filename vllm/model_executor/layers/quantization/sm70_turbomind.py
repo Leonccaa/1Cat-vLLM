@@ -64,6 +64,13 @@ def should_use_mxfp4_moe_turbomind() -> bool:
     )
 
 
+def should_use_nvfp4_moe_turbomind() -> bool:
+    """Select the native NVFP4 MoE path only on exact SM70."""
+    return is_exact_sm70_cuda_platform() and use_turbomind(
+        envs.VLLM_SM70_NVFP4_TURBOMIND
+    )
+
+
 def should_prepare_turbomind(
     tensor: torch.Tensor,
     default_enabled: bool,

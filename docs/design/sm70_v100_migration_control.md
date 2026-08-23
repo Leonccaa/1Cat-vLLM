@@ -41671,3 +41671,69 @@ Interpretation:
   formatter changes from current main and keep large C/CUDA formatter work
   separate from accepted kernel repairs. Small policy substitutions still need
   their own current-source static/argument-equivalence checks before merge.
+
+## 2026-08-22 Qwen3.6-35B-A3B ModelOpt NVFP4 TurboMind route
+
+- The checkpoint at `/data/models/Qwen3.6-35B-A3B-NVFP4` is ModelOpt 0.37.0
+  `MIXED_PRECISION`: dense projections use FP8, routed/shared experts use
+  `W4A16_NVFP4`, and 19 `mtp.*` tensors are present and unquantized. Exact SM70
+  admission now requires both FP8 and NVFP4 TurboMind gates; unsupported model
+  shapes, TP8, EP, and all-to-all fail closed rather than taking a generic
+  fallback.
+- The native Qwen3.6-35B-A3B MoE contract is H2048, expert I512, 256 experts,
+  top-k 8, replicated experts, and TP1/2/4. B1-B8 decode uses compact active
+  expert groups. B9-B18 CUDA Graph/MTP decode and larger prefill use persistent
+  buffers with the full 256-expert grouped TurboMind operation. The grouped
+  prefill policy is default-on and may be disabled only for diagnosis with
+  `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL=0`.
+- A real layer-0 TP4 checkpoint oracle matched the previous per-expert route:
+  M4096 W13/W2 were bitwise identical and improved 20.39x/9.48x. Full-grouped
+  B9 and B18 had cosine 1.0, maximum absolute error at most 1.221e-4, and
+  21.59x-35.21x isolated-stage speedups. Expanding the compact path to 144
+  groups produced a roughly 0.495 W13 relative-L2 error and catastrophic W2
+  output, so the compact limit remains 64 groups; do not repeat that candidate.
+- Matching TP4, FP8-E5M2 KV-cache, Flash-V100/FlashQLA, full CUDA Graph,
+  input-4096/output-1024, max-length-8192 runs measured AWQ at 0.3813 s prefill
+  and 113.71 token/s steady decode. Default-grouped NVFP4 measured 0.4216 s and
+  116.99 token/s: prefill is 10.56% slower than AWQ while decode is 2.89%
+  faster, placing both in the same performance class. Grouping reduced NVFP4
+  prefill from 1.5479 s to 0.4216 s (3.67x).
+- MTP4 resolved the bundled draft as `Qwen3_5MoeMTP`, captured FULL CUDA Graphs
+  through B18, and measured 0.8379 s prefill plus 174.76 token/s steady decode
+  under the same model contract. It accepted 792/924 draft tokens, with mean
+  acceptance length 4.43, and improved no-MTP decode by 1.49x. MTP prefill is
+  slower because the drafter participates. That original run still exposed
+  first-request sampler/Mamba JIT, which the later cold-start work below moves
+  ahead of request processing.
+- The accepted cold-start patch warms the exact Mamba speculative postprocess,
+  all-greedy rejection sampler, and unquantized MTP-drafter MoE signatures. For
+  the checkpoint's 256-expert/top-8 draft, token counts 9, 33, and 257 cover the
+  sorted-assignment, unaligned-buffer, and SM70 small-to-large tile boundaries.
+  A fresh-cache ShareGPT16 run then produced no inference-time Triton JIT
+  warning: 97.69 end-to-end output token/s, 242.72 serial-prefill token/s,
+  120.09 pure-decode token/s, and 8.827 ms mean TPOT. Moving these compilations
+  into startup adds about 4.33 s to model load versus the preceding
+  Mamba/sampler-only candidate.
+- MTP quality is gated by dataset accuracy, validity, and repetition health,
+  not token equality with no-MTP. On pinned GSM8K test records 0-127 with
+  five-shot chat prompting, thinking disabled, greedy sampling, and a 512-token
+  cap, no-MTP scored 122/128 and three full-forward MTP4 runs scored 121, 122,
+  and 121. The post-rebase final at `d3b1ea3678` scored 121/128 with zero invalid
+  or repetitive records and the same wrong set as the preceding full MTP run:
+  `[2, 12, 37, 87, 89, 102, 119]`. Record 37 is a cap-induced truncation and is
+  correct at 1024 output tokens, so effective MTP4 accuracy is 122/128. A
+  standard-GDN diagnostic scored only 108/128 and is rejected.
+- A final default-grouped, no-MTP natural-text gate used two identical Chinese
+  prompts and one Python prompt. All three requests reached EOS with `stop`;
+  the duplicate outputs were token-for-token identical, and the code response
+  produced a correct `add(a, b)` implementation. This supersedes the earlier
+  128-token truncated quality smoke for route acceptance.
+- Reproducible JSON, logs, numeric oracles, and the rejected compact experiment
+  are under
+  `bench_results/modelopt_mixed_nvfp4_moe_20260822/{results,logs,telemetry}`.
+  The final dataset artifact is
+  `results/tp4_mtp4_fp8kv_gsm8k_chat_nothink_5shot_128_coldstart_rebased_final_graph.json`;
+  the all-JIT-warm ShareGPT artifact is
+  `results/tp4_gpu0123_mtp4_fp8kv_sharegpt16_seed20260822_all_jit_warmup_reserved_graph.json`.
+  These results are the accepted 35B evidence; earlier short route-hit and
+  quality smokes must not be substituted for the matched speed contract.
