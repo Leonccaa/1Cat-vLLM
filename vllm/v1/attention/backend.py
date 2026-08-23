@@ -388,6 +388,9 @@ class CommonAttentionMetadata:
 
     causal: bool = True
 
+    cudagraph_graph_variant: int | None = None
+    """Optional semantic variant for CUDA graph capture dummy runs."""
+
     # Needed by FastPrefillAttentionBuilder
     logits_indices_padded: torch.Tensor | None = None
     num_logits_indices: int | None = None
@@ -516,6 +519,7 @@ class CommonAttentionMetadata:
             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
             slot_mapping=self.slot_mapping[:num_actual_tokens],
             causal=self.causal,
+            cudagraph_graph_variant=self.cudagraph_graph_variant,
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,
             encoder_seq_lens=maybe_slice_reqs(self.encoder_seq_lens),

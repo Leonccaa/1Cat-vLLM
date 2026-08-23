@@ -5172,6 +5172,7 @@ class GPUModelRunner(
         slot_mappings: dict[int, torch.Tensor] | None = None,
         ddtree_parent_metadata: DDTreeParentMetadata | None = None,
         cudagraph_capture_max_seq_len: int | None = None,
+        cudagraph_graph_variant: int | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -5290,6 +5291,7 @@ class GPUModelRunner(
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
             causal=True,
+            cudagraph_graph_variant=cudagraph_graph_variant,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
         )
@@ -7805,7 +7807,7 @@ class GPUModelRunner(
             attention_context_len is None
             and uniform_decode
             and num_reqs > 0
-            and self.cudagraph_dispatcher.has_attention_context_buckets
+            and self.cudagraph_dispatcher.has_attention_context_specialization
         ):
             attention_context_len = int(
                 self.optimistic_seq_lens_cpu[:num_reqs].max().item()
@@ -10518,6 +10520,11 @@ class GPUModelRunner(
                     cudagraph_capture_max_seq_len=(
                         batch_desc.attention_context_bucket
                         if is_graph_capturing
+                        else None
+                    ),
+                    cudagraph_graph_variant=(
+                        batch_desc.graph_variant
+                        if batch_descriptor_override is not None
                         else None
                     ),
                 )

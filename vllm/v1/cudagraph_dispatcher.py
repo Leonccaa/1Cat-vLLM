@@ -7,12 +7,19 @@ from itertools import product
 
 from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.forward_context import BatchDescriptor
+from vllm.forward_context import (
+    CUDAGRAPH_VARIANT_DEFAULT,
+    CUDAGRAPH_VARIANT_LONG_CONTEXT,
+    BatchDescriptor,
+)
 from vllm.logger import init_logger
 from vllm.lora.utils import get_captured_lora_counts
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+_SM70_FP8_KV_BATCH_CONTEXT_SIZES = frozenset((4, 8, 16))
+_SM70_FP8_KV_LONG_CONTEXT_MIN_SEQ_LEN = 16384
 
 
 def _get_sm70_context_buckets(env_name: str) -> tuple[int, ...]:
@@ -79,25 +86,23 @@ def _get_sm70_dsv4_decode_context_buckets(
     return (bucket,)
 
 
-def _get_sm70_fp8_kv_decode_context_buckets(
+def _is_sm70_fp8_kv_decode_shape(
     vllm_config: VllmConfig,
-) -> tuple[int, ...]:
-    """Select a scalar-only short graph for the SM70 E5M2 D256 route."""
-    env_name = "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"
-    if env_name in os.environ:
-        return _get_sm70_context_buckets(env_name)
+    *,
+    q_per_kv_values: tuple[int, ...],
+) -> bool:
     if vllm_config.speculative_config is not None:
-        return ()
+        return False
     if not (
         current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
     ):
-        return ()
+        return False
     if not envs.VLLM_SM70_FLASH_ATTN_V100:
-        return ()
+        return False
 
     cache_config = getattr(vllm_config, "cache_config", None)
     if getattr(cache_config, "cache_dtype", None) != "fp8_e5m2":
-        return ()
+        return False
 
     attention_config = getattr(vllm_config, "attention_config", None)
     attention_backend = getattr(attention_config, "backend", None)
@@ -106,24 +111,38 @@ def _get_sm70_fp8_kv_decode_context_buckets(
         "FLASH_ATTN_V100",
         "FLASHINFER_SM70",
     ):
-        return ()
+        return False
 
     model_config = vllm_config.model_config
     hf_text_config = getattr(model_config, "hf_text_config", None)
     num_attention_heads = getattr(hf_text_config, "num_attention_heads", None)
     num_key_value_heads = getattr(hf_text_config, "num_key_value_heads", None)
     head_dim = getattr(hf_text_config, "head_dim", None)
-    if not (
+    return bool(
         isinstance(num_attention_heads, int)
         and isinstance(num_key_value_heads, int)
         and num_key_value_heads > 0
         and num_attention_heads % num_key_value_heads == 0
-        and num_attention_heads // num_key_value_heads in (6, 8)
+        and num_attention_heads // num_key_value_heads in q_per_kv_values
         and head_dim == 256
+    )
+
+
+def _get_sm70_fp8_kv_decode_context_buckets(
+    vllm_config: VllmConfig,
+) -> tuple[int, ...]:
+    """Select a scalar-only B1 graph for the SM70 E5M2 D256 route."""
+    env_name = "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"
+    if env_name in os.environ:
+        return _get_sm70_context_buckets(env_name)
+    if not _is_sm70_fp8_kv_decode_shape(
+        vllm_config,
+        q_per_kv_values=(6, 8),
     ):
         return ()
 
     bucket = 8192
+    model_config = vllm_config.model_config
     max_model_len = getattr(model_config, "max_model_len", None)
     if not isinstance(max_model_len, int) or max_model_len <= bucket:
         return ()
@@ -136,6 +155,20 @@ def _get_sm70_fp8_kv_decode_context_buckets(
         env_name,
     )
     return (bucket,)
+
+
+def _sm70_fp8_kv_batch_context_routing_enabled(
+    vllm_config: VllmConfig,
+) -> bool:
+    if (
+        not envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING
+        or envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE is not None
+    ):
+        return False
+    return _is_sm70_fp8_kv_decode_shape(
+        vllm_config,
+        q_per_kv_values=(6,),
+    )
 
 
 class CudagraphDispatcher:
@@ -174,7 +207,11 @@ class CudagraphDispatcher:
         self.sm70_fp8_kv_decode_context_buckets = (
             _get_sm70_fp8_kv_decode_context_buckets(vllm_config)
         )
+        self.sm70_fp8_kv_batch_context_routing = (
+            _sm70_fp8_kv_batch_context_routing_enabled(vllm_config)
+        )
         self._logged_sm70_context_bucket = False
+        self._logged_sm70_batch_context_variant = False
 
         # Dict to store valid cudagraph dispatching keys.
         self.cudagraph_keys: dict[CUDAGraphMode, set[BatchDescriptor]] = {
@@ -317,24 +354,62 @@ class CudagraphDispatcher:
             )
         )
 
+    def _is_batch_context_variant_descriptor(
+        self,
+        batch_descriptor: BatchDescriptor,
+    ) -> bool:
+        return bool(
+            self.sm70_fp8_kv_batch_context_routing
+            and batch_descriptor.uniform
+            and batch_descriptor.num_reqs is not None
+            and batch_descriptor.num_tokens == batch_descriptor.num_reqs
+            and batch_descriptor.num_reqs in _SM70_FP8_KV_BATCH_CONTEXT_SIZES
+        )
+
+    def _context_buckets_for_descriptor(
+        self,
+        batch_descriptor: BatchDescriptor,
+    ) -> tuple[int, ...]:
+        if not batch_descriptor.uniform or batch_descriptor.num_reqs is None:
+            return ()
+
+        if self.uniform_decode_query_len > 1:
+            if batch_descriptor.num_tokens == self.uniform_decode_query_len:
+                return self.sm70_mtp_context_buckets
+            return ()
+
+        buckets: set[int] = set()
+        if batch_descriptor.num_tokens == 1:
+            buckets.update(self.sm70_dsv4_decode_context_buckets)
+            buckets.update(self.sm70_fp8_kv_decode_context_buckets)
+
+        return tuple(sorted(buckets))
+
     @property
     def has_attention_context_buckets(self) -> bool:
         return bool(self._active_context_buckets())
 
-    def _add_context_bucket_keys(self, batch_descriptor: BatchDescriptor) -> None:
-        """Add bounded graphs only for a single uniform-decode request."""
-        context_buckets = self._active_context_buckets()
-        if (
-            not context_buckets
-            or not batch_descriptor.uniform
-            or batch_descriptor.num_tokens != self.uniform_decode_query_len
-        ):
-            return
+    @property
+    def has_attention_context_specialization(self) -> bool:
+        return bool(
+            self.has_attention_context_buckets or self.sm70_fp8_kv_batch_context_routing
+        )
 
+    def _add_context_bucket_keys(self, batch_descriptor: BatchDescriptor) -> None:
+        """Add attention-specialized graphs for this exact descriptor."""
+        context_buckets = self._context_buckets_for_descriptor(batch_descriptor)
         for bucket in context_buckets:
             self.add_cudagraph_key(
                 CUDAGraphMode.FULL,
                 replace(batch_descriptor, attention_context_bucket=bucket),
+            )
+        if self._is_batch_context_variant_descriptor(batch_descriptor):
+            self.add_cudagraph_key(
+                CUDAGraphMode.FULL,
+                replace(
+                    batch_descriptor,
+                    graph_variant=CUDAGRAPH_VARIANT_LONG_CONTEXT,
+                ),
             )
 
     def _get_context_bucket_descriptor(
@@ -342,14 +417,22 @@ class CudagraphDispatcher:
         batch_descriptor: BatchDescriptor,
         attention_context_len: int | None,
     ) -> BatchDescriptor:
-        """Return a bounded graph key only when its capacity is sufficient."""
-        context_buckets = self._active_context_buckets()
+        """Return the graph specialization selected by the active context."""
+        if (
+            attention_context_len is not None
+            and attention_context_len >= _SM70_FP8_KV_LONG_CONTEXT_MIN_SEQ_LEN
+            and self._is_batch_context_variant_descriptor(batch_descriptor)
+        ):
+            return replace(
+                batch_descriptor,
+                graph_variant=CUDAGRAPH_VARIANT_LONG_CONTEXT,
+            )
+
+        context_buckets = self._context_buckets_for_descriptor(batch_descriptor)
         if (
             attention_context_len is None
             or attention_context_len <= 0
             or not context_buckets
-            or not batch_descriptor.uniform
-            or batch_descriptor.num_tokens != self.uniform_decode_query_len
         ):
             return batch_descriptor
 
@@ -537,6 +620,17 @@ class CudagraphDispatcher:
                         batch_desc_to_check,
                     )
                     self._logged_sm70_context_bucket = True
+                if (
+                    batch_desc_to_check.graph_variant == CUDAGRAPH_VARIANT_LONG_CONTEXT
+                    and not self._logged_sm70_batch_context_variant
+                ):
+                    logger.info(
+                        "Using SM70 long-context XQA CUDA graph: "
+                        "context=%d descriptor=%s",
+                        attention_context_len,
+                        batch_desc_to_check,
+                    )
+                    self._logged_sm70_batch_context_variant = True
                 return CUDAGraphMode.FULL, batch_desc_to_check
             # A bounded graph might be absent because capture-size policy
             # excluded it. Preserve the existing full-context graph then.
@@ -575,16 +669,32 @@ class CudagraphDispatcher:
             if descs:
                 # Capture the generic full-context graph before smaller
                 # context-specialized graphs so its allocations seed the pool.
-                descs.sort(
-                    key=lambda d: (
-                        d.num_tokens,
-                        d.attention_context_bucket
-                        if d.attention_context_bucket is not None
-                        else float("inf"),
-                        d.num_active_loras,
-                    ),
-                    reverse=True,
-                )
+                if self.sm70_fp8_kv_batch_context_routing:
+                    # Preserve the rollback graph capture order before adding
+                    # long-context variants. This keeps baseline graph memory
+                    # allocation and warmup behavior reproducible.
+                    descs.sort(
+                        key=lambda d: (
+                            d.graph_variant == CUDAGRAPH_VARIANT_DEFAULT,
+                            d.num_tokens,
+                            d.attention_context_bucket
+                            if d.attention_context_bucket is not None
+                            else float("inf"),
+                            d.num_active_loras,
+                        ),
+                        reverse=True,
+                    )
+                else:
+                    descs.sort(
+                        key=lambda d: (
+                            d.num_tokens,
+                            d.attention_context_bucket
+                            if d.attention_context_bucket is not None
+                            else float("inf"),
+                            d.num_active_loras,
+                        ),
+                        reverse=True,
+                    )
                 result.append((mode, descs))
 
         return result
