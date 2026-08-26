@@ -5,7 +5,7 @@ import itertools
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, overload
+from typing import Any, Literal, Protocol, TypeAlias, overload
 
 import regex as re
 import torch
@@ -37,6 +37,8 @@ from vllm.utils.torch_utils import (
 
 logger = init_logger(__name__)
 
+ShardId: TypeAlias = str | int | tuple[int, ...]
+
 
 @dataclass
 class WeightsMapper:
@@ -48,54 +50,73 @@ class WeightsMapper:
     orig_to_new_substr: Mapping[str, str | None] = field(default_factory=dict)
     orig_to_new_prefix: Mapping[str, str | None] = field(default_factory=dict)
     orig_to_new_suffix: Mapping[str, str | None] = field(default_factory=dict)
+    orig_to_new_stacked: Mapping[str, tuple[str, ShardId]] = field(default_factory=dict)
 
     def __or__(self, other: "WeightsMapper") -> "WeightsMapper":
         """Combine two `WeightsMapper`s by merging their mappings."""
         return WeightsMapper(
+            orig_to_new_regex={**self.orig_to_new_regex, **other.orig_to_new_regex},
             orig_to_new_substr={**self.orig_to_new_substr, **other.orig_to_new_substr},
             orig_to_new_prefix={**self.orig_to_new_prefix, **other.orig_to_new_prefix},
             orig_to_new_suffix={**self.orig_to_new_suffix, **other.orig_to_new_suffix},
+            orig_to_new_stacked={
+                **self.orig_to_new_stacked,
+                **other.orig_to_new_stacked,
+            },
         )
 
     def _map_name(self, key: str) -> str | None:
+        mapped_key, _ = self._map_name_with_shard(key)
+        return mapped_key
+
+    def _map_name_with_shard(self, key: str) -> tuple[str | None, ShardId | None]:
         for pattern, new_key in self.orig_to_new_regex.items():
             if pattern.search(key):
                 if new_key is None:
-                    return None
+                    return None, None
 
                 key = pattern.sub(new_key, key)
 
         for substr, new_key in self.orig_to_new_substr.items():
             if substr in key:
                 if new_key is None:
-                    return None
+                    return None, None
 
                 key = key.replace(substr, new_key, 1)
 
         for prefix, new_key in self.orig_to_new_prefix.items():
             if key.startswith(prefix):
                 if new_key is None:
-                    return None
+                    return None, None
 
                 key = key.replace(prefix, new_key, 1)
 
         for suffix, new_key in self.orig_to_new_suffix.items():
             if key.endswith(suffix):
                 if new_key is None:
-                    return None
+                    return None, None
 
                 key = new_key.join(key.rsplit(suffix, 1))
 
-        return key
+        for stacked_key, (new_key, shard_id) in self.orig_to_new_stacked.items():
+            if stacked_key in key:
+                return key.replace(stacked_key, new_key, 1), shard_id
+
+        return key, None
 
     def apply(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        return (
-            (out_name, data)
-            for name, data in weights
-            if (out_name := self._map_name(name)) is not None
-        )
+        def mapped_weights() -> Iterable[tuple[str, torch.Tensor]]:
+            for name, data in weights:
+                out_name, shard_id = self._map_name_with_shard(name)
+                if out_name is None:
+                    continue
+                if shard_id is not None:
+                    data.shard_id = shard_id
+                yield out_name, data
+
+        return mapped_weights()
 
     def apply_list(self, values: list[str]) -> list[str]:
         return [
@@ -220,7 +241,15 @@ class AutoWeightsLoader:
                 )
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, weight_data)
+            shard_id = getattr(weight_data, "shard_id", None)
+            if shard_id is None:
+                weight_loader(param, weight_data)
+            else:
+                # WeightsMapper attaches this only for orig_to_new_stacked
+                # entries.  Preserve the logical shard through recursive
+                # AutoWeightsLoader grouping so merged parameters do not
+                # mistake one source tensor for an already-fused checkpoint.
+                weight_loader(param, weight_data, shard_id)
 
             logger.debug("Loaded weight %s with shape %s", weight_qualname, param.shape)
 
@@ -352,6 +381,53 @@ class AutoWeightsLoader:
 
         autoloaded_weights = set(self._load_module("", self.module, weights))
         return autoloaded_weights
+
+
+def maybe_fuse_shared_experts(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    *,
+    n_routed_experts: int,
+    n_shared_experts: int,
+    ckpt_prefix: str = "mlp.shared_experts",
+    enabled: bool | None = None,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Route fused shared-expert weights into the extra routed slots."""
+    if enabled is None:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+    if not enabled:
+        yield from weights
+        return
+
+    prefix = f"{ckpt_prefix}."
+    for name, loaded_weight in weights:
+        if prefix not in name:
+            yield name, loaded_weight
+            continue
+        split_dim = 1 if ("down_proj.weight" in name and loaded_weight.ndim > 1) else 0
+        total = loaded_weight.shape[split_dim]
+        if total % n_shared_experts != 0:
+            raise ValueError(
+                f"Fused shared-expert weight {name!r} has size {total} along "
+                f"axis {split_dim}, not divisible by {n_shared_experts}."
+            )
+        chunk = total // n_shared_experts
+        for expert_offset in range(n_shared_experts):
+            sl = slice(expert_offset * chunk, (expert_offset + 1) * chunk)
+            if loaded_weight.ndim == 1:
+                chunk_weight = loaded_weight[sl]
+            elif split_dim == 0:
+                chunk_weight = loaded_weight[sl, :]
+            else:
+                chunk_weight = loaded_weight[:, sl]
+            yield (
+                name.replace(
+                    prefix,
+                    f"mlp.experts.{n_routed_experts + expert_offset}.",
+                ),
+                chunk_weight,
+            )
 
 
 def init_vllm_registered_model(

@@ -1050,7 +1050,10 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        # 1Cat carries the SM70 NVFP4 emulation/TurboMind paths. Kernel
+        # selection still rejects unsupported native backends later, so this
+        # gate must not prevent the explicit SM70 fallback from being chosen.
+        return 70
 
     @classmethod
     def override_quantization_method(

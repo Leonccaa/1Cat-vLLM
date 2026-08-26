@@ -865,6 +865,11 @@ class FusedMoE(PluggableLayer):
             return True if return_success else None
 
         quant_method_name = self.quant_method.__class__.__name__
+        preprocess_loaded_weight = getattr(
+            self.quant_method, "preprocess_loaded_weight", None
+        )
+        if preprocess_loaded_weight is not None:
+            loaded_weight = preprocess_loaded_weight(loaded_weight, weight_name)
         global_expert_id = expert_id
         expert_id = self._map_global_expert_id_to_local_expert_id(global_expert_id)
 

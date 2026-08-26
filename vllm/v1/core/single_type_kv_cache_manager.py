@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
@@ -545,6 +546,96 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             else:
                 break
         return num_common_blocks
+
+
+class CircularBufferManager(FullAttentionManager):
+    """Claim the QSA ring's single key-only block for each request."""
+
+    def _claim_ring_block(self, request_id: str) -> list[KVCacheBlock]:
+        req_blocks = self.req_to_blocks[request_id]
+        if req_blocks:
+            return []
+        new_blocks = self.block_pool.get_new_blocks(1)
+        req_blocks.extend(new_blocks)
+        return new_blocks
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> int:
+        del (
+            num_tokens,
+            new_computed_blocks,
+            total_computed_tokens,
+            num_tokens_main_model,
+            apply_admission_cap,
+        )
+        return 0 if self.req_to_blocks.get(request_id) else 1
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        del num_tokens, num_tokens_main_model
+        return self._claim_ring_block(request_id)
+
+    def allocate_new_computed_blocks(
+        self,
+        request_id: str,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        del new_computed_blocks, num_local_computed_tokens, num_external_computed_tokens
+        self._claim_ring_block(request_id)
+
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: BlockHashList,
+        max_length: int,
+        kv_cache_group_ids: list[int],
+        block_pool: BlockPool,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+        alignment_tokens: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+    ) -> tuple[list[KVCacheBlock], ...]:
+        del (
+            block_hashes,
+            max_length,
+            block_pool,
+            kv_cache_spec,
+            use_eagle,
+            alignment_tokens,
+            dcp_world_size,
+            pcp_world_size,
+        )
+        return tuple([] for _ in kv_cache_group_ids)
+
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        alignment_tokens: int | None = None,
+    ) -> None:
+        del request, num_tokens, alignment_tokens
+
+    def remove_skipped_blocks(self, request_id: str, num_computed_tokens: int) -> None:
+        del request_id, num_computed_tokens
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+        del running_request_id
+        return 0
+
+    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+        del num_computed_tokens
+        return 0
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
@@ -1210,6 +1301,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     TQFullAttentionSpec: FullAttentionManager,
     MLAAttentionSpec: FullAttentionManager,
     HiddenStateCacheSpec: FullAttentionManager,
+    CircularBufferSpec: CircularBufferManager,
     SlidingWindowSpec: SlidingWindowManager,
     SlidingWindowMLASpec: SlidingWindowManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,

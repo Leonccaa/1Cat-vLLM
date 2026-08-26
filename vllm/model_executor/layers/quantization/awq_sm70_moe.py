@@ -30,6 +30,47 @@ logger = init_logger(__name__)
 _DEFAULT_PERSISTENT_MAX_TOKENS = 32
 
 
+def _effective_group_size(
+    checkpoint_group_size: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+) -> int:
+    """Choose an equivalent group size aligned with every TP partition.
+
+    Repeating a source AWQ scale and zero point for smaller subgroups preserves
+    the exact dequantized weights.  This is needed for models such as
+    Qwen3.8-Flash-Next, whose 640-wide experts become 160-wide at TP4 and are
+    therefore not directly compatible with a checkpoint group size of 128.
+    """
+    group_size = checkpoint_group_size
+    while hidden_size % group_size or intermediate_size_per_partition % group_size:
+        group_size //= 2
+        if group_size < 32:
+            raise ValueError(
+                "SM70 AWQ MoE cannot align checkpoint group_size="
+                f"{checkpoint_group_size} with hidden_size={hidden_size} and "
+                "intermediate_size_per_partition="
+                f"{intermediate_size_per_partition}."
+            )
+    return group_size
+
+
+def _repeat_awq_groups(
+    loaded_weight: torch.Tensor,
+    weight_name: str,
+    repeat_factor: int,
+) -> torch.Tensor:
+    if repeat_factor == 1 or not weight_name.endswith(("qzeros", "scales")):
+        return loaded_weight
+    if loaded_weight.ndim not in (2, 3):
+        raise ValueError(
+            "SM70 AWQ grouped tensors must be per-expert 2D or fused-expert "
+            f"3D tensors, got {loaded_weight.ndim}D for {weight_name}."
+        )
+    group_dim = loaded_weight.ndim - 2
+    return loaded_weight.repeat_interleave(repeat_factor, dim=group_dim)
+
+
 def _log_runtime_route_once(message: str, *args) -> None:
     if torch.compiler.is_compiling():
         return
@@ -405,7 +446,9 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         if self.moe.has_bias:
             raise NotImplementedError("SM70 AWQ MoE does not support bias yet.")
         self.weight_bits = weight_bits
+        self.checkpoint_group_size = group_size
         self.group_size = group_size
+        self.group_size_div_factor = 1
         self.zero_point = zero_point
         self.pack_factor = 32 // weight_bits
         self.use_batched_gemm = envs.VLLM_SM70_AWQ_MOE_BATCHED_GEMM
@@ -419,6 +462,20 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
+        self.group_size = _effective_group_size(
+            self.checkpoint_group_size,
+            hidden_size,
+            intermediate_size_per_partition,
+        )
+        self.group_size_div_factor = self.checkpoint_group_size // self.group_size
+        if self.group_size_div_factor > 1:
+            logger.info_once(
+                "SM70 AWQ MoE expands checkpoint groups g%d->g%d for TP-aligned "
+                "loading.",
+                self.checkpoint_group_size,
+                self.group_size,
+            )
+
         extra_weight_attrs.update(
             {
                 "is_transposed": True,
@@ -501,6 +558,17 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_qzeros", w2_qzeros)
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
+
+    def preprocess_loaded_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+    ) -> torch.Tensor:
+        return _repeat_awq_groups(
+            loaded_weight,
+            weight_name,
+            self.group_size_div_factor,
+        )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         align = self.group_size

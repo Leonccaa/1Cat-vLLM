@@ -178,6 +178,7 @@ from vllm.v1.outputs import (
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
+from vllm.v1.ple_offload.connector import PleOffloadConnector
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
@@ -1353,6 +1354,19 @@ class GPUModelRunner(
         # Only relevant for models using ALiBi (e.g, MPT)
         self.use_alibi = model_config.uses_alibi
 
+        ple_layer_ids = getattr(model_config.hf_text_config, "ple_layer_ids", ())
+        self.uses_ngram_embedding = bool(ple_layer_ids)
+        if self.uses_ngram_embedding:
+            self.ngram_context_len = int(model_config.hf_text_config.ngram_size) - 1
+            self.ngram_eos_token_id = int(model_config.hf_text_config.eos_token_id)
+        else:
+            self.ngram_context_len = 0
+            self.ngram_eos_token_id = 0
+        if self.uses_ngram_embedding and self.ngram_context_len <= 0:
+            raise ValueError("N-gram embedding requires context length >= 1.")
+        if self.uses_ngram_embedding and len(get_pp_group().ranks) > 1:
+            raise RuntimeError("N-gram PLE embedding currently requires PP=1.")
+
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
 
@@ -1669,6 +1683,12 @@ class GPUModelRunner(
         self.inputs_embeds = self._make_buffer(
             self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
         )
+        if self.uses_ngram_embedding:
+            self.ngram_context = self._make_buffer(
+                self.max_num_reqs,
+                self.ngram_context_len,
+                dtype=torch.int32,
+            )
         self.is_token_ids = self._make_buffer(self.max_num_tokens, dtype=torch.bool)
         self.discard_request_mask = self._make_buffer(
             self.max_num_reqs, dtype=torch.bool
@@ -1692,6 +1712,7 @@ class GPUModelRunner(
             self.max_spec_state_slots,
             dtype=torch.int32,
         )
+        self._ple_offload_connector: PleOffloadConnector | None = None
         self.ddtree_num_tree_tokens_cpu = torch.zeros(
             self.max_num_reqs, dtype=torch.int32, device="cpu"
         )
@@ -6473,10 +6494,92 @@ class GPUModelRunner(
         inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
         return input_ids, inputs_embeds
 
+    def _setup_ple_offload(self, ipc_addr: str) -> None:
+        if not self.uses_ngram_embedding:
+            raise RuntimeError("PLE offload requires PLE model inputs")
+        self._ple_offload_connector = PleOffloadConnector(
+            self.vllm_config,
+            self.get_model(),
+            self.device,
+            ipc_addr,
+            input_ids_source=self.input_ids.cpu,
+            query_start_loc_source=self.query_start_loc.cpu,
+            ngram_context_source=self.ngram_context.cpu,
+        )
+
+    def _prepare_ngram_context(
+        self,
+        num_reqs: int,
+        num_reqs_padded: int,
+    ) -> torch.Tensor:
+        if not self.uses_ngram_embedding:
+            raise RuntimeError("N-gram context requested for non-ngram model.")
+        eos_token_id = self.ngram_eos_token_id
+        context_cpu = self.ngram_context.np[:num_reqs_padded]
+        context_cpu.fill(eos_token_id)
+
+        num_computed = self.input_batch.num_computed_tokens_cpu
+        token_ids = self.input_batch.token_ids_cpu
+        is_token_ids = self.input_batch.is_token_ids
+        for req_idx in range(num_reqs):
+            end = int(num_computed[req_idx])
+            if end <= 0:
+                continue
+            start = max(0, end - self.ngram_context_len)
+            context_tokens = token_ids[req_idx, start:end]
+            if context_tokens.size == 0:
+                continue
+            if self.enable_prompt_embeds and not is_token_ids[req_idx, start:end].all():
+                safe_tokens = context_tokens.copy()
+                safe_tokens[~is_token_ids[req_idx, start:end]] = eos_token_id
+                context_tokens = safe_tokens
+            context_cpu[req_idx, -context_tokens.size :] = context_tokens
+
+        self.ngram_context.copy_to_gpu(num_reqs_padded)
+        return self.ngram_context.gpu[:num_reqs_padded]
+
+    def _maybe_add_ngram_kwargs(
+        self,
+        model_kwargs: dict[str, Any],
+        *,
+        num_reqs: int,
+        num_reqs_padded: int,
+        is_first_rank: bool,
+        is_encoder_decoder: bool,
+        use_dummy_context: bool,
+        query_start_loc: torch.Tensor | None = None,
+        num_scheduled_tokens: np.ndarray | None = None,
+    ) -> None:
+        if not self.uses_ngram_embedding or not is_first_rank or is_encoder_decoder:
+            return
+        if query_start_loc is None:
+            if num_scheduled_tokens is None:
+                raise RuntimeError("query_start_loc is required for N-gram input.")
+            cu_num_tokens = np.cumsum(num_scheduled_tokens, dtype=np.int32)
+            last = int(cu_num_tokens[-1]) if num_reqs else 0
+            self.query_start_loc.np[0] = 0
+            if num_reqs:
+                self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
+            self.query_start_loc.np[num_reqs + 1 :].fill(last)
+            self.query_start_loc.copy_to_gpu()
+            query_start_loc = self.query_start_loc.gpu[: num_reqs_padded + 1]
+        model_kwargs["query_start_loc"] = query_start_loc
+
+        if use_dummy_context:
+            self.ngram_context.np[:num_reqs_padded].fill(self.ngram_eos_token_id)
+            self.ngram_context.copy_to_gpu(num_reqs_padded)
+            model_kwargs["ngram_context"] = self.ngram_context.gpu[:num_reqs_padded]
+        else:
+            model_kwargs["ngram_context"] = self._prepare_ngram_context(
+                num_reqs, num_reqs_padded
+            )
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
         num_input_tokens: int,  # Padded
+        num_reqs: int,
+        num_reqs_padded: int,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> tuple[
         torch.Tensor | None,
@@ -6554,6 +6657,20 @@ class GPUModelRunner(
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
             model_kwargs = self._init_model_kwargs()
+
+        if self.uses_ngram_embedding and is_first_rank and input_ids is None:
+            raise RuntimeError(
+                "N-gram PLE embedding requires token ids on the first PP rank."
+            )
+        self._maybe_add_ngram_kwargs(
+            model_kwargs,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            is_first_rank=is_first_rank,
+            is_encoder_decoder=is_encoder_decoder,
+            use_dummy_context=False,
+            query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
+        )
 
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
@@ -8314,7 +8431,11 @@ class GPUModelRunner(
                 model_kwargs,
                 ec_connector_output,
             ) = self._preprocess(
-                scheduler_output, num_tokens_padded, intermediate_tensors
+                scheduler_output,
+                num_tokens_padded,
+                num_reqs,
+                num_reqs_padded,
+                intermediate_tensors,
             )
             if trace_log:
                 trace_model_preprocess_ms = (
@@ -8368,6 +8489,12 @@ class GPUModelRunner(
         ) = ([]) if self._sm70_mtp_profile_enabled() else None
         mtp_forward_start = self._sm70_mtp_profile_start(mtp_profile_events)
         trace_forward_t0 = time.perf_counter() if trace_log else 0.0
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.prepare_forward(
+                num_reqs,
+                num_tokens_padded,
+                dummy_run=False,
+            )
         with (
             self._dflash_ddtree_target_forward_profile_scope(
                 use_spec_decode=use_spec_decode,
@@ -8399,6 +8526,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.release_outputs()
         if trace_log:
             trace_forward_submit_ms = (time.perf_counter() - trace_forward_t0) * 1000.0
         self._sm70_mtp_profile_finish(
@@ -10540,6 +10669,23 @@ class GPUModelRunner(
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
 
+            self._maybe_add_ngram_kwargs(
+                model_kwargs,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                is_first_rank=get_pp_group().is_first_rank,
+                is_encoder_decoder=self.model_config.is_encoder_decoder,
+                use_dummy_context=True,
+                num_scheduled_tokens=num_scheduled_tokens,
+            )
+
+            if self._ple_offload_connector is not None:
+                self._ple_offload_connector.prepare_forward(
+                    num_reqs,
+                    num_tokens_padded,
+                    dummy_run=True,
+                )
+
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
             elif self.uses_xdrope_dim > 0:
@@ -10609,6 +10755,8 @@ class GPUModelRunner(
                     **model_kwargs,
                 )
                 _sm70_profile_trace("_dummy_run model forward exit")
+            if self._ple_offload_connector is not None:
+                self._ple_offload_connector.release_outputs()
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -11029,6 +11177,10 @@ class GPUModelRunner(
         memory is reclaimable when running in the same process."""
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
+
+        if self._ple_offload_connector is not None:
+            self._ple_offload_connector.close()
+            self._ple_offload_connector = None
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()

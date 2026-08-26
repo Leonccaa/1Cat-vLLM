@@ -434,6 +434,7 @@ class VocabParallelEmbedding(PluggableLayer):
         padding_size: padding size for the vocabulary.
         quant_config: quant config for the layer
         prefix: full name of the layer in the state dict
+        quant_method: preselected quantization method for model-specific layers
     """  # noqa: E501
 
     # --8<-- [end:vocab_parallel_embedding]
@@ -447,6 +448,8 @@ class VocabParallelEmbedding(PluggableLayer):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        quant_method: QuantizeMethodBase | None = None,
     ):
         super().__init__()
         self.prefix = prefix
@@ -476,8 +479,7 @@ class VocabParallelEmbedding(PluggableLayer):
         )
         self.embedding_dim = embedding_dim
 
-        quant_method = None
-        if quant_config is not None:
+        if quant_method is None and quant_config is not None:
             quant_method = quant_config.get_quant_method(self, prefix=prefix)
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()

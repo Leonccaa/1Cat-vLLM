@@ -66,6 +66,7 @@ except ImportError:
     SafeTensorsFileLoader = fastsafetensors.placeholder_attr("SafeTensorsFileLoader")
     SingleGroup = fastsafetensors.placeholder_attr("SingleGroup")
 
+from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 
 logger = init_logger(__name__)
@@ -320,12 +321,17 @@ def get_quant_config(
     # if hf_quant_config is None, we will try to get config from
     # hf_overrides
     hf_overrides = model_config.hf_overrides
+    if callable(hf_overrides):
+        # A callable hf_overrides is a config-to-config transform (e.g. the
+        # one SpeculativeConfig installs on draft model configs); it cannot
+        # carry quantization config entries, so treat it as no overrides.
+        hf_overrides = {}
     if not isinstance(hf_overrides, dict):
         raise ValueError(
             "hf_overrides must be a dict for get_quant_config "
             "to get the quantization config from it."
         )
-    quantization_config_file = hf_overrides.get("quantization_config_file", None)
+    quantization_config_file = hf_overrides.get("quantization_config_file")
     if quantization_config_file is not None:
         if hasattr(quant_cls, "from_config_file"):
             return quant_cls.from_config_file(quantization_config_file)
@@ -335,7 +341,7 @@ def get_quant_config(
                 "but quant_cls.from_config_file is not implemented in "
                 f"{quant_cls}"
             )
-    quantization_config_json = hf_overrides.get("quantization_config_dict_json", None)
+    quantization_config_json = hf_overrides.get("quantization_config_dict_json")
     if quantization_config_json is not None:
         if hasattr(quant_cls, "from_config_dict_json"):
             return quant_cls.from_config_dict_json(quantization_config_json)
@@ -908,6 +914,8 @@ def safetensors_weights_iterator(
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
+    if is_offload_process():
+        loading_desc += "(PLE-offload)"
 
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
 
