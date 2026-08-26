@@ -208,7 +208,6 @@ def _get_ple_embedding_quant_method(
         prefix,
         ignored_layers,
         quant_config.packed_modules_mapping,
-        match_mode=quant_config.ignored_layers_match_mode,
     ):
         return None
     # PLE checkpoint shards form one runtime embedding parameter.

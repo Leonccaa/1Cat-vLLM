@@ -50,7 +50,6 @@ def apply_qsa_rope(
             head_dim,
             rotary_dim,
             rotary_emb.mrope_interleaved,
-            rotary_emb.is_neox_style,
         )
         return tensor.reshape(shape)
 

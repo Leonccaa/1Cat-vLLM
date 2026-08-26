@@ -21,7 +21,7 @@ from vllm.v1.attention.backends.utils import (
     compute_causal_conv1d_metadata,
     mamba_get_block_table_tensor,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 
 class ShortConvAttentionBackend(AttentionBackend):
@@ -111,7 +111,7 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
 
     def __init__(
         self,
-        kv_cache_spec: MambaSpec,
+        kv_cache_spec: AttentionSpec,
         layer_names: list[str],
         vllm_config: VllmConfig,
         device: torch.device,
@@ -284,7 +284,9 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             spec_sequence_masks = spec_sequence_masks_cpu
         else:
             spec_sequence_masks = async_tensor_h2d(
-                spec_sequence_masks_cpu, device=query_start_loc.device
+                spec_sequence_masks_cpu,
+                dtype=torch.bool,
+                device=query_start_loc.device,
             )
 
         # For causal_conv1d (non-spec prefill Triton kernel metadata).
