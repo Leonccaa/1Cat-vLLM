@@ -364,9 +364,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             q = q.reshape(*orig_shape, -1)
             gate = gate.reshape(*orig_shape, -1)
         else:
-            q, k, v = qkv.split(
-                [self.q_size, self.kv_size, self.kv_size], dim=-1
-            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
 
         q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
@@ -446,7 +444,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             token_to_req=side_metadata.token_to_req,
         )
 
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
