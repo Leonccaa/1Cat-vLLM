@@ -50,9 +50,7 @@ class WeightsMapper:
     orig_to_new_substr: Mapping[str, str | None] = field(default_factory=dict)
     orig_to_new_prefix: Mapping[str, str | None] = field(default_factory=dict)
     orig_to_new_suffix: Mapping[str, str | None] = field(default_factory=dict)
-    orig_to_new_stacked: Mapping[str, tuple[str, ShardId]] = field(
-        default_factory=dict
-    )
+    orig_to_new_stacked: Mapping[str, tuple[str, ShardId]] = field(default_factory=dict)
 
     def __or__(self, other: "WeightsMapper") -> "WeightsMapper":
         """Combine two `WeightsMapper`s by merging their mappings."""
