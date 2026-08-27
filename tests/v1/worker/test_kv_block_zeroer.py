@@ -13,12 +13,36 @@ import pytest
 import torch
 
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.worker.utils import KVBlockZeroer, _infer_segment_block_strides
+from vllm.v1.worker.utils import (
+    KVBlockZeroer,
+    _infer_segment_block_strides,
+    _resolve_zeroer_kernel_layout,
+)
 
 CELL_ELS = 8  # int32 elements zeroed per (block, segment)
 CELL_BYTES = CELL_ELS * 4
 N_LAYERS = 3  # -> n_segs = 3 interleaved segments
 N_BLOCKS = 4
+
+
+@pytest.mark.parametrize(
+    ("block_size", "storage_block_size", "group_kernel_bs", "expected"),
+    [
+        (784, 784, 16, (16, 49)),
+        (784, 98, 16, (98, 1)),
+    ],
+)
+def test_resolve_zeroer_kernel_layout(
+    block_size: int,
+    storage_block_size: int,
+    group_kernel_bs: int,
+    expected: tuple[int, int],
+) -> None:
+    spec = SimpleNamespace(
+        block_size=block_size,
+        storage_block_size=storage_block_size,
+    )
+    assert _resolve_zeroer_kernel_layout(spec, group_kernel_bs) == expected
 
 
 @pytest.mark.parametrize(

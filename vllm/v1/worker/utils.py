@@ -36,6 +36,31 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+def _resolve_zeroer_kernel_layout(
+    spec: FullAttentionSpec,
+    group_kernel_block_size: int,
+) -> tuple[int, int]:
+    """Return the physical kernel block size and virtual-block ratio.
+
+    Compressed attention specs store fewer rows than their logical scheduler
+    block size. Their cache view is shaped with ``storage_block_size`` as one
+    physical page, so zeroing must mirror that layout instead of multiplying
+    the page span by the logical compression ratio a second time.
+    """
+    storage_block_size = spec.storage_block_size
+    kernel_block_size = (
+        storage_block_size
+        if storage_block_size != spec.block_size
+        else group_kernel_block_size
+    )
+    if storage_block_size % kernel_block_size:
+        raise ValueError(
+            "KV storage block size must be divisible by its kernel block size: "
+            f"{storage_block_size} vs {kernel_block_size}."
+        )
+    return kernel_block_size, storage_block_size // kernel_block_size
+
+
 def _infer_segment_block_strides(
     seg_addrs: list[int],
     page_size_el: int,
@@ -184,8 +209,10 @@ class KVBlockZeroer:
                 if isinstance(spec, FullAttentionSpec):
                     if not isinstance(kv, torch.Tensor):
                         continue
-                    kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
-                    ratio = spec.block_size // kernel_bs
+                    kernel_bs, ratio = _resolve_zeroer_kernel_layout(
+                        spec,
+                        kernel_block_sizes[group.kv_cache_group_id],
+                    )
                     block_dim = group.backend.get_kv_cache_block_dim(
                         kernel_bs,
                         spec.num_kv_heads,
