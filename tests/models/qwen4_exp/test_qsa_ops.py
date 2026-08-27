@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops.qsa import (
     _qsa_indexer_cublas_shape_supported,
     _qsa_sparse_launch_profile,
+    _repair_qsa_boundary_ties_sm70,
 )
 
 
@@ -64,3 +66,56 @@ def test_qsa_indexer_cublas_requires_enough_score_work(monkeypatch):
 
     assert not qsa_ops._qsa_indexer_cublas_work_supported(1024, 512)
     assert qsa_ops._qsa_indexer_cublas_work_supported(2048, 512)
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sm70_qsa_boundary_tie_repair_prefers_lowest_block_indices():
+    rows = 3
+    columns = 2048
+    block_topk = 512
+    visible = torch.tensor([1024, 700, 400], dtype=torch.int32, device="cuda")
+    source = torch.zeros((rows, columns), dtype=torch.float32, device="cuda")
+    source[0, :100] = 2.0
+    source[1, 650:700] = 2.0
+    source[2, :400] = torch.arange(400, dtype=torch.float32, device="cuda")
+
+    expected = torch.full(
+        (rows, block_topk),
+        -1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    expected[0] = torch.arange(block_topk, dtype=torch.int32, device="cuda")
+    expected[1, :462] = torch.arange(462, dtype=torch.int32, device="cuda")
+    expected[1, 462:] = torch.arange(650, 700, dtype=torch.int32, device="cuda")
+    expected[2, :400] = torch.arange(400, dtype=torch.int32, device="cuda")
+
+    outputs = []
+    for _ in range(3):
+        logits = source.clone()
+        blocks = torch.empty(
+            (rows, block_topk),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+        torch.ops._C.persistent_topk(
+            logits,
+            visible,
+            blocks,
+            workspace,
+            block_topk,
+            columns,
+        )
+        _repair_qsa_boundary_ties_sm70(
+            logits,
+            visible,
+            blocks,
+            workspace,
+            columns,
+        )
+        torch.accelerator.synchronize()
+        outputs.append(blocks.clone())
+
+    assert all(torch.equal(output, expected) for output in outputs)

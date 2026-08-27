@@ -322,6 +322,110 @@ def _expand_qsa_indices_kernel(
 
 
 @triton.jit
+def _qsa_topk_cutoff_kernel(
+    logits_ptr,
+    visible_blocks_ptr,
+    block_indices_ptr,
+    cutoffs_ptr,
+    stride_logits_row,
+    stride_blocks_row,
+    stride_blocks_column,
+    num_columns,
+    BLOCK_TOPK: tl.constexpr,
+) -> None:
+    """Recover each row's exact top-k cutoff from persistent_topk output."""
+
+    row = tl.program_id(0)
+    ranks = tl.arange(0, BLOCK_TOPK)
+    blocks = tl.load(
+        block_indices_ptr + row * stride_blocks_row + ranks * stride_blocks_column,
+    )
+    visible = tl.load(visible_blocks_ptr + row)
+    valid = (blocks >= 0) & (blocks < visible) & (blocks < num_columns)
+    safe_blocks = tl.maximum(blocks, 0)
+    scores = tl.load(
+        logits_ptr + row * stride_logits_row + safe_blocks,
+        mask=valid,
+        other=float("inf"),
+    ).to(tl.float32)
+    tl.store(cutoffs_ptr + row, tl.min(scores, axis=0))
+
+
+@triton.jit
+def _qsa_boundary_rank_keys_kernel(
+    logits_ptr,
+    visible_blocks_ptr,
+    cutoffs_ptr,
+    stride_logits_row,
+    num_columns,
+    BLOCK_TOPK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    """Replace logits with unique rank keys for a canonical boundary tie."""
+
+    row = tl.program_id(0)
+    columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    visible = tl.load(visible_blocks_ptr + row)
+    live = (columns < num_columns) & (columns < visible)
+    scores = tl.load(
+        logits_ptr + row * stride_logits_row + columns,
+        mask=live,
+        other=-float("inf"),
+    ).to(tl.float32)
+    cutoff = tl.load(cutoffs_ptr + row)
+
+    # Values strictly above the cutoff must all survive. Exact-cutoff values
+    # fill the remaining slots by increasing block index. The two disjoint
+    # integer ranges are exactly representable in FP32 for QSA cache widths,
+    # so persistent_topk sees no ties and needs no numerical perturbation.
+    index_key = (num_columns - columns).to(tl.float32)
+    greater_key = 2.0 * num_columns + index_key
+    tied_key = index_key
+    boundary_key = tl.where(
+        scores > cutoff,
+        greater_key,
+        tl.where(scores == cutoff, tied_key, -float("inf")),
+    )
+    # For short rows persistent_topk already returns every visible index. Keep
+    # the rewritten values unique as well so this kernel remains graph-safe for
+    # captured decode shapes without a device-to-host length check.
+    rank_key = tl.where(visible <= BLOCK_TOPK, tied_key, boundary_key)
+    tl.store(
+        logits_ptr + row * stride_logits_row + columns,
+        tl.where(live, rank_key, -float("inf")),
+        mask=columns < num_columns,
+    )
+
+
+@triton.jit
+def _canonicalize_qsa_block_indices_kernel(
+    block_indices_ptr,
+    stride_row,
+    stride_column,
+    rows,
+    BLOCK_TOPK: tl.constexpr,
+) -> None:
+    """Put a selected QSA block set in ascending block order."""
+
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_TOPK)
+    blocks = tl.load(
+        block_indices_ptr + row * stride_row + offsets * stride_column,
+        mask=row < rows,
+        other=-1,
+    )
+    sentinel: tl.constexpr = 0x7FFFFFFF
+    sort_keys = tl.where(blocks >= 0, blocks, sentinel)
+    sort_keys = tl.sort(sort_keys, dim=0, descending=False)
+    blocks = tl.where(sort_keys == sentinel, -1, sort_keys)
+    tl.store(
+        block_indices_ptr + row * stride_row + offsets * stride_column,
+        blocks,
+        mask=row < rows,
+    )
+
+
+@triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -1014,6 +1118,66 @@ def expand_qsa_block_indices_cuda(
     return out
 
 
+def _repair_qsa_boundary_ties_sm70(
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    blocks: torch.Tensor,
+    topk_workspace: torch.Tensor,
+    score_columns: int,
+) -> None:
+    """Apply the Qwen3.8 cutoff-tie contract without a full stable sort."""
+
+    if not blocks.shape[0]:
+        return
+    block_topk = blocks.shape[1]
+    cutoffs = torch.empty(
+        blocks.shape[0],
+        dtype=torch.float32,
+        device=blocks.device,
+    )
+    _qsa_topk_cutoff_kernel[(blocks.shape[0],)](
+        logits,
+        visible_blocks,
+        blocks,
+        cutoffs,
+        logits.stride(0),
+        blocks.stride(0),
+        blocks.stride(1),
+        score_columns,
+        BLOCK_TOPK=block_topk,
+        num_warps=8,
+    )
+    column_block = 256
+    _qsa_boundary_rank_keys_kernel[
+        (blocks.shape[0], triton.cdiv(score_columns, column_block))
+    ](
+        logits,
+        visible_blocks,
+        cutoffs,
+        logits.stride(0),
+        score_columns,
+        BLOCK_TOPK=block_topk,
+        BLOCK_N=column_block,
+        num_warps=4,
+    )
+    torch.ops._C.persistent_topk(
+        logits,
+        visible_blocks,
+        blocks,
+        topk_workspace,
+        block_topk,
+        score_columns,
+    )
+    _canonicalize_qsa_block_indices_kernel[(blocks.shape[0],)](
+        blocks,
+        blocks.stride(0),
+        blocks.stride(1),
+        blocks.shape[0],
+        BLOCK_TOPK=block_topk,
+        num_warps=8,
+    )
+
+
 def qsa_select_paged_tokens(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1122,6 +1286,26 @@ def qsa_select_paged_tokens(
             block_topk,
             score_columns,
         )
+        is_sm70_qwen38_topk = (
+            block_topk == 512
+            and score_columns > block_topk
+            and current_platform.is_device_capability(70)
+        )
+        repair_boundary_ties = is_sm70_qwen38_topk and (
+            blocks.shape[0] <= 32 or int(visible_blocks.max().item()) > block_topk
+        )
+        if repair_boundary_ties:
+            logger.info_once(
+                "Using deterministic SM70 QSA cutoff-tie repair (block_topk=%d).",
+                block_topk,
+            )
+            _repair_qsa_boundary_ties_sm70(
+                logits,
+                visible_blocks,
+                blocks,
+                topk_workspace,
+                score_columns,
+            )
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],
