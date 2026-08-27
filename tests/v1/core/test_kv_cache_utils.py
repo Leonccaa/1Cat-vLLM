@@ -214,6 +214,26 @@ def test_resolve_kv_cache_block_sizes_for_aligned_mamba_group():
     ) == (1648, 16)
 
 
+@pytest.mark.parametrize(
+    ("layer_counts", "expected_group_size"),
+    [
+        ([1, 12, 12, 12, 36], 12),
+        ([1, 20, 30], 10),
+        ([1, 64, 64], 16),
+        ([1, 5, 7], 1),
+        ([3, 7], 3),
+        ([5, 6], 6),
+    ],
+)
+def test_select_hybrid_kv_cache_group_size(
+    layer_counts: list[int], expected_group_size: int
+):
+    assert (
+        kv_cache_utils._select_hybrid_kv_cache_group_size(layer_counts)
+        == expected_group_size
+    )
+
+
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
 def test_none_hash(monkeypatch, hash_fn):
     import vllm.v1.core.kv_cache_utils
