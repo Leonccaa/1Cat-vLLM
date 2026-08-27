@@ -231,6 +231,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     ) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
+        self.params_dtype = params_dtype
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
         self.ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
@@ -466,9 +467,13 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             for name, loaded_weight in weights:
                 if name != "ngram_embedding.weight_scale":
                     continue
+                runtime_dtype = self.params_dtype or loaded_weight.dtype
                 self.register_buffer(
                     "_offload_weight_scale",
-                    loaded_weight.to(device=torch.accelerator.current_accelerator()),
+                    loaded_weight.to(
+                        device=torch.accelerator.current_accelerator(),
+                        dtype=runtime_dtype,
+                    ),
                     persistent=False,
                 )
                 retained.add(name)
@@ -584,6 +589,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 quant_config=quant_config,
                 params_dtype=model_config.dtype,
             )
+        # GPU offload placeholders intentionally skip the embedding subclass
+        # constructor, so attach the model's runtime dtype from this owning
+        # layer, whose constructor always runs.
+        self.ple_embedding.params_dtype = model_config.dtype
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
             self.hc_hidden_size,
@@ -1193,13 +1202,31 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        embeddings = self.ple_embedding(
-            hidden_states,
-            input_ids,
-            query_start_loc,
-            ngram_context,
-        )
-        embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
+        if (
+            isinstance(self.ple_embedding, PleOffloadLayer)
+            and self.ple_embedding._is_cpu_offloaded
+        ):
+            output_buffer = self.ple_embedding._gpu_output_buffer
+            weight_scale = self._get_embedding_weight_scale()
+            if is_fp8(output_buffer) and weight_scale is None:
+                raise RuntimeError("FP8 PLE embedding is missing its global scale")
+            embeddings = torch.ops.vllm.qwen4_exp_ple_offload_wait_dequantize(
+                self.ple_embedding._sem.flag_tensor,
+                output_buffer,
+                weight_scale,
+                hidden_states,
+            )
+        else:
+            embeddings = self.ple_embedding(
+                hidden_states,
+                input_ids,
+                query_start_loc,
+                ngram_context,
+            )
+            embeddings = self._dequantize_embeddings(
+                embeddings,
+                hidden_states.dtype,
+            )
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
@@ -1238,6 +1265,57 @@ def qwen4_exp_ple_short_conv_fake(
     return
 
 
+def qwen4_exp_ple_offload_wait_dequantize(
+    sem_flag_tensor: torch.Tensor,
+    gpu_output_buffer: torch.Tensor,
+    weight_scale: torch.Tensor | None,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Wait for and materialize a runtime-sized PLE offload result.
+
+    The output shape is anchored to ``hidden_states`` rather than to the
+    fixed-size CUDA IPC buffer. Keeping the wait, slice, and optional FP8
+    dequantization behind one opaque op prevents an AOT trace at one token
+    from specializing later prefill outputs to ``M=1``. ``copy=True`` also
+    guarantees that the returned tensor does not alias the IPC buffer.
+    """
+    torch.ops.vllm.ple_offload_wait(
+        sem_flag_tensor,
+        gpu_output_buffer,
+        hidden_states,
+    )
+    output = gpu_output_buffer[: hidden_states.shape[0]].to(
+        dtype=hidden_states.dtype,
+        copy=True,
+    )
+    if is_fp8(gpu_output_buffer):
+        if weight_scale is None:
+            raise RuntimeError("FP8 PLE embedding is missing its global scale")
+        output.mul_(weight_scale.to(output.dtype))
+    return output
+
+
+def qwen4_exp_ple_offload_wait_dequantize_fake(
+    sem_flag_tensor: torch.Tensor,
+    gpu_output_buffer: torch.Tensor,
+    weight_scale: torch.Tensor | None,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    del sem_flag_tensor, weight_scale
+    return hidden_states.new_empty(
+        (hidden_states.shape[0], *gpu_output_buffer.shape[1:])
+    )
+
+
+# The CPU offload process writes the IPC buffer; this op only waits and reads.
+# Marking the buffer mutable would make AOT functionalization clone it before
+# the wait, so the compiled graph would consume stale data from that clone.
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_offload_wait_dequantize",
+    op_func=qwen4_exp_ple_offload_wait_dequantize,
+    fake_impl=qwen4_exp_ple_offload_wait_dequantize_fake,
+)
+
 direct_register_custom_op(
     op_name="qwen4_exp_ple_short_conv",
     op_func=qwen4_exp_ple_short_conv,
@@ -1250,4 +1328,5 @@ __all__ = [
     "Qwen4ExpNGramEmbedding",
     "Qwen4ExpPLEGroupedNorm",
     "Qwen4ExpPLELayer",
+    "qwen4_exp_ple_offload_wait_dequantize",
 ]
