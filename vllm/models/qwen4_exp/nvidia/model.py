@@ -549,83 +549,6 @@ direct_register_custom_op(
 )
 
 
-def qwen4_exp_final_mixer_full_forward(
-    hidden_states: torch.Tensor,
-    block_output: torch.Tensor,
-    injection: torch.Tensor,
-    multi_output: torch.Tensor,
-    sample_output: torch.Tensor,
-    mixer_name: str,
-) -> None:
-    """Run the final HyperConnection mixer outside Inductor rewrites."""
-    mixer = get_forward_context().no_compile_layers[mixer_name]
-    if not isinstance(mixer, GatedResidual):
-        raise TypeError(f"{mixer_name} is not a GatedResidual mixer")
-    multi_result, sample_result, _ = mixer.combine_and_mix(
-        hidden_states,
-        block_output,
-        injection,
-    )
-    multi_output.copy_(multi_result)
-    sample_output.copy_(sample_result)
-
-
-def qwen4_exp_final_mixer_full_forward_fake(
-    hidden_states: torch.Tensor,
-    block_output: torch.Tensor,
-    injection: torch.Tensor,
-    multi_output: torch.Tensor,
-    sample_output: torch.Tensor,
-    mixer_name: str,
-) -> None:
-    del (
-        hidden_states,
-        block_output,
-        injection,
-        multi_output,
-        sample_output,
-        mixer_name,
-    )
-
-
-direct_register_custom_op(
-    op_name="qwen4_exp_final_mixer_full_forward",
-    op_func=qwen4_exp_final_mixer_full_forward,
-    mutates_args=["multi_output", "sample_output"],
-    fake_impl=qwen4_exp_final_mixer_full_forward_fake,
-)
-
-
-def qwen4_exp_input_embedding_full_forward(
-    input_ids: torch.Tensor,
-    hidden_output: torch.Tensor,
-    embedding_name: str,
-    hc_count: int,
-) -> None:
-    """Run TP vocabulary embedding and HC expansion outside Inductor."""
-    embedding = get_forward_context().no_compile_layers[embedding_name]
-    if not isinstance(embedding, VocabParallelEmbedding):
-        raise TypeError(f"{embedding_name} is not a VocabParallelEmbedding")
-    hidden_output.copy_(embedding(input_ids).repeat(1, hc_count))
-
-
-def qwen4_exp_input_embedding_full_forward_fake(
-    input_ids: torch.Tensor,
-    hidden_output: torch.Tensor,
-    embedding_name: str,
-    hc_count: int,
-) -> None:
-    del input_ids, hidden_output, embedding_name, hc_count
-
-
-direct_register_custom_op(
-    op_name="qwen4_exp_input_embedding_full_forward",
-    op_func=qwen4_exp_input_embedding_full_forward,
-    mutates_args=["hidden_output"],
-    fake_impl=qwen4_exp_input_embedding_full_forward_fake,
-)
-
-
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
     """Expose Qwen4Exp routed experts through vLLM's EPLB protocol."""
 
@@ -705,11 +628,6 @@ class Qwen4ExpModel(nn.Module):
             and getattr(config, "indexer_n_heads", None) is not None
         )
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
-        self.embed_tokens_name = maybe_prefix(prefix, "embed_tokens")
-        static_context = vllm_config.compilation_config.static_forward_context
-        if self.embed_tokens_name in static_context:
-            raise ValueError(f"Duplicate layer name: {self.embed_tokens_name}")
-        static_context[self.embed_tokens_name] = self.embed_tokens
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)
@@ -728,10 +646,6 @@ class Qwen4ExpModel(nn.Module):
         )
 
         self.hyper_connection_mixer: GatedResidual | None
-        self.hyper_connection_mixer_name = maybe_prefix(
-            prefix,
-            "hyper_connection_mixer",
-        )
         if get_pp_group().is_last_rank:
             hc_config = HyperConnectionConfig(
                 hc_count=config.hc_count,
@@ -744,15 +658,7 @@ class Qwen4ExpModel(nn.Module):
             self.hyper_connection_mixer = GatedResidual(
                 hc_config,
                 use_combine=False,
-                prefix=self.hyper_connection_mixer_name,
-            )
-            static_context = vllm_config.compilation_config.static_forward_context
-            if self.hyper_connection_mixer_name in static_context:
-                raise ValueError(
-                    f"Duplicate layer name: {self.hyper_connection_mixer_name}"
-                )
-            static_context[self.hyper_connection_mixer_name] = (
-                self.hyper_connection_mixer
+                prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
             )
         else:
             self.hyper_connection_mixer = None
@@ -796,28 +702,8 @@ class Qwen4ExpModel(nn.Module):
             else:
                 if input_ids is None:
                     raise ValueError("input_ids or inputs_embeds is required")
-                if torch.compiler.is_compiling():
-                    hidden_states = torch.empty(
-                        (
-                            input_ids.shape[0],
-                            self.config.hidden_size * self.config.hc_count,
-                        ),
-                        dtype=self.embed_tokens.weight.dtype,
-                        device=input_ids.device,
-                    )
-                    torch.ops.vllm.qwen4_exp_input_embedding_full_forward(
-                        input_ids,
-                        hidden_states,
-                        self.embed_tokens_name,
-                        self.config.hc_count,
-                    )
-                else:
-                    hidden_states = self.embed_input_ids(input_ids).repeat(
-                        1,
-                        self.config.hc_count,
-                    )
-            if inputs_embeds is not None:
-                hidden_states = hidden_states.repeat(1, self.config.hc_count)
+                hidden_states = self.embed_input_ids(input_ids)
+            hidden_states = hidden_states.repeat(1, self.config.hc_count)
         else:
             if intermediate_tensors is None:
                 raise ValueError("pipeline stage requires intermediate tensors")
@@ -876,25 +762,9 @@ class Qwen4ExpModel(nn.Module):
         # the sampled single stream and the materialized multi-stream state.
         final_mixer = self.hyper_connection_mixer
         assert final_mixer is not None
-        assert block_output is not None
-        assert injection is not None
-        if torch.compiler.is_compiling():
-            multi_hidden = torch.empty_like(hidden_states)
-            sample_hidden_states = hidden_states.new_empty(
-                (hidden_states.shape[0], self.config.hidden_size)
-            )
-            torch.ops.vllm.qwen4_exp_final_mixer_full_forward(
-                hidden_states,
-                block_output,
-                injection,
-                multi_hidden,
-                sample_hidden_states,
-                self.hyper_connection_mixer_name,
-            )
-        else:
-            multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
-                hidden_states, block_output, injection
-            )
+        multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
+            hidden_states, block_output, injection
+        )
         if self._mtp_hidden_buffer is not None:
             # Capture the pre-final-mixer multi-stream hidden state
             # [T, hc_count*H] for the MTP drafter (zero extra compute:

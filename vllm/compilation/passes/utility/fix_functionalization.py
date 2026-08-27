@@ -353,23 +353,6 @@ class FixFunctionalizationPass(VllmInductorPass):
                 }
                 self.defunctionalize(graph, node, mutated_args)
             elif (
-                hasattr(torch.ops.vllm, "qwen4_exp_final_mixer_full_forward")
-                and at_target
-                == torch.ops.vllm.qwen4_exp_final_mixer_full_forward.default
-            ):
-                mutated_args = {
-                    1: "multi_output",
-                    2: "sample_output",
-                }
-                self.defunctionalize(graph, node, mutated_args)
-            elif (
-                hasattr(torch.ops.vllm, "qwen4_exp_input_embedding_full_forward")
-                and at_target
-                == torch.ops.vllm.qwen4_exp_input_embedding_full_forward.default
-            ):
-                mutated_args = {1: "hidden_output"}
-                self.defunctionalize(graph, node, mutated_args)
-            elif (
                 hasattr(torch.ops.vllm, "fused_rope_and_unified_kv_cache_update")
                 and at_target
                 == torch.ops.vllm.fused_rope_and_unified_kv_cache_update.default
