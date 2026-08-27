@@ -22,6 +22,7 @@ from vllm.models.qwen4_exp.nvidia.ple_layer import (
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLELayer,
     _get_ple_embedding_quant_method,
+    qwen4_exp_ple_offload_wait_dequantize_fake,
 )
 
 
@@ -159,9 +160,11 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
     assert module.get_offload_output_dtype(torch.bfloat16) == torch.float8_e4m3fn
 
 
-def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
+@pytest.mark.skip_global_cleanup
+def test_ngram_gpu_offload_retains_fp8_scale_in_runtime_dtype(monkeypatch) -> None:
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
+    module.params_dtype = torch.float16
     weight_scale = torch.tensor([0.25], dtype=torch.bfloat16)
     monkeypatch.setattr(ple_layer_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
     monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: False)
@@ -179,18 +182,42 @@ def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
     )
 
     assert loaded == {"ngram_embedding.weight_scale"}
-    assert torch.equal(module._offload_weight_scale, weight_scale)
+    assert module._offload_weight_scale.dtype == torch.float16
+    assert torch.equal(module._offload_weight_scale, weight_scale.to(torch.float16))
     assert module.get_offload_output_dtype(torch.bfloat16) == torch.float8_e4m3fn
 
     ple_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(ple_layer)
     ple_layer.ple_embedding = module
     embeddings = torch.tensor([[4.0, 8.0]]).to(torch.float8_e4m3fn)
-    output = ple_layer._dequantize_embeddings(embeddings, torch.bfloat16)
+    output = ple_layer._dequantize_embeddings(embeddings, torch.float16)
     torch.testing.assert_close(
         output,
-        torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16),
+        torch.tensor([[1.0, 2.0]], dtype=torch.float16),
     )
+
+
+@pytest.mark.skip_global_cleanup
+def test_ple_offload_dequant_fake_uses_runtime_token_shape() -> None:
+    hidden_states = torch.empty(7, 16, dtype=torch.float16)
+    output = qwen4_exp_ple_offload_wait_dequantize_fake(
+        torch.empty(1, dtype=torch.int32),
+        torch.empty(256, 32, dtype=torch.float8_e4m3fn),
+        torch.ones(1, dtype=torch.float16),
+        hidden_states,
+    )
+
+    assert output.shape == (7, 32)
+    assert output.dtype == torch.float16
+
+
+@pytest.mark.skip_global_cleanup
+def test_ple_offload_dequant_custom_op_does_not_mutate_ipc_buffer() -> None:
+    op = torch.ops.vllm.qwen4_exp_ple_offload_wait_dequantize.default
+
+    # Declaring the externally-written IPC buffer mutable makes AOT
+    # functionalization clone it before the op waits for the CPU producer.
+    assert not op._schema.is_mutable
 
 
 def _make_fp8_embedding_layer(

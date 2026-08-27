@@ -11,6 +11,7 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -67,6 +68,7 @@ from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -210,6 +212,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         quant_config = vllm_config.quant_config
 
         self.config = config
+        self.prefix = prefix
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
         if vllm_config.parallel_config.use_sequence_parallel_moe:
@@ -295,8 +298,21 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hc_config,
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
+        for state_name in (
+            "_empty_gdn_conv_state",
+            "_empty_gdn_ssm_state",
+            "_empty_ple_conv_state",
+            "_empty_qsa_main_cache",
+            "_empty_qsa_raw_cache",
+            "_empty_qsa_compressed_cache",
+        ):
+            self.register_buffer(state_name, torch.empty(0), persistent=False)
+        static_context = vllm_config.compilation_config.static_forward_context
+        if prefix in static_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        static_context[prefix] = self
 
-    def forward(
+    def _forward(
         self,
         hidden_states: torch.Tensor,
         prev_block_output: torch.Tensor | None,
@@ -362,6 +378,252 @@ class Qwen4ExpDecoderLayer(nn.Module):
         )
         mlp_out = self.mlp(block_input)
         return hidden_states, mlp_out, injection
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        prev_block_output: torch.Tensor | None,
+        prev_injection: torch.Tensor | None,
+        positions: torch.Tensor,
+        *,
+        input_ids: torch.Tensor | None,
+        query_start_loc: torch.Tensor | None,
+        ngram_context: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not torch.compiler.is_compiling():
+            return self._forward(
+                hidden_states,
+                prev_block_output,
+                prev_injection,
+                positions,
+                input_ids=input_ids,
+                query_start_loc=query_start_loc,
+                ngram_context=ngram_context,
+            )
+        if input_ids is None or query_start_loc is None or ngram_context is None:
+            raise RuntimeError("Qwen4Exp compiled layers require raw PLE inputs")
+
+        gdn_conv_state = self._empty_gdn_conv_state
+        gdn_ssm_state = self._empty_gdn_ssm_state
+        ple_conv_state = self._empty_ple_conv_state
+        qsa_main_cache = self._empty_qsa_main_cache
+        qsa_raw_cache = self._empty_qsa_raw_cache
+        qsa_compressed_cache = self._empty_qsa_compressed_cache
+        if self.layer_type == "linear_attention":
+            gdn_kv_cache = getattr(self.linear_attn, "kv_cache", None)
+            if gdn_kv_cache is not None:
+                gdn_conv_state, gdn_ssm_state = gdn_kv_cache
+        elif isinstance(self.self_attn, Qwen4ExpQSAAttention):
+            qsa_main_cache = self.self_attn.kv_cache
+            qsa_raw_cache = self.self_attn.indexer.raw_key_cache.kv_cache
+            qsa_compressed_cache = self.self_attn.indexer.compressed_key_cache.kv_cache
+        if self.ple is not None:
+            ple_conv_state = self.ple.kv_cache[0]
+
+        num_tokens = hidden_states.shape[0]
+        hidden_output = torch.empty_like(hidden_states)
+        block_output = hidden_states.new_empty((num_tokens, self.config.hidden_size))
+        injection_output = hidden_states.new_empty((num_tokens, self.config.hc_count))
+        torch.ops.vllm.qwen4_exp_decoder_layer_full_forward(
+            hidden_states,
+            prev_block_output,
+            prev_injection,
+            positions,
+            input_ids,
+            query_start_loc,
+            ngram_context,
+            hidden_output,
+            block_output,
+            injection_output,
+            gdn_conv_state,
+            gdn_ssm_state,
+            ple_conv_state,
+            qsa_main_cache,
+            qsa_raw_cache,
+            qsa_compressed_cache,
+            self.prefix,
+        )
+        return hidden_output, block_output, injection_output
+
+
+def qwen4_exp_decoder_layer_full_forward(
+    hidden_states: torch.Tensor,
+    prev_block_output: torch.Tensor | None,
+    prev_injection: torch.Tensor | None,
+    positions: torch.Tensor,
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    hidden_output: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_output: torch.Tensor,
+    gdn_conv_state: torch.Tensor,
+    gdn_ssm_state: torch.Tensor,
+    ple_conv_state: torch.Tensor,
+    qsa_main_cache: torch.Tensor,
+    qsa_raw_cache: torch.Tensor,
+    qsa_compressed_cache: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Run one complete decoder layer outside Inductor rewrites."""
+    del (
+        gdn_conv_state,
+        gdn_ssm_state,
+        ple_conv_state,
+        qsa_main_cache,
+        qsa_raw_cache,
+        qsa_compressed_cache,
+    )
+    layer = get_forward_context().no_compile_layers[layer_name]
+    if not isinstance(layer, Qwen4ExpDecoderLayer):
+        raise TypeError(f"{layer_name} is not a Qwen4Exp decoder layer")
+    hidden_result, block_result, injection_result = layer._forward(
+        hidden_states,
+        prev_block_output,
+        prev_injection,
+        positions,
+        input_ids=input_ids,
+        query_start_loc=query_start_loc,
+        ngram_context=ngram_context,
+    )
+    hidden_output.copy_(hidden_result)
+    block_output.copy_(block_result)
+    injection_output.copy_(injection_result)
+
+
+def qwen4_exp_decoder_layer_full_forward_fake(
+    hidden_states: torch.Tensor,
+    prev_block_output: torch.Tensor | None,
+    prev_injection: torch.Tensor | None,
+    positions: torch.Tensor,
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    hidden_output: torch.Tensor,
+    block_output: torch.Tensor,
+    injection_output: torch.Tensor,
+    gdn_conv_state: torch.Tensor,
+    gdn_ssm_state: torch.Tensor,
+    ple_conv_state: torch.Tensor,
+    qsa_main_cache: torch.Tensor,
+    qsa_raw_cache: torch.Tensor,
+    qsa_compressed_cache: torch.Tensor,
+    layer_name: str,
+) -> None:
+    del (
+        hidden_states,
+        prev_block_output,
+        prev_injection,
+        positions,
+        input_ids,
+        query_start_loc,
+        ngram_context,
+        hidden_output,
+        block_output,
+        injection_output,
+        gdn_conv_state,
+        gdn_ssm_state,
+        ple_conv_state,
+        qsa_main_cache,
+        qsa_raw_cache,
+        qsa_compressed_cache,
+        layer_name,
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_decoder_layer_full_forward",
+    op_func=qwen4_exp_decoder_layer_full_forward,
+    mutates_args=[
+        "hidden_output",
+        "block_output",
+        "injection_output",
+        "gdn_conv_state",
+        "gdn_ssm_state",
+        "ple_conv_state",
+        "qsa_main_cache",
+        "qsa_raw_cache",
+        "qsa_compressed_cache",
+    ],
+    fake_impl=qwen4_exp_decoder_layer_full_forward_fake,
+)
+
+
+def qwen4_exp_final_mixer_full_forward(
+    hidden_states: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    multi_output: torch.Tensor,
+    sample_output: torch.Tensor,
+    mixer_name: str,
+) -> None:
+    """Run the final HyperConnection mixer outside Inductor rewrites."""
+    mixer = get_forward_context().no_compile_layers[mixer_name]
+    if not isinstance(mixer, GatedResidual):
+        raise TypeError(f"{mixer_name} is not a GatedResidual mixer")
+    multi_result, sample_result, _ = mixer.combine_and_mix(
+        hidden_states,
+        block_output,
+        injection,
+    )
+    multi_output.copy_(multi_result)
+    sample_output.copy_(sample_result)
+
+
+def qwen4_exp_final_mixer_full_forward_fake(
+    hidden_states: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    multi_output: torch.Tensor,
+    sample_output: torch.Tensor,
+    mixer_name: str,
+) -> None:
+    del (
+        hidden_states,
+        block_output,
+        injection,
+        multi_output,
+        sample_output,
+        mixer_name,
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_final_mixer_full_forward",
+    op_func=qwen4_exp_final_mixer_full_forward,
+    mutates_args=["multi_output", "sample_output"],
+    fake_impl=qwen4_exp_final_mixer_full_forward_fake,
+)
+
+
+def qwen4_exp_input_embedding_full_forward(
+    input_ids: torch.Tensor,
+    hidden_output: torch.Tensor,
+    embedding_name: str,
+    hc_count: int,
+) -> None:
+    """Run TP vocabulary embedding and HC expansion outside Inductor."""
+    embedding = get_forward_context().no_compile_layers[embedding_name]
+    if not isinstance(embedding, VocabParallelEmbedding):
+        raise TypeError(f"{embedding_name} is not a VocabParallelEmbedding")
+    hidden_output.copy_(embedding(input_ids).repeat(1, hc_count))
+
+
+def qwen4_exp_input_embedding_full_forward_fake(
+    input_ids: torch.Tensor,
+    hidden_output: torch.Tensor,
+    embedding_name: str,
+    hc_count: int,
+) -> None:
+    del input_ids, hidden_output, embedding_name, hc_count
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_input_embedding_full_forward",
+    op_func=qwen4_exp_input_embedding_full_forward,
+    mutates_args=["hidden_output"],
+    fake_impl=qwen4_exp_input_embedding_full_forward_fake,
+)
 
 
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
@@ -443,6 +705,11 @@ class Qwen4ExpModel(nn.Module):
             and getattr(config, "indexer_n_heads", None) is not None
         )
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
+        self.embed_tokens_name = maybe_prefix(prefix, "embed_tokens")
+        static_context = vllm_config.compilation_config.static_forward_context
+        if self.embed_tokens_name in static_context:
+            raise ValueError(f"Duplicate layer name: {self.embed_tokens_name}")
+        static_context[self.embed_tokens_name] = self.embed_tokens
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)
@@ -461,6 +728,10 @@ class Qwen4ExpModel(nn.Module):
         )
 
         self.hyper_connection_mixer: GatedResidual | None
+        self.hyper_connection_mixer_name = maybe_prefix(
+            prefix,
+            "hyper_connection_mixer",
+        )
         if get_pp_group().is_last_rank:
             hc_config = HyperConnectionConfig(
                 hc_count=config.hc_count,
@@ -473,7 +744,15 @@ class Qwen4ExpModel(nn.Module):
             self.hyper_connection_mixer = GatedResidual(
                 hc_config,
                 use_combine=False,
-                prefix=maybe_prefix(prefix, "hyper_connection_mixer"),
+                prefix=self.hyper_connection_mixer_name,
+            )
+            static_context = vllm_config.compilation_config.static_forward_context
+            if self.hyper_connection_mixer_name in static_context:
+                raise ValueError(
+                    f"Duplicate layer name: {self.hyper_connection_mixer_name}"
+                )
+            static_context[self.hyper_connection_mixer_name] = (
+                self.hyper_connection_mixer
             )
         else:
             self.hyper_connection_mixer = None
@@ -517,8 +796,28 @@ class Qwen4ExpModel(nn.Module):
             else:
                 if input_ids is None:
                     raise ValueError("input_ids or inputs_embeds is required")
-                hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.repeat(1, self.config.hc_count)
+                if torch.compiler.is_compiling():
+                    hidden_states = torch.empty(
+                        (
+                            input_ids.shape[0],
+                            self.config.hidden_size * self.config.hc_count,
+                        ),
+                        dtype=self.embed_tokens.weight.dtype,
+                        device=input_ids.device,
+                    )
+                    torch.ops.vllm.qwen4_exp_input_embedding_full_forward(
+                        input_ids,
+                        hidden_states,
+                        self.embed_tokens_name,
+                        self.config.hc_count,
+                    )
+                else:
+                    hidden_states = self.embed_input_ids(input_ids).repeat(
+                        1,
+                        self.config.hc_count,
+                    )
+            if inputs_embeds is not None:
+                hidden_states = hidden_states.repeat(1, self.config.hc_count)
         else:
             if intermediate_tensors is None:
                 raise ValueError("pipeline stage requires intermediate tensors")
@@ -577,9 +876,25 @@ class Qwen4ExpModel(nn.Module):
         # the sampled single stream and the materialized multi-stream state.
         final_mixer = self.hyper_connection_mixer
         assert final_mixer is not None
-        multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
-            hidden_states, block_output, injection
-        )
+        assert block_output is not None
+        assert injection is not None
+        if torch.compiler.is_compiling():
+            multi_hidden = torch.empty_like(hidden_states)
+            sample_hidden_states = hidden_states.new_empty(
+                (hidden_states.shape[0], self.config.hidden_size)
+            )
+            torch.ops.vllm.qwen4_exp_final_mixer_full_forward(
+                hidden_states,
+                block_output,
+                injection,
+                multi_hidden,
+                sample_hidden_states,
+                self.hyper_connection_mixer_name,
+            )
+        else:
+            multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
+                hidden_states, block_output, injection
+            )
         if self._mtp_hidden_buffer is not None:
             # Capture the pre-final-mixer multi-stream hidden state
             # [T, hc_count*H] for the MTP drafter (zero extra compute:

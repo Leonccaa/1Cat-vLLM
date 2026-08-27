@@ -78,9 +78,7 @@ class FixFunctionalizationPass(VllmInductorPass):
         fused_add_rms_norm_static_fp8_quant = _get_c_op(
             "fused_add_rms_norm_static_fp8_quant"
         )
-        rms_norm_dynamic_per_token_quant = _get_c_op(
-            "rms_norm_dynamic_per_token_quant"
-        )
+        rms_norm_dynamic_per_token_quant = _get_c_op("rms_norm_dynamic_per_token_quant")
         rms_norm_targets = [
             op
             for op in (
@@ -336,6 +334,40 @@ class FixFunctionalizationPass(VllmInductorPass):
                 # before the wait, potentially reading it before the CPU signals.
                 # Restore the wait and keep users on the original IPC buffer.
                 mutated_args = {1: "gpu_output_buffer"}
+                self.defunctionalize(graph, node, mutated_args)
+            elif (
+                hasattr(torch.ops.vllm, "qwen4_exp_decoder_layer_full_forward")
+                and at_target
+                == torch.ops.vllm.qwen4_exp_decoder_layer_full_forward.default
+            ):
+                mutated_args = {
+                    1: "hidden_output",
+                    2: "block_output",
+                    3: "injection_output",
+                    4: "gdn_conv_state",
+                    5: "gdn_ssm_state",
+                    6: "ple_conv_state",
+                    7: "qsa_main_cache",
+                    8: "qsa_raw_cache",
+                    9: "qsa_compressed_cache",
+                }
+                self.defunctionalize(graph, node, mutated_args)
+            elif (
+                hasattr(torch.ops.vllm, "qwen4_exp_final_mixer_full_forward")
+                and at_target
+                == torch.ops.vllm.qwen4_exp_final_mixer_full_forward.default
+            ):
+                mutated_args = {
+                    1: "multi_output",
+                    2: "sample_output",
+                }
+                self.defunctionalize(graph, node, mutated_args)
+            elif (
+                hasattr(torch.ops.vllm, "qwen4_exp_input_embedding_full_forward")
+                and at_target
+                == torch.ops.vllm.qwen4_exp_input_embedding_full_forward.default
+            ):
+                mutated_args = {1: "hidden_output"}
                 self.defunctionalize(graph, node, mutated_args)
             elif (
                 hasattr(torch.ops.vllm, "fused_rope_and_unified_kv_cache_update")

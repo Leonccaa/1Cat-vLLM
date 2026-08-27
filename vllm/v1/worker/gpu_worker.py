@@ -18,6 +18,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
+from vllm.config.utils import Range
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -75,6 +76,29 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+
+def _missing_compile_range_warmup_sizes(
+    compile_ranges: list[Range],
+    warmup_sizes: list[int],
+    cudagraph_capture_sizes: list[int],
+) -> list[int]:
+    """Return range endpoints that still need a non-specializing warmup.
+
+    Dynamo specializes dimensions first seen at 0 or 1 even after
+    ``mark_dynamic``. A size-1 CUDA graph capture therefore does not warm a
+    multi-size compile range safely when guards are disabled.
+    """
+    all_sizes = set(cudagraph_capture_sizes)
+    all_sizes.update(warmup_sizes)
+    return [
+        compile_range.end
+        for compile_range in compile_ranges
+        if not any(
+            size in compile_range and (compile_range.is_single_size() or size > 1)
+            for size in all_sizes
+        )
+    ]
 
 
 class AsyncIntermediateTensors(IntermediateTensors):
@@ -319,9 +343,9 @@ class Worker(WorkerBase):
             yield
             return
 
-        set_allocator_settings = getattr(torch._C,
-                                         "_accelerator_setAllocatorSettings",
-                                         None)
+        set_allocator_settings = getattr(
+            torch._C, "_accelerator_setAllocatorSettings", None
+        )
         if set_allocator_settings is None:
             yield
             return
@@ -706,11 +730,13 @@ class Worker(WorkerBase):
             # For each compile_range, if none of the batch sizes
             # in warmup_sizes or cudagraph_capture_sizes are in the range,
             # add the end of the range to ensure compilation/warmup.
-            all_sizes = set(cg_capture_sizes)
-            all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])
-            for compile_range in compile_ranges:
-                if not any(x in compile_range for x in all_sizes):
-                    warmup_sizes.append(compile_range.end)
+            warmup_sizes.extend(
+                _missing_compile_range_warmup_sizes(
+                    compile_ranges,
+                    [x for x in warmup_sizes if isinstance(x, int)],
+                    cg_capture_sizes,
+                )
+            )
 
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
