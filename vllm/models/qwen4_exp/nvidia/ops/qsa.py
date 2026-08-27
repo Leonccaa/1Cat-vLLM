@@ -5,14 +5,28 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+logger = init_logger(__name__)
+
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
+_SM70_INDEXER_CUBLAS = os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS", "1") == "1"
+_SM70_INDEXER_SCORE_TILE_BYTES = (
+    int(os.getenv("VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB", "64")) * 1024 * 1024
+)
+_SM70_INDEXER_CUBLAS_MIN_ROWS = int(
+    os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_ROWS", "512")
+)
+_SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS = int(
+    os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS", str(1024**2))
+)
 
 
 @triton.jit
@@ -116,6 +130,124 @@ def _qsa_mqa_paged_kernel(
             tl.where(page_valid, score, -float("inf")),
             mask=live & (columns < num_columns),
         )
+
+
+@triton.jit
+def _qsa_visible_blocks_kernel(
+    token_to_req_ptr,
+    query_positions_ptr,
+    sequence_lengths_ptr,
+    visible_blocks_ptr,
+    rows,
+    num_requests,
+    COMPRESS_RATIO: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    request = tl.load(token_to_req_ptr + row, mask=row < rows, other=-1)
+    valid_request = (request >= 0) & (request < num_requests)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    query_position = tl.load(query_positions_ptr + row, mask=row < rows, other=-1)
+    sequence_length = tl.load(
+        sequence_lengths_ptr + safe_request,
+        mask=(row < rows) & valid_request,
+        other=0,
+    )
+    visible = tl.minimum(
+        (query_position + 1) // COMPRESS_RATIO,
+        sequence_length // COMPRESS_RATIO,
+    )
+    tl.store(
+        visible_blocks_ptr + row,
+        tl.where(valid_request, tl.maximum(visible, 0), 0),
+        mask=row < rows,
+    )
+
+
+@triton.jit
+def _qsa_gather_single_request_keys_kernel(
+    cache_ptr,
+    page_table_ptr,
+    keys_ptr,
+    valid_ptr,
+    stride_cache_page,
+    stride_cache_token,
+    stride_cache_dim,
+    stride_table_page,
+    stride_keys_row,
+    columns,
+    num_pages,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+) -> None:
+    column = tl.program_id(0)
+    dims = tl.arange(0, BLOCK_D)
+    logical_page = column // PAGE_SIZE
+    page_offset = column % PAGE_SIZE
+    physical_page = tl.load(
+        page_table_ptr + logical_page * stride_table_page,
+        mask=(column < columns) & (logical_page < PAGE_TABLE_WIDTH),
+        other=-1,
+    )
+    valid = (column < columns) & (physical_page >= 0) & (physical_page < num_pages)
+    safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+    key = tl.load(
+        cache_ptr
+        + safe_page * stride_cache_page
+        + page_offset * stride_cache_token
+        + dims * stride_cache_dim,
+        mask=valid & (dims < HEAD_DIM),
+        other=0.0,
+    )
+    tl.store(
+        keys_ptr + column * stride_keys_row + dims,
+        key,
+        mask=(column < columns) & (dims < HEAD_DIM),
+    )
+    tl.store(valid_ptr + column, valid, mask=column < columns)
+
+
+@triton.jit
+def _qsa_relu_headsum_visible_kernel(
+    score_ptr,
+    visible_ptr,
+    key_valid_ptr,
+    logits_ptr,
+    stride_score_row,
+    stride_score_column,
+    stride_logits_row,
+    width,
+    column_start,
+    score_divisor,
+    NUM_HEADS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    absolute_columns = column_start + columns
+    visible = tl.load(visible_ptr + row)
+    key_valid = tl.load(
+        key_valid_ptr + absolute_columns,
+        mask=columns < width,
+        other=0,
+    ).to(tl.int1)
+    live = (columns < width) & (absolute_columns < visible) & key_valid
+    score = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for head in range(NUM_HEADS):
+        values = tl.load(
+            score_ptr
+            + (row * NUM_HEADS + head) * stride_score_row
+            + columns * stride_score_column,
+            mask=columns < width,
+            other=0.0,
+        ).to(tl.float32)
+        score += tl.maximum(values, 0.0)
+    tl.store(
+        logits_ptr + row * stride_logits_row + absolute_columns,
+        tl.where(live, score / score_divisor, -float("inf")),
+        mask=columns < width,
+    )
 
 
 @triton.jit
@@ -682,6 +814,144 @@ def qsa_mqa_paged(
     return logits, visible_blocks
 
 
+def _qsa_indexer_cublas_shape_supported(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+) -> bool:
+    """Whether the exact Qwen3.8 single-request index shape can use cuBLAS."""
+
+    return (
+        q.dtype == torch.float16
+        and k_cache.dtype == torch.float16
+        and q.ndim == 3
+        and q.shape[1:] == (4, 128)
+        and k_cache.ndim == 4
+        and k_cache.shape[2:] == (1, 128)
+        and page_table.ndim == 2
+        and page_table.shape[0] == 1
+    )
+
+
+def _use_sm70_qsa_indexer_cublas(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+) -> bool:
+    return (
+        _SM70_INDEXER_CUBLAS
+        and current_platform.is_device_capability(70)
+        and q.shape[0] >= _SM70_INDEXER_CUBLAS_MIN_ROWS
+        and _qsa_indexer_cublas_shape_supported(q, k_cache, page_table)
+    )
+
+
+def _qsa_indexer_cublas_work_supported(rows: int, columns: int) -> bool:
+    return rows * columns >= _SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS
+
+
+def _qsa_visible_blocks(
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int,
+) -> torch.Tensor:
+    rows = query_positions.shape[0]
+    visible = torch.empty(rows, dtype=torch.int32, device=query_positions.device)
+    if rows:
+        _qsa_visible_blocks_kernel[(rows,)](
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            visible,
+            rows,
+            sequence_lengths.shape[0],
+            COMPRESS_RATIO=compress_ratio,
+            num_warps=1,
+        )
+    return visible
+
+
+def _qsa_gather_single_request_keys(
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    columns: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    keys = torch.empty(
+        (columns, k_cache.shape[3]), dtype=k_cache.dtype, device=k_cache.device
+    )
+    valid = torch.empty(columns, dtype=torch.uint8, device=k_cache.device)
+    if columns:
+        _qsa_gather_single_request_keys_kernel[(columns,)](
+            k_cache,
+            page_table[0],
+            keys,
+            valid,
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(3),
+            page_table.stride(1),
+            keys.stride(0),
+            columns,
+            k_cache.shape[0],
+            PAGE_SIZE=k_cache.shape[1],
+            PAGE_TABLE_WIDTH=page_table.shape[1],
+            HEAD_DIM=k_cache.shape[3],
+            BLOCK_D=triton.next_power_of_2(k_cache.shape[3]),
+            num_warps=4,
+        )
+    return keys, valid
+
+
+def _qsa_mqa_cublas(
+    q: torch.Tensor,
+    keys: torch.Tensor,
+    key_valid: torch.Tensor,
+    visible: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score one request with Volta Tensor Cores and a fused QSA epilogue."""
+
+    rows, num_heads, head_dim = q.shape
+    columns = keys.shape[0]
+    logits = torch.empty((rows, columns), dtype=torch.float32, device=q.device)
+    if not rows or not columns:
+        return logits, visible
+
+    q2 = q.reshape(rows * num_heads, head_dim)
+    bytes_per_column = max(1, q2.shape[0] * torch.float32.itemsize)
+    tile_columns = max(
+        256,
+        min(columns, _SM70_INDEXER_SCORE_TILE_BYTES // bytes_per_column),
+    )
+    tile_columns = max(256, tile_columns // 256 * 256)
+    for column_start in range(0, columns, tile_columns):
+        column_stop = min(column_start + tile_columns, columns)
+        width = column_stop - column_start
+        # FP16 inputs, FP32 accumulation/output. This still selects Volta HMMA
+        # through cuBLAS while avoiding an FP16 round trip before top-k.
+        scores = torch.mm(
+            q2,
+            keys[column_start:column_stop].t(),
+            out_dtype=torch.float32,
+        )
+        _qsa_relu_headsum_visible_kernel[(rows, triton.cdiv(width, 256))](
+            scores,
+            visible,
+            key_valid,
+            logits,
+            scores.stride(0),
+            scores.stride(1),
+            logits.stride(0),
+            width,
+            column_start,
+            math.sqrt(head_dim),
+            NUM_HEADS=num_heads,
+            BLOCK_N=256,
+            num_warps=4,
+        )
+    return logits, visible
+
+
 def expand_qsa_block_indices_cuda(
     block_indices: torch.Tensor,
     query_positions: torch.Tensor,
@@ -762,9 +1032,44 @@ def qsa_select_paged_tokens(
     if not rows:
         return out
 
-    columns = page_table.shape[1] * k_cache.shape[1]
+    capacity_columns = page_table.shape[1] * k_cache.shape[1]
+    score_columns = capacity_columns
     block_topk = token_topk // compress_ratio
-    rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
+    contiguous_keys: torch.Tensor | None = None
+    key_valid: torch.Tensor | None = None
+    all_visible: torch.Tensor | None = None
+    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
+        all_visible = _qsa_visible_blocks(
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+        )
+        # cuBLAS has a rectangular host-side launch shape, unlike the paged
+        # Triton kernel's device-side early exit. Bound it to this chunk's live
+        # prefix so early-context prefill does not multiply the unused 140K
+        # model-capacity tail. This is one scalar sync per QSA layer.
+        score_columns = min(
+            capacity_columns,
+            max(block_topk, int(all_visible.max().item())),
+        )
+        if _qsa_indexer_cublas_work_supported(rows, score_columns):
+            logger.info_once(
+                "Using SM70 QSA indexer prefill cuBLAS path "
+                "(single-request FP16, rows=%d, score_tile_mib=%d).",
+                rows,
+                _SM70_INDEXER_SCORE_TILE_BYTES // (1024 * 1024),
+            )
+            # Gather this request's paged MQA keys once, then reuse them across
+            # every bounded logits chunk below. Generic, short-work and
+            # multi-request batches keep the paged Triton fallback.
+            contiguous_keys, key_valid = _qsa_gather_single_request_keys(
+                k_cache, page_table, score_columns
+            )
+        else:
+            score_columns = capacity_columns
+            all_visible = None
+    rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(score_columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
     blocks_buffer = torch.empty(
         (chunk_rows, block_topk), dtype=torch.int32, device=q.device
@@ -775,15 +1080,24 @@ def qsa_select_paged_tokens(
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
-        logits, visible_blocks = qsa_mqa_paged(
-            q[row_slice],
-            k_cache,
-            page_table,
-            token_to_req[row_slice],
-            query_positions[row_slice],
-            sequence_lengths,
-            compress_ratio,
-        )
+        if contiguous_keys is not None and key_valid is not None:
+            assert all_visible is not None
+            logits, visible_blocks = _qsa_mqa_cublas(
+                q[row_slice],
+                contiguous_keys,
+                key_valid,
+                all_visible[row_slice],
+            )
+        else:
+            logits, visible_blocks = qsa_mqa_paged(
+                q[row_slice],
+                k_cache,
+                page_table,
+                token_to_req[row_slice],
+                query_positions[row_slice],
+                sequence_lengths,
+                compress_ratio,
+            )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
             blocks.shape[0] <= 32
@@ -796,7 +1110,14 @@ def qsa_select_paged_tokens(
             if use_cooperative_topk
             else torch.ops._C.persistent_topk
         )
-        topk_op(logits, visible_blocks, blocks, topk_workspace, block_topk, columns)
+        topk_op(
+            logits,
+            visible_blocks,
+            blocks,
+            topk_workspace,
+            block_topk,
+            score_columns,
+        )
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],

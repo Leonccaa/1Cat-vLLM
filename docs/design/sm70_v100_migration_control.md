@@ -68,6 +68,40 @@ Goal:
   and no non-finite values. A 128-column tile is rejected before execution
   because its `139264`-byte shared-memory requirement exceeds V100's
   `98304`-byte limit.
+- The next hotspot audit inspected the cached SM70 PTX instead of screening
+  more launch shapes blindly. Both QSA scoring kernels contain no `mma`/`wmma`
+  instructions: selected attention compiles to roughly 1026 static FP32 FMA
+  instructions, and the four-head D128 index scorer compiles to roughly 2048.
+  The latter grows with all visible compressed blocks and explains most of the
+  additional 131K decay.
+- A D256 selected-attention WMMA prototype is rejected. It has real SM70 HMMA,
+  no local-memory spill, and passes the resource gate, but measures only
+  `51.808ms` versus `55.682ms` at 8192 rows (`1.0748x`) and its output relative
+  L2 is `0.5627`. At 512 rows it is only `1.2532x`. It is neither correct nor
+  fast enough to justify a production integration or model restart.
+- The retained long-indexer candidate gathers one request's paged FP16 MQA
+  keys once, applies a cuBLAS FP16-input/FP32-output Tensor Core GEMM in a
+  bounded workspace, and fuses per-head ReLU, head sum, visibility and scale
+  into one Triton epilogue. At 1024 rows and 131K context, scoring including
+  paged gather moves from `35.767ms` to `2.108ms` (`16.964x`), with maximum
+  absolute error `8.11e-6` and relative L2 `2.90e-7`. The complete
+  score/top-k/expand path moves from `38.792ms` to `3.118ms` (`12.441x`).
+  Random stress selection sets are exact for 1023/1024 rows; the sole mismatch
+  is a boundary near-tie, and final sparse-attention cosine is `0.9999992`.
+  Production admission is limited to exact SM70, FP16 `[rows,4,128]`, FP16
+  `[pages,page,1,128]`, one request, at least 512 rows, and at least 1,048,576
+  row-column score elements; decode, short work and generic batches retain the
+  paged Triton route. The measured crossover is `0.733x` at 1K context,
+  `2.164x` at 2K, `4.900x` at 8K, `8.064x` at 16K and `11.102x` at 32K. A real
+  TP4 token-hash and quality gate remains required before this candidate is
+  accepted or reported as an endpoint improvement.
+- Raising the NVFP4 MoE tuning limit is rejected independently of the model
+  gate. Real layer-0 weights and the exact 8192-token/top-10 routing shape
+  measure default W13/W2 at `4.320/2.382ms` (`31.07/28.18 TFLOP/s`) and the
+  measured policy at `4.343/2.381ms`; combined tuning is `0.9966x`. The real
+  router distribution is highly skewed (0/58/160/2150 minimum/median/mean/
+  maximum rows per expert), but TurboMind's measured dispatch does not improve
+  it. Do not spend another startup autotuning this same shape.
 - No new GDN candidate is claimed by this follow-up. A cold standalone 8192
   token original-TileLang probe under `/usr` CUDA attempted to rebuild the
   TileLang cumsum kernel and failed in the installed TileLang BF16 fallback
