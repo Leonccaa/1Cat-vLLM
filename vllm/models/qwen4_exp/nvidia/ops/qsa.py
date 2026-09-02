@@ -11,7 +11,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
-    fp8_e4m3fn_bits_to_fp32,
+    fp8_e4m3fn_bits_to_fp32_bitcast,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
@@ -569,8 +569,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             other=0.0,
         )
         if KV_E4M3:
-            keys = (fp8_e4m3fn_bits_to_fp32(keys) * k_scale).to(query.dtype)
-            values = (fp8_e4m3fn_bits_to_fp32(values) * v_scale).to(query.dtype)
+            keys = (fp8_e4m3fn_bits_to_fp32_bitcast(keys) * k_scale).to(query.dtype)
+            values = (fp8_e4m3fn_bits_to_fp32_bitcast(values) * v_scale).to(query.dtype)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
