@@ -499,6 +499,22 @@ def test_hf_token_cli_arg(cli_args, expected):
     assert args.hf_token == expected
 
 
+def test_prefill_pressure_cli_args():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(
+        [
+            "--prefill-pressure-token-budget",
+            "768",
+            "--prefill-pressure-threshold",
+            "2",
+        ]
+    )
+    engine_args = EngineArgs.from_cli_args(args)
+
+    assert engine_args.prefill_pressure_token_budget == 768
+    assert engine_args.prefill_pressure_threshold == 2
+
+
 @pytest.mark.parametrize(
     ("arg", "expected"),
     [

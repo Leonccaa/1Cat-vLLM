@@ -122,6 +122,13 @@ class Scheduler(SchedulerInterface):
         self.adaptive_long_prefill_threshold = (
             self.scheduler_config.long_prefill_token_threshold_adaptive
         )
+        if self.scheduler_config.prefill_pressure_token_budget > 0:
+            logger.info(
+                "Prefill-pressure scheduling enabled with token_budget=%d and "
+                "active_prefill_threshold=%d.",
+                self.scheduler_config.prefill_pressure_token_budget,
+                self.scheduler_config.prefill_pressure_threshold,
+            )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.mixed_prefill_budget = MixedPrefillBudget(
             self.max_num_scheduled_tokens,
@@ -526,6 +533,31 @@ class Scheduler(SchedulerInterface):
         )
         return max(end - start, 0)
 
+    def _get_prefill_pressure_token_budget(self) -> int | None:
+        budget = self.scheduler_config.prefill_pressure_token_budget
+        if budget <= 0:
+            return None
+
+        num_running_prefills = sum(
+            request.num_computed_tokens < request.num_prompt_tokens
+            for request in self.running
+        )
+        num_running_decodes = len(self.running) - num_running_prefills
+        if num_running_decodes == 0:
+            return None
+
+        num_waiting_prefills = sum(
+            request.num_computed_tokens < request.num_prompt_tokens
+            for request in itertools.chain(self.waiting, self.skipped_waiting)
+        )
+        if (
+            num_running_prefills + num_waiting_prefills
+            < self.scheduler_config.prefill_pressure_threshold
+        ):
+            return None
+
+        return min(budget, self.max_num_scheduled_tokens)
+
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -547,6 +579,7 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        prefill_token_budget = self._get_prefill_pressure_token_budget()
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -713,6 +746,12 @@ class Scheduler(SchedulerInterface):
                     )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            is_prefill = request.num_computed_tokens < request.num_prompt_tokens
+            if is_prefill and prefill_token_budget is not None:
+                if prefill_token_budget == 0:
+                    req_index += 1
+                    continue
+                num_new_tokens = min(num_new_tokens, prefill_token_budget)
             num_new_tokens = min(num_new_tokens, token_budget)
 
             num_new_tokens = limit_prefill(request.request_id, num_new_tokens)
@@ -810,7 +849,16 @@ class Scheduler(SchedulerInterface):
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                            preempted_num_tokens = num_scheduled_tokens.pop(
+                                preempted_req_id
+                            )
+                            token_budget += preempted_num_tokens
+                            if (
+                                prefill_token_budget is not None
+                                and preempted_req.num_computed_tokens
+                                < preempted_req.num_prompt_tokens
+                            ):
+                                prefill_token_budget += preempted_num_tokens
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             scheduled_ddtree_payloads.pop(preempted_req_id, None)
@@ -845,6 +893,8 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            if is_prefill and prefill_token_budget is not None:
+                prefill_token_budget -= num_new_tokens
             req_index += 1
 
             # Speculative decode related.
@@ -1048,6 +1098,13 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    is_prefill = num_computed_tokens < request.num_prompt_tokens
+                    if is_prefill and prefill_token_budget is not None:
+                        num_new_tokens = min(num_new_tokens, prefill_token_budget)
+                        if num_new_tokens == 0:
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
                     assert num_new_tokens > 0
                     prefill_remaining[request.request_id] = max(
                         0,
@@ -1191,6 +1248,12 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                if (
+                    not load_kv_async
+                    and is_prefill
+                    and prefill_token_budget is not None
+                ):
+                    prefill_token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Encoder-related.
