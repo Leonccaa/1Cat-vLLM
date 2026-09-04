@@ -85,6 +85,32 @@ llm = LLM(model="meta-llama/Llama-3.1-8B-Instruct", max_num_batched_tokens=16384
 
 See related papers for more details (<https://arxiv.org/pdf/2401.08671> or <https://arxiv.org/pdf/2308.16369>).
 
+### Protecting Decode Under Prefill Pressure
+
+Large prefill chunks can still make active decode requests wait for the whole
+mixed batch to finish. To bound that interference without reducing the normal
+pure-prefill batch size, set `prefill_pressure_token_budget`:
+
+```bash
+vllm serve MODEL \
+    --max-num-batched-tokens 8192 \
+    --prefill-pressure-token-budget 768 \
+    --prefill-pressure-threshold 1
+```
+
+When at least one decode request is runnable and the configured number of
+prefill requests is active, the scheduler admits at most the specified number
+of aggregate prefill tokens in that iteration. Decode tokens do not consume
+this separate budget, and pure-prefill iterations retain the full
+`max_num_batched_tokens` budget. The feature is disabled by default with a
+budget of `0`.
+
+Choose the budget from a workload-specific latency/throughput sweep. A smaller
+value usually improves mixed-phase ITL but can increase long-request TTFT and
+reduce prefill throughput. The budget should be smaller than
+`max_num_batched_tokens`; hybrid models that require block-aligned prefill
+chunks may also impose a practical minimum.
+
 ## Parallelism Strategies
 
 vLLM supports multiple parallelism strategies that can be combined to optimize performance across different hardware configurations.

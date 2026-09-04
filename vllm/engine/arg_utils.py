@@ -556,6 +556,8 @@ class EngineArgs:
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
+    prefill_pressure_token_budget: int = SchedulerConfig.prefill_pressure_token_budget
+    prefill_pressure_threshold: int = SchedulerConfig.prefill_pressure_threshold
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
@@ -1427,6 +1429,14 @@ class EngineArgs:
             "--long-prefill-token-threshold",
             **scheduler_kwargs["long_prefill_token_threshold"],
         )
+        scheduler_group.add_argument(
+            "--prefill-pressure-token-budget",
+            **scheduler_kwargs["prefill_pressure_token_budget"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-pressure-threshold",
+            **scheduler_kwargs["prefill_pressure_threshold"],
+        )
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
         scheduler_group.add_argument(
@@ -2285,6 +2295,8 @@ class EngineArgs:
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
+            prefill_pressure_token_budget=self.prefill_pressure_token_budget,
+            prefill_pressure_threshold=self.prefill_pressure_threshold,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,

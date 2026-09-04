@@ -81,6 +81,15 @@ class SchedulerConfig:
     """For chunked prefill, a request is considered long if the prompt is
     longer than this number of tokens."""
 
+    prefill_pressure_token_budget: int = Field(default=0, ge=0)
+    """Maximum aggregate prefill tokens scheduled in one iteration while
+    decode work is runnable and the active-prefill count reaches
+    ``prefill_pressure_threshold``. Zero disables pressure-based limiting."""
+
+    prefill_pressure_threshold: int = Field(default=1, ge=1)
+    """Number of active prefill requests required before applying
+    ``prefill_pressure_token_budget`` while decode work is runnable."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.
@@ -308,5 +317,20 @@ class SchedulerConfig:
                 f"{self.max_long_partial_prefills=} must be less than or equal to "
                 f"{self.max_num_partial_prefills=}."
             )
+
+        if self.prefill_pressure_token_budget > 0:
+            if not self.enable_chunked_prefill:
+                raise ValueError(
+                    "Chunked prefill must be enabled to set "
+                    "prefill_pressure_token_budget > 0."
+                )
+            if self.prefill_pressure_token_budget >= self.max_num_batched_tokens:
+                logger.warning(
+                    "prefill_pressure_token_budget=%d is greater than or equal "
+                    "to max_num_batched_tokens=%d, so it cannot reduce mixed "
+                    "prefill/decode interference.",
+                    self.prefill_pressure_token_budget,
+                    self.max_num_batched_tokens,
+                )
 
         return self
