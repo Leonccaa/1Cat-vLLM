@@ -613,7 +613,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "awq_moe_active_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor permuted_experts_id, "
-      "Tensor active_expert_offsets, Tensor active_expert_ids, Tensor ptrs_w, "
+      "Tensor(b!) active_expert_offsets, Tensor(c!) active_expert_ids, Tensor "
+      "ptrs_w, "
       "Tensor ptrs_s, int total_slots, int k, int n, int group_size) -> ()");
   ops.impl("awq_moe_active_dense_stage_sm70_out", torch::kCUDA,
            &awq_moe_active_dense_stage_sm70_out);

@@ -78,6 +78,37 @@ def _log_runtime_route_once(message: str, *args) -> None:
     logger.info_once(message, *args)
 
 
+def _qwen38_active_grouped_layer_contract(
+    layer: RoutedExperts, group_size: int
+) -> bool:
+    return bool(
+        int(layer.moe_config.tp_size) == 4
+        and layer.sm70_num_experts == 512
+        and group_size == 32
+        and layer.sm70_hidden_logical_size == layer.sm70_w13_k_dim == 2560
+        and layer.sm70_w13_n_dim == 320
+        and layer.sm70_w2_k_dim == 160
+        and layer.sm70_w2_n_dim == 2560
+    )
+
+
+def _use_qwen38_active_grouped_decode(
+    layer: RoutedExperts, num_tokens: int, top_k: int
+) -> bool:
+    """Share the runtime admission policy with pre-capture warmup."""
+    max_tokens = envs.VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS
+    return bool(
+        getattr(layer, "sm70_awq_qwen38_active_grouped_decode", False)
+        and layer.sm70_awq_moe_batched_gemm
+        and 2 <= num_tokens <= 8
+        and top_k == 10
+        and (max_tokens <= 0 or num_tokens <= max_tokens)
+        and not envs.VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13
+        and not envs.VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2
+        and not envs.VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2
+    )
+
+
 def _use_temporary_buffers_for_dummy_or_capture() -> bool:
     # Dummy/profile and CUDA graph capture allocate temporary tensors. Captured
     # addresses subsequently remain fixed in the graph pool; normal eager
@@ -803,6 +834,10 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             and indexed_prefill_requested
             and indexed_prefill_available
         )
+        layer.sm70_awq_qwen38_active_grouped_decode = bool(
+            envs.VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE
+            and _qwen38_active_grouped_layer_contract(layer, self.group_size)
+        )
 
         self._allocate_buffers(layer)
         del layer.w13_qweight, layer.w13_scales, layer.w13_qzeros
@@ -1469,7 +1504,9 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         use_batched_moe_gemm = route_plan.use_batched_moe_gemm
         use_batched_active_exact_w2 = route_plan.use_batched_active_exact_w2
         use_batched_exact_w2 = route_plan.use_batched_exact_w2
-        use_active_exact_small_batched_moe = False
+        use_active_exact_small_batched_moe = _use_qwen38_active_grouped_decode(
+            layer, num_tokens, top_k
+        )
         compare_dense_step = None
         compare_dense_w13_stats = None
         compare_dense_w2_stats = None
@@ -1504,16 +1541,16 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             )
         elif use_active_exact_small_batched_moe:
             _log_runtime_route_once(
-                "SM70 AWQ MoE batched path using active-route exact "
-                "dense-stage route (tokens=%d, routes=%d).",
+                "SM70 Qwen3.8 AWQ active grouped decode (tokens=%d, routed_slots=%d).",
                 num_tokens,
                 total_slots,
             )
-            sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
+            sm70_ops.awq_moe_active_dense_stage_sm70_out(
                 buffers["gate_up"],
                 buffers["permuted_input"],
-                buffers["active_expert_offsets"],
                 buffers["permuted_experts_id"],
+                buffers["active_expert_offsets"],
+                buffers["sorted_expert_ids"],
                 layer.w13_strided_ptrs_w,
                 layer.w13_strided_ptrs_s,
                 total_slots,
@@ -1521,6 +1558,21 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_n_dim,
                 self.group_size,
             )
+            if compare_dense_step is not None:
+                dense_gate_up = torch.empty_like(buffers["gate_up"])
+                sm70_ops.awq_moe_dense_stage_sm70_out(
+                    dense_gate_up,
+                    buffers["permuted_input"],
+                    buffers["expert_offsets"],
+                    layer._awq_moe_buf_dense_expert_ids,
+                    layer.w13_strided_ptrs_w,
+                    layer.w13_strided_ptrs_s,
+                    layer.sm70_num_experts,
+                    layer.sm70_w13_k_dim,
+                    layer.sm70_w13_n_dim,
+                    self.group_size,
+                )
+                compare_dense_w13_stats = _diff_stats(buffers["gate_up"], dense_gate_up)
         elif route_plan.w13 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
             _log_runtime_route_once(
                 "SM70 AWQ MoE batched W13 using per-expert dispatch "
@@ -1587,20 +1639,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         buffers["intermediate"] = _dump_awq_moe_buffer(
             layer, buffers["intermediate"], "silu_out"
         )
-        if use_active_exact_small_batched_moe:
-            sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
-                buffers["sorted_output"],
-                buffers["intermediate"],
-                buffers["active_expert_offsets"],
-                buffers["permuted_experts_id"],
-                layer.w2_strided_ptrs_w,
-                layer.w2_strided_ptrs_s,
-                total_slots,
-                layer.sm70_w2_k_dim,
-                layer.sm70_w2_n_dim,
-                self.group_size,
-            )
-        elif use_batched_active_exact_w2:
+        if use_active_exact_small_batched_moe or use_batched_active_exact_w2:
             _log_runtime_route_once(
                 "SM70 AWQ MoE batched path using grouped-active exact W2 (routes=%d).",
                 total_slots,
