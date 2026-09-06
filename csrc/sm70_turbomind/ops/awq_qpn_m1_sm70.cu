@@ -25,7 +25,7 @@ constexpr int kExperts = 512;
 constexpr int kRoutes = 10;
 constexpr int kSplit = 16;
 
-// Formats: existing 3B scalar (0) / 4B scale+bias metadata (2).
+// Modes: existing 3B scalar / 3B cooperative / 4B scale+bias metadata.
 template <int Format>
 __device__ __forceinline__ uint32_t read_awq_stats(const uint8_t* stats,
                                                    int group, int tile, int col,
@@ -34,6 +34,19 @@ __device__ __forceinline__ uint32_t read_awq_stats(const uint8_t* stats,
   if constexpr (Format == 2) {
     return __ldg(reinterpret_cast<const uint32_t*>(stats) + group * n +
                  tile * 32 + col);
+  } else if constexpr (Format == 1) {
+    const int lane = threadIdx.x & 31;
+    const auto* words = reinterpret_cast<const uint32_t*>(
+        stats + (static_cast<size_t>(group) * n + tile * 32) * 3);
+    const uint32_t word = lane < 24 ? __ldg(words + lane) : 0;
+    const int byte = col * 3;
+    const int shift = (byte & 3) * 8;
+    const uint32_t lo = __shfl_sync(0xffffffffu, word, byte >> 2);
+    // No out-of-range load/shuffle for the last (offset 93) record.
+    const uint32_t hi =
+        __shfl_sync(0xffffffffu, word, (byte >> 2) + (shift > 8));
+    bits = lo >> shift;
+    if (shift > 8) bits |= hi << (32 - shift);
   } else {
     const auto* record =
         stats + (static_cast<size_t>(group) * n + tile * 32 + col) * 3;
@@ -334,7 +347,7 @@ void awq_moe_qpn_m1_sm70_out(at::Tensor out, at::Tensor intermediate,
   const auto stream = at::cuda::getCurrentCUDAStream();
   // Reuse the prepared bank; no load-time repack or additional weight copy.
   if (compact) {
-    launch<0, 0>(input, w13, s13, w2, s2, ids, topk, intermediate, out, stream);
+    launch<1, 0>(input, w13, s13, w2, s2, ids, topk, intermediate, out, stream);
   } else {
     launch<2, 2>(input, w13, s13, w2, s2, ids, topk, intermediate, out, stream);
   }

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +15,9 @@ import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
+from vllm.model_executor.layers.quantization.awq_sm70_moe import (
+    _use_qwen38_active_grouped_decode,
+)
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     _prepare_compact_slot_groups,
     _use_compact_grouped,
@@ -613,6 +616,23 @@ def _warmup_moe_dense_stage_layers(
         for num_tokens in token_counts:
             total_slots = num_tokens * top_k
             expert_offsets = _build_balanced_offsets(total_slots, num_experts, device)
+            active_grouped = _use_qwen38_active_grouped_decode(layer, num_tokens, top_k)
+            stage_op: Callable[..., None] = sm70_ops.awq_moe_dense_stage_sm70_out
+            stage_metadata: tuple[torch.Tensor, ...] = (
+                expert_offsets,
+                dense_expert_ids,
+            )
+            stage_experts = num_experts
+            if active_grouped:
+                # One row per expert warms the same dynamic-offset GEMM used
+                # when repeated experts form multi-row segments at replay.
+                stage_op = sm70_ops.awq_moe_active_dense_stage_sm70_out
+                stage_metadata = (
+                    dense_expert_ids[:total_slots],
+                    torch.empty(total_slots + 1, dtype=torch.int32, device=device),
+                    torch.empty(total_slots, dtype=torch.int32, device=device),
+                )
+                stage_experts = total_slots
             permuted_input = torch.empty(
                 (total_slots, int(layer.sm70_w13_k_dim)),
                 dtype=torch.float16,
@@ -634,27 +654,25 @@ def _warmup_moe_dense_stage_layers(
                 device=device,
             )
 
-            sm70_ops.awq_moe_dense_stage_sm70_out(
+            stage_op(
                 gate_up,
                 permuted_input,
-                expert_offsets,
-                dense_expert_ids,
+                *stage_metadata,
                 layer.w13_strided_ptrs_w,
                 layer.w13_strided_ptrs_s,
-                num_experts,
+                stage_experts,
                 int(layer.sm70_w13_k_dim),
                 int(layer.sm70_w13_n_dim),
                 group_size,
             )
             _silu_and_mul_w13(layer, intermediate, gate_up)
-            sm70_ops.awq_moe_dense_stage_sm70_out(
+            stage_op(
                 sorted_output,
                 intermediate,
-                expert_offsets,
-                dense_expert_ids,
+                *stage_metadata,
                 layer.w2_strided_ptrs_w,
                 layer.w2_strided_ptrs_s,
-                num_experts,
+                stage_experts,
                 int(layer.sm70_w2_k_dim),
                 int(layer.sm70_w2_n_dim),
                 group_size,

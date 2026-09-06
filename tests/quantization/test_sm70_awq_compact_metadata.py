@@ -8,6 +8,7 @@ import pytest
 from vllm import envs
 from vllm.model_executor.layers.quantization.awq_sm70_moe import (
     _is_qwen38_tp4_compact_metadata_shape,
+    _resolve_compact_metadata,
 )
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -28,8 +29,36 @@ def _layer(
     )
 
 
-def test_awq_compact_metadata_is_default_off() -> None:
+def test_awq_compact_metadata_is_default_on(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_SM70_AWQ_MOE_COMPACT_METADATA", raising=False)
+    assert envs.VLLM_SM70_AWQ_MOE_COMPACT_METADATA is True
+    monkeypatch.setenv("VLLM_SM70_AWQ_MOE_COMPACT_METADATA", "0")
     assert envs.VLLM_SM70_AWQ_MOE_COMPACT_METADATA is False
+
+
+def test_awq_compact_metadata_default_falls_back_when_unsupported() -> None:
+    resolve = _resolve_compact_metadata
+    assert resolve(requested=True, explicit=False, native_available=True, shape_ok=True)
+    assert not resolve(
+        requested=True, explicit=False, native_available=False, shape_ok=True
+    )
+    assert not resolve(
+        requested=True, explicit=False, native_available=True, shape_ok=False
+    )
+    assert not resolve(
+        requested=False, explicit=True, native_available=True, shape_ok=True
+    )
+
+
+def test_awq_compact_metadata_explicit_request_fails_closed() -> None:
+    with pytest.raises(RuntimeError, match="awq_sm70_prepare_compact"):
+        _resolve_compact_metadata(
+            requested=True, explicit=True, native_available=False, shape_ok=True
+        )
+    with pytest.raises(RuntimeError, match="Qwen3.8 TP4"):
+        _resolve_compact_metadata(
+            requested=True, explicit=True, native_available=True, shape_ok=False
+        )
 
 
 def test_awq_compact_metadata_shape_gate_accepts_qwen38_tp4() -> None:

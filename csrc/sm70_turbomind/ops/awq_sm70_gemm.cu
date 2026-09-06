@@ -8405,6 +8405,23 @@ void awq_moe_active_dense_stage_sm70_out(
       "SM70 AWQ MoE active dense-stage path enabled C++ op reached", input,
       total_slots, total_slots);
 
+  // Reuse the active-segment ABI for the narrow Qwen3.8 TP4 decode shapes.
+  // Equal trailing offsets describe empty groups; nonempty groups may contain
+  // multiple rows. Keep offsets-based scheduling (not one-row slot dispatch).
+  const char* grouped =
+      std::getenv("VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE");
+  const char* exact_w2 =
+      std::getenv("VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2");
+  if ((grouped == nullptr || std::atoi(grouped) != 0) &&
+      (exact_w2 == nullptr || std::atoi(exact_w2) == 0) && group_size == 32 &&
+      total_slots >= 20 && total_slots <= 80 && total_slots % 10 == 0 &&
+      ((k == 2560 && n == 320) || (k == 160 && n == 2560))) {
+    awq_moe_gemm_sm70_out_impl(out, input, active_expert_offsets, ptrs_w,
+                               ptrs_s, total_slots, k, n, group_size, false,
+                               active_expert_ids, true);
+    return;
+  }
+
   for (int segment = 0; segment < static_cast<int>(total_slots); ++segment) {
     torch::Tensor offsets = active_expert_offsets.narrow(0, segment, 2);
     torch::Tensor expert_idx = active_expert_ids.narrow(0, segment, 1);

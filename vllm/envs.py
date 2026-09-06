@@ -119,12 +119,14 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_MOE_DISABLE: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL: bool = True
+    VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE: bool = True
+    VLLM_SM70_AWQ_QWEN38_QPN_M1: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS: int = 0
     VLLM_SM70_AWQ_MOE_PERSISTENT_MAX_TOKENS: int = 0
-    VLLM_SM70_AWQ_MOE_COMPACT_METADATA: bool = False
+    VLLM_SM70_AWQ_MOE_COMPACT_METADATA: bool = True
     VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST: str | None = None
     VLLM_SM70_AWQ_MOE_BATCHED_LAYER_DENYLIST: str | None = None
     VLLM_SM70_AWQ_MOE_COMPARE_DENSE_DIR: str | None = None
@@ -1662,6 +1664,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL", "1"))
     ),
+    # Qwen3.8 TP4 g32 small-batch MoE: group active expert segments through
+    # the existing active-stage op. Set to 0 before startup for the old route.
+    "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE": lambda: bool(
+        int(os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE", "1"))
+    ),
+    # Opt-in Qwen3.8 TP4/native-g32 single-token W13/W2 QPN route.
+    # Keeps prepared metadata and FP16 boundaries, but changes reduction order.
+    "VLLM_SM70_AWQ_QWEN38_QPN_M1": lambda: (
+        env_with_choices("VLLM_SM70_AWQ_QWEN38_QPN_M1", "0", ["0", "1"])() == "1"
+    ),
     "VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13", "0"))
     ),
@@ -1682,9 +1694,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Exact Qwen3.8 TP4 AWQ experiment: persist each per-group statistic as
     # {FP16 scale, uint8 zero} and reconstruct the FP16 bias in the SM70
-    # iterator. Keep opt-in until model-level latency has been accepted.
+    # iterator. Default on for the supported Qwen3.8 TP4 E512 native-g32 shape;
+    # unsupported builds or shapes fall back to the 4-byte layout unless the
+    # variable is set explicitly, which fails closed. Set to 0 for 4-byte.
     "VLLM_SM70_AWQ_MOE_COMPACT_METADATA": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_MOE_COMPACT_METADATA", "0"))
+        int(os.getenv("VLLM_SM70_AWQ_MOE_COMPACT_METADATA", "1"))
     ),
     "VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST": lambda: os.getenv(
         "VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST", None
