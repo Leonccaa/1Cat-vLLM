@@ -49,6 +49,17 @@ retains `half_fma(q, scale, half(-zero * scale))`; replacing this with
 
 ## Numerical boundary and tests
 
+The acceptance objective is **controlled additional numerical perturbation**.
+Both implementations approximate the same computation; legacy output is not
+ground truth. Holding the AWQ checkpoint fixed separates the arithmetic
+change from the quantization error already present in both paths. Compare
+each path against the same independently decoded-weight/FP64 reference,
+then assess their paired differences and task-level behavior. This does not
+measure either path's error against the original unquantized model.
+Passing the retained local bounds means both paths have bounded error on
+the tested inputs, not that their errors are identical or cancel. Whole-model
+quality and amplification across states/routing remain separate checks.
+
 The CTA-local reduction changes FP32 summation order relative to the legacy
 TurboMind split-K route. Bitwise equality to legacy AWQ is not promised, and
 neither path is declared the mathematical reference merely because it existed
