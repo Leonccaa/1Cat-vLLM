@@ -13,6 +13,19 @@ IDs. For an existing audited corpus, pass both `--corpus-manifest` and
 `--processor-audit-jsonl`; every processor tensor hash must match before an
 output is created.
 
+`qsa_long_corpus.py` builds disjoint 16K/64K/128K raw-token shards from pinned
+long-document sources. At least one quality manifest is mandatory. The builder
+refuses output if a 64-token rolling shingle overlaps any supplied quality
+prompt.
+
+`qsa_tool_corpus.py` creates deterministic calibration-only tool selection,
+tool result, and multi-turn records. It is not a quality set.
+
+`qsa_kv_quality.py` freezes long-retrieval, held-out tool-selection, and page4
+trace prompts into exact token IDs. Its API runner requires the server to echo
+identical prompt IDs and records deterministic output IDs, correctness,
+latency, first-token agreement, and repeat stability for matched KV modes.
+
 `qsa_kv_calibration.py collect` runs the final checkpoint through the normal
 offline inference engine with FP16 KV. The `COLLECTING` marker is created only
 after engine initialization, excluding dummy/profile/graph-capture forwards.
