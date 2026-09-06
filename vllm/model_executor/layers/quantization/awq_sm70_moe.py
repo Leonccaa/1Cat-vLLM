@@ -21,6 +21,10 @@ from vllm.model_executor.layers.fused_moe import (
     SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.quantization.awq_qpn_sm70 import (
+    initialize_qpn_m1,
+    use_qpn_m1,
+)
 from vllm.model_executor.layers.quantization.sm70_moe_router import (
     Sm70MoeStageRoute,
     select_sm70_quantized_moe_route,
@@ -838,6 +842,9 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             envs.VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE
             and _qwen38_active_grouped_layer_contract(layer, self.group_size)
         )
+        layer.sm70_awq_qwen38_qpn_m1 = initialize_qpn_m1(
+            layer, _qwen38_active_grouped_layer_contract(layer, self.group_size)
+        )
 
         self._allocate_buffers(layer)
         del layer.w13_qweight, layer.w13_scales, layer.w13_qzeros
@@ -1172,6 +1179,23 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         top_k: int,
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if use_qpn_m1(layer, x, topk_weights, topk_ids_i32):
+            _log_runtime_route_once(
+                "SM70 AWQ Qwen3.8 QPN M1 W13/W2 enabled "
+                "(existing prepared banks, direct route order)."
+            )
+            sm70_ops.awq_moe_qpn_m1_sm70_out(
+                output,
+                buffers["intermediate"],
+                x,
+                layer.w13_tm_weight,
+                layer.w13_tm_scales,
+                layer.w2_tm_weight,
+                layer.w2_tm_scales,
+                topk_ids_i32,
+                topk_weights,
+            )
+            return output
         _log_runtime_route_once(
             "SM70 AWQ MoE legacy single-token monolithic compact path enabled "
             "(top_k=%d, experts=%d).",

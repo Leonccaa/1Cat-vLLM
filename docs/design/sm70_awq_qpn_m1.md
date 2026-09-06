@@ -67,3 +67,112 @@ explicit FP16 rounding allowance, changing CUDA Graph inputs, duplicate and
 invalid expert IDs, aliased/misaligned arguments, and the registered fake op.
 It requires SM70; a CPU skip is not a GPU test pass. Shape-specific kernel
 tests do not by themselves establish full-model quality or throughput.
+
+## Runtime layer
+
+`VLLM_SM70_AWQ_QWEN38_QPN_M1=1` opts in at model initialization. The default
+is `0`; other values are rejected. Use a native build containing the operator
+and restart the engine after changing the setting, including for rollback.
+Changing an environment variable does not replace an already captured graph.
+There is no research sidecar, runtime compilation or external DSO loader.
+
+Admission requires the existing TP4/E512/native-group-32 geometry, batched
+TurboMind weights, interleaved W13 and the legacy single-token compact path.
+Both the checkpoint and prepared group sizes must be 32. An explicit opt-in
+with an unsupported layer contract or missing native operator fails closed.
+At execution, only contiguous FP16 `(1, 2560)` inputs with ten INT32 expert
+IDs and FP32 router weights select QPN. Other physical batch sizes, including
+padded CUDA Graph batches, retain their existing route. This does not change
+grouped decode, prefill, attention, shared experts, router selection or MTP.
+The existing prepared banks and per-call buffers are passed by reference.
+
+Run CPU admission and neighboring dispatch tests:
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/quantization/test_awq_qpn_sm70.py \
+  tests/quantization/test_sm70_awq_active_grouped_decode.py \
+  tests/quantization/test_sm70_awq_indexed_prefill.py \
+  tests/quantization/test_sm70_awq_compact_metadata.py
+```
+
+### Validation snapshot and limitations
+
+The September 5-6, 2026 investigation used four V100s, TP4/MTP0, the same
+native-group-32 AWQ checkpoint and frozen prompt token IDs, FP16 activations
+and KV, 4-byte metadata, prefix caching off, and `ignore_eos=false`. The
+runtime inherited the separate grouped-decode change and used a separate
+QSA page4 logical-order fix in both arms. Those are baseline dependencies,
+not changes made by this proposal. Raw artifacts distinguish the built core,
+Python sources, QSA extension, checkpoint, tokenizer and evaluation tools.
+
+Uninstrumented full-model cells were each measured once with an output limit
+of 320 tokens; these are observations, not confidence intervals. The metric
+below is aggregate **pure-decode** throughput, excluding prefill overlap:
+
+| Workload | QPN off (tok/s) | QPN on (tok/s) |
+| --- | --- | --- |
+| C1 x 64K | 50.0326 | 59.0313 |
+| C4 x 64K | 131.3485 | 129.5357 |
+| C8 x 16K | 246.3619 | 245.7809 |
+
+The separate NVFP4 reference was 60.2609 tok/s for C1 x 64K: about a 2.04%
+gap, not exact parity. All these full-model numbers use 4-byte metadata;
+they must not be attributed to cooperative 3-byte metadata loading. The
+older 54.6544 tok/s baseline and its 68.3180 tok/s (+25%) research target
+remain distinct from this paired experiment; that target is not achieved.
+Instrumented dual-path diagnostic timings are not performance measurements.
+
+The initial cross-process quality pair had an IFEval pass-to-fail change
+(4/5 to 3/5); its unchanged-route controls also differed, so it could not
+isolate QPN as the cause. A later same-runtime 65-case pair recorded:
+
+| Evaluation subset | QPN off | QPN on |
+| --- | --- | --- |
+| HumanEval | 5/5 | 5/5 |
+| MBPP | 4/5 | 4/5 |
+| IFEval strict | 3/5 | 4/5 |
+| GSM8K | 29/32 | 28/32 |
+| Tool selection | 10/12 | 10/12 |
+| Needle retrieval | 6/6 | 6/6 |
+
+There was one GSM regression and one IFEval improvement; 47/65 output token
+streams were exact. This is **not** a zero-regression or statistically
+non-inferior quality result. The original budgets and failed cases remain
+part of the evidence, rather than being replaced by the focused diagnostic.
+
+For attribution, the focused same-process/same-graph experiment executed
+both local MoE implementations on identical inputs/routes and selected the
+returned output with a device flag. Shapes were prewarmed and GEMM LUTs
+remained fixed. Same-arm repeats and unchanged-route C4 controls were exact.
+Independent checkpoint/FP64 checks covered 1,152 captured layer/rank/arm
+samples at three fixed prefixes; both paths' W13 and W2 passed the retained
+rounding bounds. Neither implementation was used as the other's oracle.
+
+The GSM first divergence occurred at index 120, where the legacy logits for
+token IDs 4003 and 16526 were exactly tied at 21.59375. The focused legacy
+run also reproduced the earlier QPN failed answer at the unchanged 256-token
+budget. This supports numerical trajectory variation, not a demonstrated
+kernel defect. It does not make a truncated or incorrect answer acceptable
+by definition.
+
+Teacher forcing prevents different sampled prefixes from confounding the
+comparison; it does not force hidden states or expert membership to match.
+At the captured 64K step, 13/48 layers changed expert membership while each
+selection respected its own scores. The first change reversed a 0.01171875
+score margin. Global logit differences can therefore be larger than local
+rounding errors. The focused 64K maximum was 1.751953, and an earlier full
+trace reached 5.052734; these are not described as a few ULPs. Not every
+historical worst-logit step was captured for independent local replay.
+
+The analysis tool was also corrected to use `argmax`, not the first index
+from `topk(2)`, for the greedy tie rule. Reanalysis found an IFEval flip at
+index 80 where QPN's top two logits tie; an earlier short-prompt flip was
+a tie-order reporting artifact. Raw tensors and task scores did not change.
+
+Current scope is an opt-in review proposal. The tested local numerical
+evidence does not justify rewriting the kernel solely to reproduce legacy
+tokens, but broad quality non-inferiority and production readiness remain
+unproven. Future acceptance must retain task-level quality checks alongside
+numerical bounds; neither single-question changes nor their aggregate
+cancellation alone settle that decision.
