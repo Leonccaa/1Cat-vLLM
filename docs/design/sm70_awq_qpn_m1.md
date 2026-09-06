@@ -42,8 +42,9 @@ other or any input. Negative or out-of-range expert IDs contribute zero;
 duplicate valid expert IDs retain their separate router weights.
 
 The 4-byte layout stores the existing FP16 scale and rounded FP16 bias.
-The 3-byte layout stores a FP16 scale and UINT8 zero point, read scalarly in
-this layer. Bias is reconstructed at the same FP16 boundary. Dequantization
+The 3-byte layout stores a FP16 scale and UINT8 zero point. The kernel-only
+base reads it scalarly; the independent cooperative-load layer below changes
+only W13 metadata reads. Bias is reconstructed at the same FP16 boundary. Dequantization
 retains `half_fma(q, scale, half(-zero * scale))`; replacing this with
 `half((q - zero) * scale)` is not an equivalent rounding contract.
 
@@ -187,3 +188,22 @@ tokens, but broad quality non-inferiority and production readiness remain
 unproven. Future acceptance must retain task-level quality checks alongside
 numerical bounds; neither single-question changes nor their aggregate
 cancellation alone settle that decision.
+
+## Cooperative 3-byte metadata layer
+
+W13 loads one 96-byte tile using 24 aligned 32-bit loads per warp, then
+shuffles the packed words to reconstruct each lane's 3-byte record. The last
+record (byte offset 93) needs no read or shuffle beyond the 24 loaded words.
+W2 keeps the scalar 3-byte reader; the 4-byte path is unchanged. Weight
+layout, bias reconstruction, MMA order and all rounding boundaries remain
+identical to the kernel-only base. No new runtime option or resident buffer
+is introduced.
+
+The scalar and cooperative builds each passed the same two portable SM70
+GPU tests and 256 real-checkpoint/dynamic-graph comparisons to the validated
+prototype, with 72 independent FP64 stage checks and no rounding-bound
+violations per build. A single-layer graph probe measured 21.5280 us for
+scalar 3-byte W13/W2 and 20.6160 us for the cooperative build (about 4.2%
+lower); this is a component observation, not a model-level speedup claim.
+The full-model results above use 4-byte metadata and cannot validate or
+measure deployment of the cooperative 3-byte path.
