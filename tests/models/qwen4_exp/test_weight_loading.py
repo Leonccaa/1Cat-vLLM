@@ -293,7 +293,15 @@ def test_only_qsa_main_cache_scales_move_to_the_merged_owner(
     assert _remap_qsa_cache_scale_name(checkpoint_name, frozenset({0})) == model_name
 
 
-def test_qsa_e4m3_loader_requires_all_24_scales() -> None:
+@pytest.mark.skip_global_cleanup
+def test_qsa_e4m3_loader_requires_all_24_scales(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        qwen4_exp_model.envs,
+        "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES",
+        True,
+    )
     required = {
         f"layers.{layer}.self_attn.{kind}_scale"
         for layer in range(12)
@@ -412,6 +420,44 @@ def test_qsa_e4m3_skips_scale_gate_in_ple_offload_process(
     assert not attention._qsa_kv_scales_finalized
     assert attention.k_scale.item() == -1.0
     assert attention.v_scale.item() == -1.0
+
+
+@pytest.mark.skip_global_cleanup
+def test_qsa_e4m3_finalizes_uncalibrated_speculative_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = nn.Module()
+    attention = Qwen4ExpQSAAttention.__new__(Qwen4ExpQSAAttention)
+    nn.Module.__init__(attention)
+    attention.kv_cache_dtype = "fp8_e4m3"
+    attention.layer_name = "mtp.layers.48.self_attn.attn"
+    attention._qsa_kv_scales_finalized = False
+    attention.register_buffer("_k_scale", torch.tensor(1.0))
+    attention.register_buffer("_v_scale", torch.tensor(1.0))
+    attention.register_buffer("_q_scale", torch.tensor(1.0))
+    attention.register_buffer("_prob_scale", torch.tensor(1.0))
+    attention.k_scale = nn.Parameter(torch.tensor(-1.0), requires_grad=False)
+    attention.v_scale = nn.Parameter(torch.tensor(-1.0), requires_grad=False)
+    model.attention = attention
+    monkeypatch.setattr(qwen4_exp_model, "is_offload_process", lambda: False)
+    monkeypatch.setattr(
+        qwen4_exp_model.envs,
+        "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES",
+        True,
+    )
+
+    _finalize_qsa_e4m3_scale_load(
+        model,
+        set(),
+        "fp8_e4m3",
+        allow_uncalibrated_speculative_draft=True,
+    )
+
+    assert attention._qsa_kv_scales_finalized
+    assert not hasattr(attention, "k_scale")
+    assert not hasattr(attention, "v_scale")
+    assert attention._k_scale.item() == 1.0
+    assert attention._v_scale.item() == 1.0
 
 
 def test_loader_skips_final_mixer_on_non_last_pp_rank(monkeypatch) -> None:

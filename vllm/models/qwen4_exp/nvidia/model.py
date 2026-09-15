@@ -195,7 +195,11 @@ def _validate_qsa_e4m3_scale_load(
 
 
 def _finalize_qsa_e4m3_scale_load(
-    model: nn.Module, loaded: set[str], cache_dtype: str
+    model: nn.Module,
+    loaded: set[str],
+    cache_dtype: str,
+    *,
+    allow_uncalibrated_speculative_draft: bool = False,
 ) -> None:
     if cache_dtype not in ("fp8", "fp8_e4m3"):
         return
@@ -212,7 +216,23 @@ def _finalize_qsa_e4m3_scale_load(
     required_scales = {
         f"{name}.{kind}_scale" for name in qsa_modules for kind in ("k", "v")
     }
-    missing_scales = _validate_qsa_e4m3_scale_load(required_scales, loaded, cache_dtype)
+    if allow_uncalibrated_speculative_draft:
+        missing_scales = required_scales - loaded
+        if missing_scales:
+            # The standalone MTP shard set predates the target KV scale overlay.
+            # Unit draft scales can lower proposal acceptance, but target-model
+            # verification still owns every token admitted to the output.
+            logger.warning_once(
+                "QSA E4M3 speculative draft has %d/%d calibrated K/V scales; "
+                "using unit scales for the missing draft entries. Target-model "
+                "scale validation remains strict.",
+                len(required_scales) - len(missing_scales),
+                len(required_scales),
+            )
+    else:
+        missing_scales = _validate_qsa_e4m3_scale_load(
+            required_scales, loaded, cache_dtype
+        )
     if not missing_scales:
         logger.info_once(
             "QSA E4M3 calibrated scale gate passed: loaded %d/%d K/V scales.",

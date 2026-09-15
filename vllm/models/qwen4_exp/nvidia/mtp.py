@@ -65,6 +65,7 @@ from .model import (
     _QWEN4_EXP_IGNORED_MISSING_SUFFIXES,
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
+    _finalize_qsa_e4m3_scale_load,
 )
 
 
@@ -564,6 +565,12 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             )
         )
         _validate_mtp_expert_weights_loaded(self, loaded_weights)
+        _finalize_qsa_e4m3_scale_load(
+            self,
+            loaded_weights,
+            self.vllm_config.cache_config.cache_dtype,
+            allow_uncalibrated_speculative_draft=True,
+        )
         return loaded_weights
 
 
