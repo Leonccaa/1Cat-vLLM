@@ -569,7 +569,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             self,
             loaded_weights,
             self.vllm_config.cache_config.cache_dtype,
-            allow_uncalibrated_speculative_draft=True,
+            require_calibrated_speculative_draft=True,
         )
         return loaded_weights
 

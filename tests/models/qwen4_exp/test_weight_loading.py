@@ -423,7 +423,7 @@ def test_qsa_e4m3_skips_scale_gate_in_ple_offload_process(
 
 
 @pytest.mark.skip_global_cleanup
-def test_qsa_e4m3_finalizes_uncalibrated_speculative_draft(
+def test_qsa_e4m3_rejects_uncalibrated_speculative_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = nn.Module()
@@ -446,18 +446,17 @@ def test_qsa_e4m3_finalizes_uncalibrated_speculative_draft(
         True,
     )
 
-    _finalize_qsa_e4m3_scale_load(
-        model,
-        set(),
-        "fp8_e4m3",
-        allow_uncalibrated_speculative_draft=True,
-    )
+    with pytest.raises(ValueError, match="set speculative_config.kv_cache_dtype"):
+        _finalize_qsa_e4m3_scale_load(
+            model,
+            set(),
+            "fp8_e4m3",
+            require_calibrated_speculative_draft=True,
+        )
 
-    assert attention._qsa_kv_scales_finalized
-    assert not hasattr(attention, "k_scale")
-    assert not hasattr(attention, "v_scale")
-    assert attention._k_scale.item() == 1.0
-    assert attention._v_scale.item() == 1.0
+    assert not attention._qsa_kv_scales_finalized
+    assert attention.k_scale.item() == -1.0
+    assert attention.v_scale.item() == -1.0
 
 
 def test_loader_skips_final_mixer_on_non_last_pp_rank(monkeypatch) -> None:
