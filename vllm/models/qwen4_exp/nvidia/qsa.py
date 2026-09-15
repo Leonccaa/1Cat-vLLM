@@ -253,8 +253,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
         if e4m3_cache and vllm_config.parallel_config.tensor_parallel_size != 4:
             raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires TP4")
-        if e4m3_cache and vllm_config.speculative_config is not None:
-            raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires MTP0")
+        # Speculative decoding verifies target tokens against this same QSA
+        # cache.  Keep E4M3 admission independent of whether an MTP drafter is
+        # configured; target/draft correctness is qualified end to end.
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
@@ -452,6 +453,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         sentinel and is marked finalized so nothing re-validates it.
         """
         set_default_quant_scales(self, register_buffer=False)
+        if hasattr(self, "k_scale"):
+            del self.k_scale
+        if hasattr(self, "v_scale"):
+            del self.v_scale
         self._qsa_kv_scales_finalized = True
 
     def validate_loaded_kv_scales(self) -> None:

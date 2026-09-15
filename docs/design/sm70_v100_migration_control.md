@@ -52,6 +52,103 @@ arithmetic is also excluded: better local FP64 error still changes proposal
 distributions. Historical failed numerical, memory-budget, route-coverage,
 sanitizer-timeout and slower-kernel results remain recorded in the worklog.
 
+## DFlash2 residual weight memory recovery, 2026-09-08
+
+Follow-up in the [shared NVFP4 report](sm70_dflash2_shared_nvfp4.md) removes
+unused FP16 LM-head packing when FP32 logits consume the original parameter.
+Allocation stacks identify the extra 606.25 MiB/rank matrix as draft-head
+packing retained in the native cache after target-head sharing; avoiding
+the unused preparation removes that allocation too. QPN8 screening remains
+enabled, and explicit packed Tensor Core top1 retains its layout.
+
+`VLLM_SM70_NVFP4_QPN2_SHARED_SCALES=1` optionally retains only QPN2 E4M3
+scales and restores temporary FP16 scales for TurboMind fallback. It requires
+the shared-code path, rebuilt native operators, DFlash2 TP4 q7 without DBO,
+and capture sizes <=32 so graphs do not retain each fallback's temporary
+scales. The largest temporary is 5.3125 MiB. The switch defaults off.
+
+43 CPU checks, 224 real-shard scale/output checks and six LM-head cases pass,
+including changed-input graph replay. Decode scale-cost ratios are within
+0.1% of one; head ratios are 0.9969–1.0010. M135 fallback projections cost
+5.87% more, adding 3.13 ms across the isolated projection sequence; this is
+not TTFT. Preserve the rejected initial lane-map and harness setup evidence.
+
+Production candidate completes at 18:59 CST: loading 6.286138 GiB/rank,
+25.144552 GiB/TP4, down 7.671183 GiB from shared codes alone. Both unused
+head matrices and persistent TM scales are absent on all four ranks. KV is
+still automatic E4M3 at utilization0.8, maxlen256K/chunk4096/maxseq4/q7;
+budget17.70 GiB/rank, 1,661,426 logical tokens, idleNVML26,036 MiB/rank.
+MBPP28 repeats match all754 tokens of the archived shared-code cohort;
+MBPP0 matches all1093. Median decode225.66 tok/s, round19.068 ms,
+TTFT107.95 ms. Historical same-output values were221.40/19.435/112.37;
+no observed focused slowdown, but no contemporaneous speedup claim.
+
+The current paired control was terminated during compilation and has no
+endpoint result. Keep it separate. Earlier other-cohort parity differences
+are not resolved by the latest archived-cohort match. Concurrency and
+long-context admission remain outstanding; PR561 stays Draft.
+
+Evening quality follow-up at source2d683cc135: the two completed candidate
+final answers pass original assertions and EvalPlus base/plus tests (2/2
+each). Two attempts to run a current 32-task plus four-concurrent A/B are
+interrupted before candidate execution. Latest parent receives SIGINT;
+child receives SIGTERM during cleanup, without a logged OOM/CUDA failure.
+The controls themselves return270 versus634 tokens on MBPP28 (first
+difference at zero-based token8), with six identical repeats within each
+process. Different-output medians233.57/253.62 tok/s do not prove an
+optimization speed delta. Preserve this restart-variation evidence and
+the interrupted1957/2018 cohorts. No new32-task/concurrency pass is claimed;
+resume with an uninterrupted GPU reservation and verify control stability.
+
+## DFlash2 shared NVFP4 codes, 2026-09-08
+
+The [shared QPN2/TurboMind weight path](sm70_dflash2_shared_nvfp4.md) removes
+the extra QPN2 codes while retaining both scale formats and opaque dynamic-M
+dispatch. All 280 real TP4-shard operator cases match output bits, including
+gated output, padding and CUDA Graph replay with changed inputs. The removed
+target codes total approximately 2.836 GiB per rank for QUASAR 27B.
+
+Keep `VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT` opt-in. Shared row-first scheduling,
+8-row CTAs and selective caching for K=1536/N=5120 output weights yield
+weighted M8/M16/M32 ratios of 1.0013/0.9869/0.9591 in the repeated-operator
+ABBA benchmark. All 336 final cases on 24 real shards pass bitwise,
+including partial rows. A six-tensor working set yields ratios
+1.0259/0.9915/0.9019; M8 retains a cost and these isolated projection ratios
+do not establish model throughput. Reject the slower
+vector-load/shuffle and global unroll 1/2/8 experiments.
+
+Production validation must retain automatic KV at utilization 0.8, TP4,
+256K context, E4M3 KV, chunk 4096, maxseq 4 and the existing DFlash2 q7 graph,
+FP32-logit and sampling settings. The fixed 2 GiB/8K/E5M2 diagnostic is excluded
+from production conclusions. With matching revision-four Flash-V100, the
+production control completes: 11.08 GiB loading/rank, 12.68 GiB KV budget,
+1,190,275 KV tokens and 277.52 tokens/s median single-request pure decode.
+The shared production retry completes: loading 8.20 GiB/rank, KV 15.76 GiB,
+1,479,578 logical tokens (+24.31%) and idle NVML 26,030 MiB/rank versus 26,114.
+However, MBPP28 differs at token 16 and completes 754 versus 260 tokens; MBPP0
+completes 1093 versus 2105. Both arms finish naturally, but deterministic parity
+fails. Shared 221.40 tok/s cannot establish a matched-output speed comparison.
+Inputs, launch arguments and recorded binaries match. Comparing the actual
+installed `_C` operators exposes M16/M32 differences on all six projections;
+M1/M8/135/1024 match. The 336 earlier checks used same-build source controls.
+All 18 installed-dispatch comparisons at M9/16/32 equal TurboMind bitwise.
+The optional sidecar overlay now permits both model arms to use legacy/shared
+QPN2 from the same declared source, instead of trusting a Python route log.
+The 17:55/17:57 CST source-aligned pair reproduces the loading and KV capacity
+values above, with 26,040 versus 26,030 MiB idle worker usage and 0.26 GiB
+graph capture increments in both arms. Both have zero active requests/KV use.
+However, parity still fails: MBPP28 first differs at token 155, returning
+998 versus 297 tokens; MBPP0 differs at token 287, returning 887 versus 760.
+Within-arm speed repeats are stable and all outputs finish naturally. The
+native version gap does not fully explain model parity. Raw medians of
+222.82 versus 236.75 tok/s and 19.286 versus 19.234 ms/round are different
+output workloads, not an accepted model speedup. Preserve this cohort in
+`source-aligned-summary.json` separately from the older mixed-native pair.
+Next compare actual activations at the first-divergence prefix; do not repeat
+unchanged endpoint timing or change production KV/context/sampling settings.
+Keep the feature default-off and PR Draft; do not repeat the old-extension,
+fixed-KV harness failures or passed 336 checks as a substitute for localization.
+
 ## DFlash2 E4M3 FP32 default policy, 2026-09-08
 
 [The precision-default change](sm70_dflash2_fp32_defaults.md) is based on
@@ -46555,3 +46652,55 @@ has launched no full model. Details and artifacts are in
   with the CUDA-12.8 Flash-V100 extension.
 - Model admission and human review remain outstanding. PR524 stays Draft;
   no auto-merge, production default change, or private long-prefill promotion.
+
+## 2026-09-14 E4M3 FP8-KV route parity
+
+- Base `a6f5e8347b` (`onecat/main`), owned branch
+  `codex/v100-fp8kv-fp16-route-parity-20260914-122513`.
+- Route E4M3 GQA6/D256 prefill through the shared FP16 workspace and default
+  Q8000/Q8192 FP32-accumulated attention kernel. Route uniform decode, batches
+  above 16, and resident small-query rows in mixed chunked-prefill batches
+  through E4M3 XQA. These paths are default on with explicit rollback flags.
+- Fix the page-800 wave loader, which previously addressed at most two logical
+  pages inside p896/p1664 partitions. The corrected B1 page-800 256K graph run
+  is bitwise equal to scalar and 6.82x faster. B32 page-800 256K is 6.60x faster
+  with `4.77e-7` maximum absolute difference. Page-1568 B1 256K is 6.92x
+  faster with `2.38e-7` maximum absolute difference.
+- Preserve E4M3 XQA softmax/PV state and partition outputs in FP32 until the
+  final FP16 output boundary. E5M2 retains its existing numerical contract.
+- All full-model validation for this line uses normal CUDA graphs; do not pass
+  `--enforce-eager`. Record first-request uncached prefill independently from
+  prefix-cache hits.
+- The TP4 Qwen3.8-27B NVFP4/compressed-tensors full-model gate uses FP16
+  execution, E4M3 KV, Q8192 chunks, maximum length 262144, one live request,
+  prefix caching off, no speculation, and `FULL_AND_PIECEWISE` CUDA graphs.
+  The 16K quality precheck returns `海蓝石榴；木星` at 4149.15 prompt
+  tok/s. The uncached 256000-token request returns
+  `校验词是「海蓝石榴」，太阳系最大的行星是木星。` with a 102.7519-second TTFT,
+  **2491.44 prompt tok/s**. Both retrieval and knowledge checks pass, and
+  `cached_tokens=0`. Its 15 decode intervals are a short quality observation,
+  not a throughput baseline. A separate graph-only 256000-input/256-output run
+  measures 255 intervals in 5.3902 seconds: **47.308 tok/s** and **21.138 ms
+  TPOT**, with a 102.9135-second TTFT and 2487.53 prompt tok/s.
+- Every rank records 480 Q8192 FP32-accumulated long-prefill calls and 496 E4M3
+  bridge calls during the 256K request. The final route summary records 48
+  dynamic page-800 E4M3 XQA decode calls per rank. The final source-built
+  operator reaches 77.0142/75.9654 TFLOP/s at KV128K/KV256K with finite output.
+- CUDA 12.8 SM70 source build and local import pass. Final SHA256 values are
+  core `2557f6b7...fa4c4`, stable libtorch `622af596...d162`, FA2/79T
+  `aa657e16...5add`, and Flash-V100 `66df783d...70b3`. Runtime process maps
+  contain the attention DSOs from this owned worktree and no other checkout.
+- Remove the pre-existing B16 ceiling from no-MTP full CUDA-graph capture and
+  default-capture B1/B2/B4/B8/B16/B32 when `max_num_seqs` permits. A standard
+  non-eager `vllm bench serve` matrix at exact 2048 input and 256 output tokens
+  completes C2/C4/C8/C16/C32 with zero failures. C32 records 21.7727-second
+  median TTFT, 32.521/32.824-ms median/P90 ITL, 983.986 derived pure-decode
+  tok/s, 272.868 full-request output tok/s, and 30.008-second median request
+  wall. All 62 requests generate 256 tokens; a separate 32-request natural
+  answer burst passes retrieval and knowledge checks for every response.
+- The matching page-800/256K CUDA-graph operator matrix covers
+  B2/B4/B8/B16/B32. All outputs are finite, maximum absolute difference from
+  scalar E4M3 is at most `4.77e-7`, and XQA speedups are
+  3.64x/6.12x/6.35x/6.46x/6.59x. Native attention admission has no batch or
+  total-KV-length ceiling; services above B32 continue through piecewise CUDA
+  graphs with the same accelerated attention route.
