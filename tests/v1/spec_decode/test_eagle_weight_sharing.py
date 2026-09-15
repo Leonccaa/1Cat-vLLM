@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import nullcontext
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -78,3 +79,40 @@ def test_target_head_resolution_prefers_language_model_and_keeps_fallback():
     assert utils.get_target_lm_head(wrapper, language_model) is wrapper.lm_head
     del wrapper.lm_head
     assert utils.get_target_lm_head(wrapper, language_model) is None
+
+
+def test_loader_applies_independent_draft_kv_cache_dtype(monkeypatch):
+    @dataclass
+    class CacheConfig:
+        cache_dtype: str
+
+    @dataclass
+    class Config:
+        speculative_config: object
+        cache_config: CacheConfig
+
+    target = make_model()
+    draft = make_model()
+    captured = {}
+
+    def fake_get_model(**kwargs):
+        captured.update(kwargs)
+        return draft
+
+    monkeypatch.setattr(utils, "get_model", fake_get_model)
+    monkeypatch.setattr(utils, "get_pp_group", lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(
+        "vllm.compilation.backends.set_model_tag", lambda _tag: nullcontext()
+    )
+    config = Config(
+        speculative_config=SimpleNamespace(
+            draft_model_config=object(),
+            kv_cache_dtype="auto",
+        ),
+        cache_config=CacheConfig(cache_dtype="fp8_e4m3"),
+    )
+
+    utils.load_eagle_model(target, config)
+
+    assert config.cache_config.cache_dtype == "fp8_e4m3"
+    assert captured["vllm_config"].cache_config.cache_dtype == "auto"
