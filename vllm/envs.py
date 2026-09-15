@@ -192,6 +192,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
+    VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT: bool = False
+    VLLM_SM70_NVFP4_QPN2_SHARED_SCALES: bool = False
     VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = True
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
@@ -401,6 +403,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS: bool = False
     VLLM_SM70_DECODE_TILE_PROFILE: bool = False
     VLLM_FLASH_V100_ROUTE_SUMMARY: bool = False
+    VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS: bool = True
     VLLM_FLASH_V100_FP8_PREFILL_BRIDGE: bool = True
     VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN: int = 16384
     VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16: bool = False
@@ -427,7 +430,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV: int = 32768
     VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL: bool = False
     VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL: bool = True
-    VLLM_FLASH_V100_PREFILL_D256_GQA_V37: bool = True
+    VLLM_FLASH_V100_PREFILL_D256_GQA_V37: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV: bool = False
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS: int = 32768
     VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q: int = 1
@@ -1904,6 +1907,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
     # stays on the existing TurboMind path.
     "VLLM_SM70_NVFP4_QPN2": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2", "0"))),
+    # Share TurboMind B/Pack1 codes with QPN2, preserving both scale formats.
+    # Opt in until same-contract GPU correctness and performance gates pass.
+    "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", "0"))
+    ),
+    "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "0"))
+    ),
     # Reuse each packed NVFP4 tile across two eight-row verifier groups in one
     # CTA. This is a default-off Qwen3.8 DFlash2 B2 operator candidate.
     "VLLM_SM70_NVFP4_QPN2_M16_NATIVE": lambda: bool(
@@ -2889,6 +2900,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASH_V100_ROUTE_SUMMARY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0"))
     ),
+    # Mixed chunked-prefill batches send resident decode and short verification
+    # rows through the partitioned paged-decode kernels. This prevents a q=1
+    # row from walking a long prefix serially in the paged-prefill kernel.
+    "VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS", "1"))
+    ),
     "VLLM_FLASH_V100_FP8_PREFILL_BRIDGE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1"))
     ),
@@ -2969,8 +2986,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
             )
         )
     ),
+    # The qualified Q8000 FP32-accumulated route is the default. Keep v37 as
+    # an explicit rollback and matched-control selection.
     "VLLM_FLASH_V100_PREFILL_D256_GQA_V37": lambda: bool(
-        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "1"))
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0"))
     ),
     "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL": lambda: bool(
         int(
