@@ -12,6 +12,7 @@ import fnmatch
 import hashlib
 import importlib.util
 import json
+import stat
 import struct
 from pathlib import Path
 
@@ -138,6 +139,13 @@ def test_materialize_unit_scale_overlay(tmp_path):
     assert prov["merged_index_sha256"] == _sha256(out / "model.safetensors.index.json")
     assert prov["mtp_report"] is None
     assert prov["mtp_report_sha256"] is None
+    for filename in (
+        "model-kvscales.safetensors",
+        "model-bf16-kvscales-mtp.safetensors",
+        "model.safetensors.index.json",
+        "kvscales-provenance.json",
+    ):
+        assert stat.S_IMODE((out / filename).stat().st_mode) == 0o644
 
 
 def test_materialize_from_layer_and_calibrated(tmp_path):

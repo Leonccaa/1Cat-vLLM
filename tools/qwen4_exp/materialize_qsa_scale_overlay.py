@@ -261,8 +261,10 @@ def materialize(args: argparse.Namespace) -> None:
             shutil.copy2(published_path, target_path)
         else:
             save_scale_shard(target_path, target, metadata)
+        target_path.chmod(0o644)
         draft_path = staging / MTP_SCALE_FILENAME
         save_scale_shard(draft_path, draft, {"source": draft_source})
+        draft_path.chmod(0o644)
 
         merged_weight_map = dict(weight_map)
         merged_weight_map.update({name: target_path.name for name in target})
@@ -279,6 +281,7 @@ def materialize(args: argparse.Namespace) -> None:
             json.dumps(merged_index, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        merged_index_path.chmod(0o644)
         mtp_report = getattr(args, "mtp_report", None)
         mtp_report_path = Path(mtp_report).resolve() if mtp_report else None
         provenance = {
@@ -302,10 +305,12 @@ def materialize(args: argparse.Namespace) -> None:
             "mtp_tensor_count": len(draft),
             "mtp_tensor_names": sorted(draft),
         }
-        (staging / "kvscales-provenance.json").write_text(
+        provenance_path = staging / "kvscales-provenance.json"
+        provenance_path.write_text(
             json.dumps(provenance, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        provenance_path.chmod(0o644)
         staging.rename(output)
     except Exception:
         if staging.exists():
