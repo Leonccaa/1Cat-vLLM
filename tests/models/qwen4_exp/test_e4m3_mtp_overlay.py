@@ -131,6 +131,13 @@ def test_materialize_unit_scale_overlay(tmp_path):
     prov = json.loads((out / "kvscales-provenance.json").read_text())
     assert prov["mtp_scale_source"] == "prototype:unit"
     assert prov["target_tensor_count"] == len(target_names)
+    assert prov["base_checkpoint"] == str(base.resolve())
+    assert prov["scale_pack_manifest_sha256"] == _sha256(
+        pack / "kvscales-manifest.json"
+    )
+    assert prov["merged_index_sha256"] == _sha256(out / "model.safetensors.index.json")
+    assert prov["mtp_report"] is None
+    assert prov["mtp_report_sha256"] is None
 
 
 def test_materialize_from_layer_and_calibrated(tmp_path):
@@ -165,6 +172,8 @@ def test_materialize_from_layer_and_calibrated(tmp_path):
     assert s2["mtp.layers.0.self_attn.k_scale"] == pytest.approx(0.3)  # layer 48
     prov2 = json.loads((out2 / "kvscales-provenance.json").read_text())
     assert prov2["mtp_scale_source"] == "calibrated"
+    assert prov2["mtp_report"] == str(report.resolve())
+    assert prov2["mtp_report_sha256"] == _sha256(report)
 
 
 def test_materialize_refuses_existing_dir(tmp_path):

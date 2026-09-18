@@ -202,7 +202,8 @@ def materialize(args: argparse.Namespace) -> None:
     if base == output or base in output.parents:
         raise ValueError("Output must not be inside the base checkpoint directory")
 
-    manifest = _load_json(pack_dir / MANIFEST_FILENAME)
+    manifest_path = pack_dir / MANIFEST_FILENAME
+    manifest = _load_json(manifest_path)
     if manifest.get("schema_version") != 1:
         raise ValueError("Unsupported scale-pack manifest version")
     base_index_path = base / INDEX_FILENAME
@@ -273,21 +274,33 @@ def materialize(args: argparse.Namespace) -> None:
             index_metadata["total_size"] += target_path.stat().st_size
             index_metadata["total_size"] += draft_path.stat().st_size
         merged_index["metadata"] = index_metadata
-        (staging / INDEX_FILENAME).write_text(
+        merged_index_path = staging / INDEX_FILENAME
+        merged_index_path.write_text(
             json.dumps(merged_index, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        mtp_report = getattr(args, "mtp_report", None)
+        mtp_report_path = Path(mtp_report).resolve() if mtp_report else None
         provenance = {
             "schema_version": 1,
             "artifact_id": manifest["artifact_id"],
+            "base_checkpoint": str(base),
             "base_index_sha256": base_index_hash,
+            "scale_pack_manifest_sha256": _sha256(manifest_path),
+            "merged_index_sha256": _sha256(merged_index_path),
             "target_scale_file_sha256": _sha256(target_path),
             "target_scale_source": getattr(args, "target_scale_source", "published"),
             "target_scales": target_provenance,
             "target_tensor_count": len(target),
+            "target_tensor_names": sorted(target),
             "mtp_scale_file_sha256": _sha256(draft_path),
             "mtp_scale_source": draft_source,
+            "mtp_report": str(mtp_report_path) if mtp_report_path else None,
+            "mtp_report_sha256": (
+                _sha256(mtp_report_path) if mtp_report_path else None
+            ),
             "mtp_tensor_count": len(draft),
+            "mtp_tensor_names": sorted(draft),
         }
         (staging / "kvscales-provenance.json").write_text(
             json.dumps(provenance, indent=2, sort_keys=True) + "\n",
