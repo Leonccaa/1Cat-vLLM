@@ -40,6 +40,22 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _supports_sm70_long_batch_graphs(vllm_config: VllmConfig) -> bool:
+    """Avoid extra batch captures when the attention operator would fall back."""
+    model = getattr(vllm_config, "model_config", None)
+    cache = getattr(vllm_config, "cache_config", None)
+    if (
+        model is None
+        or getattr(model, "dtype", None) != torch.float16
+        or getattr(cache, "cache_dtype", None) not in ("fp8", "fp8_e4m3")
+    ):
+        return False
+    parallel = vllm_config.parallel_config
+    return model.get_head_size() == 256 and model.get_num_attention_heads(
+        parallel
+    ) == 6 * model.get_num_kv_heads(parallel)
+
+
 def get_explicit_cudagraph_memory_reserve(cudagraph_mode: CUDAGraphMode) -> int:
     """Return an operator-provided V2 CUDA graph memory reserve in bytes."""
     reserve_mib = envs.VLLM_V2_CUDAGRAPH_MEM_MIB
@@ -506,6 +522,8 @@ class ModelCudaGraphManager(CudaGraphManager):
             served = int(getattr(model_config, "max_model_len", 0) or 0)
             context_limit, query_rows = long_attention_graph_contract(served or None)
             max_batch_size = min(self.max_num_reqs, long_attention_max_batch_size())
+            if not _supports_sm70_long_batch_graphs(vllm_config):
+                max_batch_size = 1
             if context_limit is not None:
                 if self._sm70_dflash2_tail_graphs and (
                     bool(envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST)

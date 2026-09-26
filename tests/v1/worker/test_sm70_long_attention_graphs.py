@@ -190,8 +190,20 @@ def test_tail_capture_and_dispatch_from_real_initialization(
 
 
 @pytest.mark.parametrize("native_capacity", [1, 16])
+@pytest.mark.parametrize(
+    "query_heads,kv_heads,head_dim,kv_dtype,admit_batch",
+    [
+        (6, 1, 256, "fp8_e4m3", True),
+        (12, 2, 256, "fp8", True),
+        # Qwen 35B-A3B TP4 has four local query heads, one replicated KV head.
+        (4, 1, 256, "fp8_e4m3", False),
+        (6, 1, 256, "auto", False),
+        (6, 1, 256, "fp8_e5m2", False),
+        (6, 1, 128, "fp8_e4m3", False),
+    ],
+)
 def test_batch_long_graph_capture_requires_native_capability(
-    monkeypatch, native_capacity
+    monkeypatch, native_capacity, query_heads, kv_heads, head_dim, kv_dtype, admit_batch
 ):
     from vllm.v1.attention.ops import sm70_e4m3_long as long
 
@@ -214,7 +226,14 @@ def test_batch_long_graph_capture_requires_native_capability(
     )
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_seqs=32),
-        model_config=SimpleNamespace(max_model_len=131072),
+        model_config=SimpleNamespace(
+            max_model_len=131072,
+            dtype=torch.float16,
+            get_head_size=lambda: head_dim,
+            get_num_attention_heads=lambda parallel: query_heads,
+            get_num_kv_heads=lambda parallel: kv_heads,
+        ),
+        cache_config=SimpleNamespace(cache_dtype=kv_dtype),
         compilation_config=CompilationConfig(
             cudagraph_capture_sizes=[8, 16, 32, 64, 128, 256],
             max_cudagraph_capture_size=256,
@@ -233,7 +252,9 @@ def test_batch_long_graph_capture_requires_native_capability(
     for batch in (1, 2, 4, 8, 16, 32):
         desc = manager.dispatch(batch, batch * 8, 8)
         variant = manager._long_attention_graphs.get(desc)
-        assert (variant is not None) == (batch <= native_capacity)
+        assert (variant is not None) == (
+            batch <= native_capacity and (batch == 1 or admit_batch)
+        )
         if variant is not None:
             assert variant.attention_context_bucket == 131072
             assert variant in manager._capture_descs[CUDAGraphMode.FULL]

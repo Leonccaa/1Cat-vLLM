@@ -28,6 +28,10 @@ check or weight-quantization check. E4M3 KV, FP16 queries, D=256 and GQA=6 are t
 kernel's numerical/shape contract. Multiple six-query-head groups are supported.
 The served context limit still bounds capture, up to 262144. Existing explicit
 disable overrides remain available.
+Additional batch graphs are only captured for that dtype/head geometry. The
+35B-A3B TP4 geometry (four local query heads, one replicated KV head), FP16 KV,
+E5M2 KV and other head dimensions retain their existing graph set. This is a
+dispatch regression check, not a new 35B AWQ/FP8 speed baseline.
 
 Workspaces are shared across compatible batch sizes on the same device, stream
 and context contract. Descending graph capture allocates the largest needed
@@ -53,6 +57,10 @@ graphs can still reference them. Different streams never share a panel.
   remain bitwise equal to independent-request execution.
 - Incremental normal CMake FA2 build succeeds. The changed kernel reports no
   spills. No task-only native overlay or `LD_PRELOAD` is used.
+- After integrating main `b034648012244ab712df05b93e6d8fff877a6f2f`, the long
+  operator/graph tests plus the pre-Ampere and quantized-draft context regression
+  tests give **50 passed**. A separate CPU-only run including the expanded
+  dtype/head-geometry admission matrix gives **49 passed**; these suites overlap.
 
 Commands (from the owned worktree):
 
@@ -132,8 +140,45 @@ between repeated waves even in the control; these are emitted-token endpoint
 gains, not a claim that all of the gain is isolated kernel compute savings.
 
 The initial candidate increases the actual graph pool from 0.88 to 1.13 GiB.
-The final workspace-sharing revision is being checked separately before
-publication; retain the initial pair in `long-endpoint-initial-comparison.json`.
+Keep that first pair in `long-endpoint-initial-comparison.json`; it isolates the
+long-attention port before the main integration.
+
+The final service uses workspace sharing and main integration at
+`7e80145857c7401701924836879c5b0f17094a87`. It has the same workload and launch
+options, with one first-use warmup and three measured repeats per concurrency:
+
+| Concurrency | Control decode tok/s | Final decode tok/s | Gain | Aggregate acceptance, control → final |
+| --- | ---: | ---: | ---: | ---: |
+| C1 | 159.300 | 159.324 | +0.02% | 33.395% → 33.395% |
+| C4 | 326.832 | 429.134 | +31.30% | 38.961% → 41.889% |
+| C8 | 492.025 | 624.863 | +27.00% | 47.904% → 53.968% |
+
+The final C4 samples are 427.940/429.134/429.568 tok/s; C8 samples are
+624.863/667.761/543.966 tok/s. Acceptance contributes to this variability, so
+these gains must not be described as an equal-per-step compute comparison.
+Request mean-TPOT medians (which can include peers' initial prefill after one
+request has started decoding) are 6.277/13.355/24.432 → 6.277/10.982/21.796 ms.
+TTFT medians are 1.223/3.322/5.229 → 1.226/3.323/5.208 s. This experiment is not a
+rolling-arrival benchmark or a new PRO 6000 comparison.
+
+The final natural-EOS run is again **8/8 correct and 8/8 normal stops**. C1
+tokens and acceptance remain exact. All four TP ranks log actual C4 and C8
+bounded-graph selection during generation, in addition to native route logs
+during capture. The subsequent dtype/head-geometry admission guard preserves
+this measured configuration and is covered by the CPU matrix above.
+
+Graph pool consumption falls to **0.99 GiB**: about 0.14 GiB below the first
+candidate, leaving about 0.11 GiB above control. Service maximum length remains
+262144 at memory utilization 0.8. Record the separate pre-capture KV budget
+difference as well: control reports 11.45 GiB / 1050885 tokens, both candidates
+11.00 GiB / 1009312 tokens. That difference is present before long graphs are
+captured and has not been isolated; do not claim unchanged total KV capacity
+or four independent simultaneous 262K requests. Whole-service speed/quality was
+measured at 32K; 128K/256K evidence here is operator validation and timing.
+
+PR #697 stays Draft because its earlier rolling-decode acceptance gate is
+still unresolved. These results qualify this incremental long-context route,
+not every older change in that PR or the historical 35B performance target.
 
 The first control startup failed because the systemd environment lacked Ninja
 on PATH during the existing FlashQLA JIT build. The launcher now includes the
@@ -146,7 +191,8 @@ The completed quality runs above are from the corrected client.
 
 ## Build and retained artifacts
 
-Task root: `/data/minimax-h3/task-cache/sm70-decode-round-20260926`.
+Artifacts are retained under the isolated task root recorded in its local
+`CURRENT.md`. Paths below are relative to that root.
 
 - Native source SHA256:
   `e98db3a38dfae231ec164c3e14c9e755f362af9c089dcc36331b32b7b8d8e55f`.
@@ -161,9 +207,16 @@ Task root: `/data/minimax-h3/task-cache/sm70-decode-round-20260926`.
 - Normal dynamic dependencies: Torch, CUDA, cuBLAS and system C++ runtime;
   no private task-cache library or RPATH/RUNPATH overlay.
 - `results/long-batch-fa2-build.log`, `results/long-batch-quality-tests.log`.
+- `results/long-batch-pooled-quality-tests.log`,
+  `results/long-batch-main-tests.log`, `results/long-batch-admission-tests.log`.
 - `results/long-batch-kernel-bench.json` and
   `results/long-batch-page1648-bench.json`: raw timing arrays and library hashes.
 - `results/long-prompts-32k.json`: shared tokenized performance dataset.
+- `results/long-service-{control,candidate,pooled}/`: every raw client wave,
+  token ID, timestamp, speculative counter and natural-output result.
+- `results/long-endpoint-pooled-comparison.json`: final three-repeat medians.
+- `results/long-{control,candidate,pooled}-service.log`: configuration, route
+  evidence and memory accounting; matching `*-idle-gpu-memory.csv` snapshots.
 - `run-long-service.sh`, `long-eval.py`, `endpoint_barrier_client.py`:
   exact retained endpoint launch and measurement commands.
 - `results/long-control-service-missing-ninja.log`: rejected startup attempt.

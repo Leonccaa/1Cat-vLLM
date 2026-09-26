@@ -47974,3 +47974,39 @@ has launched no full model. Details and artifacts are in
   raw endpoint delta: admission/acceptance differs, and the first pass includes
   cold sampler/JIT stalls. Default-route logs confirm no manual acceleration
   flags are necessary. Details and limits are in the batch latency report.
+
+## 2026-09-27 DFlash2 long-context q8 batches
+
+- Extend the existing built-in compensated E4M3 attention from B1 to
+  request-major q8 B2–B16. Correct request offsets for row lengths and FP32
+  max/sum panels, query native batch capacity, capture compatible batch graphs,
+  and inspect all live CPU length hints. Single-request tails retain their
+  route. No new enable switch, model-name or weight-quantization gate is added.
+- Share compatible graph workspaces within a device/stream/bound contract and
+  retain older allocations when growing. The graph pool falls from the initial
+  candidate's 1.13 GiB to 0.99 GiB (control 0.88 GiB). Unsupported head geometry
+  or KV dtype does not capture extra batch graphs; 35B-A3B TP4's local GQA=4
+  remains on the existing route. This is not a new 35B AWQ/FP8 speed result.
+- Normal FA2 extension rebuilt from owned source. The initial focused suite has
+  41 passes; after main b034648012 integration, the relevant graph/operator and
+  quantized-draft regressions have 50 passes. The expanded CPU admission matrix
+  has 49 passes (overlapping suites). Changed-input, padding, zero-length rows,
+  old-graph replay after workspace growth and FP64 oracle checks pass through
+  262144 context. Batch results equal independent-request execution bitwise.
+- TP4 V100, Qwen3.8-27B-NVFP4, FP16 execution/E4M3 KV, DFlash2 q7, 262144 service
+  limit, memory 0.8, prefix caching, same 32K/256 tokenized fixture and sampling.
+  Three warm client all-live decode medians C1/C4/C8 are
+  159.300/326.832/492.025 -> 159.324/429.134/624.863 tok/s
+  (+0.02%/+31.30%/+27.00%). No later arrivals; TTFT is separate. Aggregate
+  acceptance is 33.395/38.961/47.904 -> 33.395/41.889/53.968%. Both control and
+  final natural-EOS retrieval score 8/8 correct and 8/8 normal stops. C4/C8
+  acceptance varies between waves: do not assign all endpoint gain to compute.
+- Actual C4/C8 graph selection is logged on all four TP workers. KV budget
+  before graph capture is 11.45 GiB control versus 11.00 GiB candidates; this
+  separate difference remains unisolated. Do not claim unchanged total KV
+  capacity, C8 at 256K, a PRO win or completion of the prior rolling gate.
+- Source, hashes, both intermediate/final service pairs, failed first startup,
+  measurements and limits are in
+  [the long-batch report](sm70_dflash2_long_batch_20260927.md). PR #697 remains
+  Draft due to its earlier rolling-acceptance failure. Public API and gateway
+  were stopped at the user's request; local benchmark services are shut down.
