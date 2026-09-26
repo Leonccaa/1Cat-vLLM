@@ -470,6 +470,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         from vllm.v1.attention.ops.sm70_e4m3_long import (
             long_attention_enabled,
             long_attention_graph_contract,
+            long_attention_max_batch_size,
         )
         from vllm.v1.attention.ops.sm70_e4m3_scalar import (
             scalar_tail_attention_available,
@@ -488,6 +489,7 @@ class ModelCudaGraphManager(CudaGraphManager):
             model_config = getattr(vllm_config, "model_config", None)
             served = int(getattr(model_config, "max_model_len", 0) or 0)
             context_limit, query_rows = long_attention_graph_contract(served or None)
+            max_batch_size = min(self.max_num_reqs, long_attention_max_batch_size())
             if context_limit is not None:
                 if self._sm70_dflash2_tail_graphs and (
                     bool(envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST)
@@ -496,19 +498,30 @@ class ModelCudaGraphManager(CudaGraphManager):
                     query_rows = (1, *query_rows)
                 descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
                 for desc in list(descs):
-                    if (
+                    single_request_variant = (
                         desc.num_reqs == 1
                         and desc.uniform_token_count in query_rows
                         and desc.num_tokens == desc.uniform_token_count
-                    ):
+                    )
+                    # Reuse the same kernel and bound for request-major q8
+                    # batches only when the loaded native build admits them.
+                    batch_q8_variant = (
+                        desc.num_reqs is not None
+                        and 2 <= desc.num_reqs <= max_batch_size
+                        and 8 in query_rows
+                        and desc.uniform_token_count == 8
+                        and desc.num_tokens == desc.num_reqs * 8
+                    )
+                    if single_request_variant or batch_q8_variant:
                         variant = replace(desc, attention_context_bucket=context_limit)
                         self._long_attention_graphs[desc] = variant
                         descs.append(variant)
                 logger.info_once(
                     "SM70 E4M3 long-context graph variants captured at bound=%d "
-                    "for query rows %s (served window=%s).",
+                    "for query rows %s and q8 batch capacity=%d (served window=%s).",
                     context_limit,
                     tuple(query_rows),
+                    max_batch_size,
                     served or "unknown",
                     scope="process",
                 )
@@ -521,9 +534,16 @@ class ModelCudaGraphManager(CudaGraphManager):
             return desc
         # Never materialize device lengths on the host. A missing or oversized
         # CPU hint conservatively selects the existing full-context graph.
-        if cpu_upper_bounds.device.type != "cpu" or cpu_upper_bounds.numel() != 1:
+        if (
+            cpu_upper_bounds.device.type != "cpu"
+            or cpu_upper_bounds.ndim != 1
+            or desc.num_reqs is None
+            or not 0 < cpu_upper_bounds.numel() <= desc.num_reqs
+        ):
             return desc
-        upper = int(cpu_upper_bounds[0])
+        # Hints are per live request; the captured graph can pad the remainder.
+        # Inspect every request so an over-capacity peer cannot enter the route.
+        upper = int(cpu_upper_bounds.max())
         limit = variant.attention_context_bucket
         if limit is None:
             return desc
@@ -533,6 +553,14 @@ class ModelCudaGraphManager(CudaGraphManager):
             # different served window keeps the same behaviour.
             return desc
         if 0 < upper <= limit:
+            if desc.num_reqs > 1:
+                logger.info_once(
+                    "SM70 long q8 attention graph replay selected: "
+                    "requests=%d bound=%d.",
+                    desc.num_reqs,
+                    limit,
+                    scope="process",
+                )
             return variant
         return desc
 
