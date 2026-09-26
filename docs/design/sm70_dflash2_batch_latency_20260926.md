@@ -1,10 +1,13 @@
 # SM70 DFlash2 batch latency, 2026-09-26
 
-Status: implemented in Draft PR #697. Focused operator and real-input numerical
+Status: implemented in PR #697. Focused operator and real-input numerical
 checks pass. A same-process diagnostic A/B shows an incremental C8 benefit, but
 fresh uninstrumented default-configuration services do not reproduce it. C8
-rolling acceptance misses the two-percentage-point gate. Keep the PR in Draft;
-no production speed gain, PRO win or completed C8 speed target is claimed.
+rolling acceptance misses the two-percentage-point gate; no production speed
+gain, PRO win or completed C8 speed target is claimed for this campaign.
+On 2026-09-27, the project owner requested merging after disclosure of this
+failure and the subsequent [long-context results](sm70_dflash2_long_batch_20260927.md).
+The unresolved gates remain follow-up work rather than passed acceptance.
 
 ## Contract and ownership
 
@@ -151,8 +154,8 @@ three runs in one fresh service. Decode-capacity results were 379.243,
 56.623% and 52.167% (median 56.006%). Against the retained three-run control
 median 385.783 tok/s, this is -1.70% in this screen; the route fix has not yet
 provided an accepted end-to-end speed gain. It does, however, remove the
-previous cross-rank plan drift and keeps the PR in Draft pending a route-quality
-selection step and a fresh paired control.
+previous cross-rank plan drift. A route-quality selection step and a fresh
+paired control remain necessary to close this campaign's acceptance gate.
 
 ## Initial endpoint screening and real-input audit
 
@@ -260,7 +263,8 @@ The implementation introduces no extra environment switch. The common attention
 combine is selected by its backend; batch context and exact request-local
 sampling use existing capability checks and automatic configuration. Explicit
 diagnostic overrides remain respected. These defaults are present in this PR's
-source; it remains Draft until the endpoint/quality evidence is reviewed.
+source and follow the merge disposition above. The merge decision does not
+change the recorded endpoint/quality results.
 
 The workload is selected using ordinary service arguments, for example:
 

@@ -2,7 +2,7 @@
 
 This follow-up extends the existing single-request SM70 E4M3 long-attention
 kernel to request-major q8 batches. It is incremental to `818a2bab6002ee02cb9ff6858b4917b30445b785`
-on `codex/v100-decode-round-20260926-111504`, within Draft PR #697. It does not
+on `codex/v100-decode-round-20260926-111504`, within PR #697. It does not
 supersede the earlier batch sampler/context acceptance failures documented in
 [the preceding audit](sm70_dflash2_batch_latency_20260926.md).
 
@@ -176,9 +176,12 @@ captured and has not been isolated; do not claim unchanged total KV capacity
 or four independent simultaneous 262K requests. Whole-service speed/quality was
 measured at 32K; 128K/256K evidence here is operator validation and timing.
 
-PR #697 stays Draft because its earlier rolling-decode acceptance gate is
-still unresolved. These results qualify this incremental long-context route,
-not every older change in that PR or the historical 35B performance target.
+On 2026-09-27, the project owner requested merging PR #697 after disclosure of
+the earlier rolling-decode acceptance failure and the KV-budget difference.
+Both remain follow-up items; the merge decision does not mark those gates as
+passed. These results qualify this incremental long-context route, not every
+older change in that PR or the historical 35B performance target. Supported
+routes remain enabled by the existing capability checks without new switches.
 
 The first control startup failed because the systemd environment lacked Ninja
 on PATH during the existing FlashQLA JIT build. The launcher now includes the

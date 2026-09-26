@@ -47964,7 +47964,7 @@ has launched no full model. Details and artifacts are in
   680.644 -> 676.332 tok/s (-0.63%). Rolling C8 acceptance falls 2.497
   percentage points, failing the requested gate. C2's +11.46% speed comes
   with +6.585 acceptance points, so it is not an isolated compute improvement.
-  Keep PR #697 in Draft; do not promote its single-process +5% as production
+  This campaign does not qualify its single-process +5% as production
   performance. The natural-EOS pair remains 14 correct/15 natural stops on
   the same cases. 4K cache-hit and 32K C2 route smokes complete on both.
 - The all-step ledger closes to client request decode duration within 0.14%.
@@ -48007,6 +48007,9 @@ has launched no full model. Details and artifacts are in
   capacity, C8 at 256K, a PRO win or completion of the prior rolling gate.
 - Source, hashes, both intermediate/final service pairs, failed first startup,
   measurements and limits are in
-  [the long-batch report](sm70_dflash2_long_batch_20260927.md). PR #697 remains
-  Draft due to its earlier rolling-acceptance failure. Public API and gateway
-  were stopped at the user's request; local benchmark services are shut down.
+  [the long-batch report](sm70_dflash2_long_batch_20260927.md). On 2026-09-27,
+  the project owner requested merging PR #697 after disclosure of the earlier
+  rolling-acceptance failure and KV-budget difference. Both remain follow-up
+  items; merging does not mark them as passed. Capability-based defaults need
+  no additional enable switches. Public API and gateway were stopped at the
+  user's request; local benchmark services are shut down.
