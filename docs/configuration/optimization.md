@@ -109,7 +109,11 @@ Choose the budget from a workload-specific latency/throughput sweep. A smaller
 value usually improves mixed-phase ITL but can increase long-request TTFT and
 reduce prefill throughput. The budget should be smaller than
 `max_num_batched_tokens`; hybrid models that require block-aligned prefill
-chunks may also impose a practical minimum.
+chunks may also impose a practical minimum. With `mamba_cache_mode="align"`,
+a budget of at least one recurrent-state block is floored to whole blocks, so
+concurrent prefills do not receive short remainder chunks. Choose the budget as
+a multiple of the state block size reported at startup; a smaller budget splits
+each block across several steps.
 
 ## Parallelism Strategies
 

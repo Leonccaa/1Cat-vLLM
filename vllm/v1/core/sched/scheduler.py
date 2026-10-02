@@ -332,6 +332,15 @@ class Scheduler(SchedulerInterface):
             and self.mamba_state_block_size is not None
             and self.mamba_state_block_size >= self.max_num_scheduled_tokens
         )
+        if (
+            self.scheduler_config.prefill_pressure_token_budget > 0
+            and self.need_mamba_block_aligned_split
+        ):
+            logger.info(
+                "Prefill-pressure budget is floored to whole %d-token Mamba "
+                "state blocks when it covers at least one block.",
+                self.mamba_state_block_size or self.cache_config.block_size,
+            )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -546,7 +555,15 @@ class Scheduler(SchedulerInterface):
         ):
             return None
 
-        return min(budget, self.max_num_scheduled_tokens)
+        budget = min(budget, self.max_num_scheduled_tokens)
+        block_size = self.mamba_state_block_size or self.cache_config.block_size
+        if self.need_mamba_block_aligned_split and budget >= block_size:
+            # Align mode floors each chunk end to the recurrent-state block
+            # grid, so a prefill rarely uses a partial block of this budget.
+            # The unused remainder would go to the next prefill as a short
+            # unaligned chunk; keep whole blocks instead.
+            budget = budget // block_size * block_size
+        return budget
 
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
