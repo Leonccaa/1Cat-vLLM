@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 
+from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import ModelRunnerOutput
 
 from .utils import create_requests, create_scheduler
@@ -153,3 +157,75 @@ def test_prefill_pressure_budget_requires_chunked_prefill():
             prefill_pressure_token_budget=32,
             max_model_len=512,
         )
+
+
+MAMBA_BLOCK_SIZE = 816
+
+
+def _align_pressure_scheduler(budget: int, *, align: bool = True):
+    decode = SimpleNamespace(num_computed_tokens=9, num_prompt_tokens=8)
+    prefills = [
+        SimpleNamespace(
+            num_computed_tokens=0,
+            num_prompt_tokens=8 * MAMBA_BLOCK_SIZE,
+            num_tokens=8 * MAMBA_BLOCK_SIZE,
+        )
+        for _ in range(2)
+    ]
+    coordinator = SimpleNamespace(eagle_group_ids=set())
+    coordinator.get_replay_boundaries = lambda request, block: (
+        KVCacheCoordinator.get_replay_boundaries(coordinator, request, block)
+    )
+    scheduler = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            prefill_pressure_token_budget=budget,
+            prefill_pressure_threshold=1,
+            long_prefill_token_threshold=0,
+        ),
+        running=[decode, *prefills],
+        waiting=[],
+        skipped_waiting=[],
+        max_num_scheduled_tokens=8192,
+        need_mamba_block_aligned_split=align,
+        mamba_state_block_size=MAMBA_BLOCK_SIZE if align else None,
+        cache_config=SimpleNamespace(block_size=16),
+        use_eagle=False,
+        mamba_state_retention_interval=0 if align else None,
+        kv_cache_manager=SimpleNamespace(coordinator=coordinator),
+    )
+    return scheduler, prefills
+
+
+@pytest.mark.parametrize(
+    ("budget", "expected"),
+    [(768, 768), (816, 816), (1000, 816), (1700, 1632), (3300, 3264)],
+)
+def test_align_pressure_budget_keeps_whole_state_blocks(budget, expected):
+    scheduler, _ = _align_pressure_scheduler(budget)
+
+    assert Scheduler._get_prefill_pressure_token_budget(scheduler) == expected
+
+
+def test_pressure_budget_is_unchanged_without_align_split():
+    scheduler, _ = _align_pressure_scheduler(1700, align=False)
+
+    assert Scheduler._get_prefill_pressure_token_budget(scheduler) == 1700
+
+
+def test_align_pressure_budget_leaves_no_short_remainder_chunk():
+    scheduler, (first, second) = _align_pressure_scheduler(1700)
+    budget = Scheduler._get_prefill_pressure_token_budget(scheduler)
+
+    # The scheduler caps each prefill by the remaining budget before the
+    # align split, then charges what the split actually scheduled.
+    first_chunk = Scheduler._mamba_block_aligned_split(scheduler, first, budget)
+    budget -= first_chunk
+
+    assert first_chunk == 2 * MAMBA_BLOCK_SIZE
+    assert budget == 0
+    # A raw 1700-token budget would hand the second prefill a 68-token chunk.
+    raw_remainder = 1700 - first_chunk
+    assert (
+        Scheduler._mamba_block_aligned_split(scheduler, second, raw_remainder)
+        == raw_remainder
+    )
