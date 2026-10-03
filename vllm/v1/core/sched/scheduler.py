@@ -603,6 +603,15 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # `long_prefill_token_threshold` exists to stop a long prefill from
+        # starving other requests of the token budget. When it is the only
+        # request there is nobody to starve, so let it use the whole budget.
+        long_prefill_token_threshold = (
+            self.scheduler_config.long_prefill_token_threshold
+            if len(self.running) + len(self.waiting) + len(self.skipped_waiting) > 1
+            else 0
+        )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -647,7 +656,7 @@ class Scheduler(SchedulerInterface):
                     ddtree_payload_for_tree_schedule
                 )
                 remaining_output_tokens = self._remaining_output_tokens(request)
-                threshold = self.scheduler_config.long_prefill_token_threshold
+                threshold = long_prefill_token_threshold
                 max_len_tokens = self.max_model_len - 1 - request.num_computed_tokens
                 _ddtree_debug_log(
                     "schedule candidate req=%s base_new=%d tree_new=%d "
@@ -680,8 +689,8 @@ class Scheduler(SchedulerInterface):
                         request.request_id,
                         num_new_tokens,
                     )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if 0 < long_prefill_token_threshold < num_new_tokens:
+                num_new_tokens = long_prefill_token_threshold
             is_prefill = request.num_computed_tokens < request.num_prompt_tokens
             if is_prefill and prefill_token_budget is not None:
                 if prefill_token_budget == 0:
@@ -1018,9 +1027,8 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
+                    if 0 < long_prefill_token_threshold < num_new_tokens:
+                        num_new_tokens = long_prefill_token_threshold
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
