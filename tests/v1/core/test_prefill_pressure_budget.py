@@ -229,3 +229,38 @@ def test_align_pressure_budget_leaves_no_short_remainder_chunk():
         Scheduler._mamba_block_aligned_split(scheduler, second, raw_remainder)
         == raw_remainder
     )
+
+
+@pytest.mark.parametrize(
+    ("with_decode", "num_prefills", "expected"),
+    [
+        # Alone: neither the threshold nor the pressure budget applies.
+        (False, 1, {"prefill-0": 96}),
+        # Prefills only: the threshold splits the budget, no pressure cap.
+        (False, 2, {"prefill-0": 40, "prefill-1": 40}),
+        # With a decode the tighter aggregate pressure budget wins.
+        (True, 2, {"decode": 1, "prefill-0": 32}),
+    ],
+)
+def test_long_prefill_threshold_combines_with_pressure_budget(
+    with_decode, num_prefills, expected
+):
+    scheduler = create_scheduler(
+        max_num_batched_tokens=96,
+        long_prefill_token_threshold=40,
+        prefill_pressure_token_budget=32,
+        max_model_len=512,
+    )
+    if with_decode:
+        _start_decode_request(scheduler)
+    for request in create_requests(
+        num_requests=num_prefills,
+        num_tokens=200,
+        max_tokens=4,
+        req_ids=[f"prefill-{i}" for i in range(num_prefills)],
+    ):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == expected
