@@ -93,6 +93,12 @@ class SchedulerConfig:
     """Number of active prefill requests required before applying
     ``prefill_pressure_token_budget`` while decode work is runnable."""
 
+    long_prefill_token_threshold_adaptive: bool = False
+    """Floor the effective long prefill token threshold at a fair share of
+    the per-step token budget: the budget divided by the number of queued
+    and running requests. Only applies when long_prefill_token_threshold is
+    nonzero."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.

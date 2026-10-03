@@ -558,6 +558,9 @@ class EngineArgs:
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
     prefill_pressure_token_budget: int = SchedulerConfig.prefill_pressure_token_budget
     prefill_pressure_threshold: int = SchedulerConfig.prefill_pressure_threshold
+    long_prefill_token_threshold_adaptive: bool = (
+        SchedulerConfig.long_prefill_token_threshold_adaptive
+    )
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
@@ -1437,6 +1440,10 @@ class EngineArgs:
             "--prefill-pressure-threshold",
             **scheduler_kwargs["prefill_pressure_threshold"],
         )
+        scheduler_group.add_argument(
+            "--long-prefill-token-threshold-adaptive",
+            **scheduler_kwargs["long_prefill_token_threshold_adaptive"],
+        )
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
         scheduler_group.add_argument(
@@ -2297,6 +2304,9 @@ class EngineArgs:
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             prefill_pressure_token_budget=self.prefill_pressure_token_budget,
             prefill_pressure_threshold=self.prefill_pressure_threshold,
+            long_prefill_token_threshold_adaptive=(
+                self.long_prefill_token_threshold_adaptive
+            ),
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,

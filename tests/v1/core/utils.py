@@ -49,6 +49,7 @@ def create_scheduler(
     long_prefill_token_threshold: int = 0,
     prefill_pressure_token_budget: int = 0,
     prefill_pressure_threshold: int = 1,
+    long_prefill_token_threshold_adaptive: bool = False,
     disable_chunked_mm_input: bool = False,
     use_kv_connector: None | bool | str | MockKVConfig = None,
     num_blocks: int = 10000,
@@ -71,6 +72,9 @@ def create_scheduler(
       enable_prefix_caching: optionally force APC config
                              (True/False) or use default
                              (False)
+      long_prefill_token_threshold: cap on prefill chunk size
+      long_prefill_token_threshold_adaptive: floor the cap at a
+                             fair share of the token budget
 
     Returns:
       {class}`Scheduler` instance
@@ -91,6 +95,7 @@ def create_scheduler(
         long_prefill_token_threshold=long_prefill_token_threshold,
         prefill_pressure_token_budget=prefill_pressure_token_budget,
         prefill_pressure_threshold=prefill_pressure_threshold,
+        long_prefill_token_threshold_adaptive=long_prefill_token_threshold_adaptive,
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
