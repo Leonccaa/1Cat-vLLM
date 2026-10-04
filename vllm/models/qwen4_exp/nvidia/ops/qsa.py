@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from vllm.v1.worker import ct252_stall_probe as _stall_probe
 import math
 import os
 from itertools import pairwise
@@ -1584,7 +1585,7 @@ def qsa_select_paged_tokens(
         # model-capacity tail. This is one scalar sync per QSA layer.
         score_columns = min(
             capacity_columns,
-            max(block_topk, int(all_visible.max().item())),
+            max(block_topk, int(_stall_probe.timed_item(all_visible.max(), "qsa_select_item"))),
         )
         if _qsa_indexer_cublas_work_supported(rows, score_columns):
             logger.info_once(

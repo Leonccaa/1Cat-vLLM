@@ -17,6 +17,7 @@ hidden. Prefer utility functions defined elsewhere and call them from here,
 instead of embedding feature-specific logic directly.
 """
 
+from vllm.v1.worker import ct252_stall_probe as stall_probe
 import functools
 import gc
 import os
@@ -1541,6 +1542,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return empty_output
 
         early_ple_model_inputs: dict[str, Any] | None = None
+        stall_probe.mark("step")
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
@@ -1714,7 +1716,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             batch_desc = self.cudagraph_manager.select_attention_graph(
                 batch_desc, input_batch.seq_lens_cpu_upper_bound
             )
-            self.kv_connector.pre_forward(scheduler_output)
+            stall_probe.timed_call("kvc_pre", self.kv_connector.pre_forward, scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
@@ -1733,7 +1735,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
             ):
-                self.kv_connector.pre_forward(scheduler_output)
+                stall_probe.timed_call("kvc_pre", self.kv_connector.pre_forward, scheduler_output)
                 model_output = self.model(**model_inputs)
 
         if self._ple_offload_connector is not None:
@@ -1806,7 +1808,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
             # Post-step KV connector related operations.
-            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            kv_connector_output = stall_probe.timed_call("kvc_post", self.kv_connector.post_forward, finished_req_ids)
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
@@ -1972,7 +1974,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Post-step KV connector related operations.
-        kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+        kv_connector_output = stall_probe.timed_call("kvc_post", self.kv_connector.post_forward, finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.mixed_prefill_timing = self.mixed_prefill_timer.finish()
 
@@ -2003,7 +2005,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.execute_model_state = None
 
         # Post-step KV connector related operations.
-        kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+        kv_connector_output = stall_probe.timed_call("kvc_post", self.kv_connector.post_forward, finished_req_ids)
 
         if not self.is_last_pp_rank:
             self.postprocess_num_computed_tokens(input_batch)

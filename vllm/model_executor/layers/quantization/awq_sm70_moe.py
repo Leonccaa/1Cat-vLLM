@@ -1364,6 +1364,9 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             )
 
         num_tokens = x.shape[0]
+        from vllm.v1.worker import ct252_stall_probe as stall_probe
+
+        stall_probe.mark(f"moe:{num_tokens}")
         top_k = topk_ids.shape[1]
         total_slots = num_tokens * top_k
         indexed_w13 = _use_qwen38_indexed_prefill(layer, x, topk_ids)

@@ -904,6 +904,9 @@ def qwen4_exp_qsa_with_output(
     """Run the complete QSA state/update/attend transaction."""
 
     layer_name = _resolve_layer_name(layer_name)
+    from vllm.v1.worker import ct252_stall_probe as stall_probe
+
+    stall_probe.mark(f"qsa:{layer_name.rsplit('layers.', 1)[-1]}")
     layer = get_forward_context().no_compile_layers[layer_name]
     if not isinstance(layer, Qwen4ExpQSAAttention):
         raise TypeError(f"{layer_name} is not a Qwen4Exp QSA owner")

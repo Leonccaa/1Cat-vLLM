@@ -2160,6 +2160,9 @@ class ChunkGatedDeltaRule(CustomOp):
         core_attn_out: torch.Tensor | None = None,
         gate_is_exp: bool = False,
     ):
+        from vllm.v1.worker import ct252_stall_probe as stall_probe
+
+        stall_probe.mark("gdn")
         if (
             q.dtype != torch.float16
             or k.dtype != torch.float16
