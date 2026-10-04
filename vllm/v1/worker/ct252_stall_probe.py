@@ -23,12 +23,56 @@ THRESHOLD_S = float(os.environ.get("CT252_STALL_PROBE_S", "1.0"))
 _EVENTS: collections.deque = collections.deque(maxlen=768)
 
 
+STEP_MS = float(os.environ.get("CT252_STALL_PROBE_STEP_MS", "1000"))
+STEP_MAX_TOKENS = int(os.environ.get("CT252_STALL_PROBE_STEP_TOKENS", "4000"))
+_STEP: list = []
+
+
+def _category(label: str) -> str:
+    head = label.split(":")[0]
+    return "kvc_pre" if head == "kvc_pre" else "kvc_post" if head == "kvc_post" else head
+
+
+def _flush_step() -> None:
+    """Summarize the previous step if it was a slow mixed (small) step."""
+    items = list(_STEP)
+    _STEP.clear()
+    if len(items) < 2:
+        return
+    try:
+        if not items[-1][1].query():
+            return
+        total = items[0][1].elapsed_time(items[-1][1])
+    except RuntimeError:
+        return
+    tokens = [int(l.split(":")[1]) for l, _ in items if l.startswith("moe:")]
+    num_tokens = max(tokens) if tokens else -1
+    if total < STEP_MS or not 0 < num_tokens <= STEP_MAX_TOKENS:
+        return
+    by_pair = collections.Counter()
+    for (l0, e0), (l1, e1) in zip(items, items[1:]):
+        try:
+            by_pair[f"{_category(l0)}>{_category(l1)}"] += e0.elapsed_time(e1)
+        except RuntimeError:
+            pass
+    logger.warning(
+        "CT252 stall probe: slow mixed step %.0f ms (%d tokens, %d marks): %s",
+        total,
+        num_tokens,
+        len(items),
+        [(k, round(v, 1)) for k, v in by_pair.most_common(8)],
+    )
+
+
 def mark(label: str) -> None:
     if not ENABLED or torch.cuda.is_current_stream_capturing():
         return
+    if label == "step":
+        _flush_step()
     event = torch.cuda.Event(enable_timing=True)
     event.record()
     _EVENTS.append((label, event, time.monotonic()))
+    _STEP.append((label, event))
 
 
 def timed_item(tensor: torch.Tensor, label: str):
