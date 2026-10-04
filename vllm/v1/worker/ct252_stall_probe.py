@@ -178,14 +178,14 @@ def _flush_step() -> None:
         total = items[0][1].elapsed_time(items[-1][1])
     except RuntimeError:
         return
-    tokens = [int(l.split(":")[1]) for l, _ in items if l.startswith("moe:")]
+    tokens = [int(l.split(":")[1]) for l, _, _ in items if l.startswith("moe:")]
     num_tokens = max(tokens) if tokens else -1
     if total < STEP_MS or not 0 < num_tokens <= STEP_MAX_TOKENS:
         return
     by_pair = collections.Counter()
     singles = []
     layer = "?"
-    for (l0, e0), (l1, e1) in zip(items, items[1:]):
+    for (l0, e0, h0), (l1, e1, h1) in zip(items, items[1:]):
         if l0.startswith("qsa:"):
             layer = l0[4:].split(".")[0]
         try:
@@ -193,7 +193,7 @@ def _flush_step() -> None:
         except RuntimeError:
             continue
         by_pair[f"{_category(l0)}>{_category(l1)}"] += ms
-        singles.append((ms, f"L{layer} {l0}>{l1}"))
+        singles.append((ms, f"L{layer} {l0}>{l1} host {(h1 - h0) * 1000.0:.0f}"))
     singles.sort(reverse=True)
     logger.warning(
         "CT252 stall probe: slow mixed step %.0f ms (%d tokens, %d marks): %s",
@@ -259,8 +259,9 @@ def mark(label: str) -> None:
         _check_allocator()
     event = torch.cuda.Event(enable_timing=True)
     event.record()
-    _EVENTS.append((label, event, time.monotonic()))
-    _STEP.append((label, event))
+    now = time.monotonic()
+    _EVENTS.append((label, event, now))
+    _STEP.append((label, event, now))
 
 
 def timed_item(tensor: torch.Tensor, label: str):
@@ -278,22 +279,25 @@ def timed_item(tensor: torch.Tensor, label: str):
 def _dump(label: str, waited: float) -> None:
     items = list(_EVENTS)
     segments = []
-    for (l0, e0, h0), (l1, e1, _) in zip(items, items[1:]):
+    for (l0, e0, h0), (l1, e1, h1) in zip(items, items[1:]):
         try:
             ms = e0.elapsed_time(e1)
         except RuntimeError:
             continue
-        segments.append((ms, l0, l1, h0))
+        # GPU gap and the host time between the two enqueues: a GPU gap with
+        # a matching host gap means the host was late; a GPU gap with no host
+        # gap means the stream was held by something else.
+        segments.append((ms, l0, l1, (h1 - h0) * 1000.0))
     total = sum(s[0] for s in segments)
     segments.sort(reverse=True)
     logger.warning(
         "CT252 stall probe: %s waited %.2f s; %d recent segments span %.0f ms; "
-        "slowest: %s",
+        "slowest (gpu_ms, host_ms): %s",
         label,
         waited,
         len(segments),
         total,
-        [(round(ms, 1), a, b) for ms, a, b, _ in segments[:10]],
+        [(round(ms, 1), round(host, 1), a, b) for ms, a, b, host in segments[:8]],
     )
     _EVENTS.clear()
 
