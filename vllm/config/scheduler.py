@@ -104,6 +104,12 @@ class SchedulerConfig:
     """Number of active prefill requests required before applying
     ``prefill_pressure_token_budget`` while decode work is runnable."""
 
+    mixed_prefill_min_tokens: int = Field(default=0, ge=0)
+    """Lower bound on the adaptive mixed-prefill token budget. Zero keeps the
+    purely adaptive budget. Under Mamba align mode the budget is rounded down to
+    whole recurrent-state blocks once it covers one, so use a multiple of the
+    state block size."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.
