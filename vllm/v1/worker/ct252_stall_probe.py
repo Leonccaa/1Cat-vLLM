@@ -12,6 +12,7 @@ import collections
 import gc
 import os
 import time
+import types
 
 import torch
 
@@ -67,6 +68,88 @@ def _maybe_freeze_gc() -> None:
         gc.get_freeze_count(),
         (time.perf_counter() - start) * 1000.0,
     )
+
+
+CENSUS = os.environ.get("CT252_GC_CENSUS") == "1"
+CENSUS_TRIGGER = os.environ.get("CT252_GC_CENSUS_TRIGGER", "/tmp/ct252_gc_census")
+_census_mtime = 0.0
+
+
+def _owner(obj, ignore: set) -> str:
+    """Name the attribute or key that holds a large container, two levels up."""
+    names = []
+    for ref in gc.get_referrers(obj):
+        if id(ref) in ignore or isinstance(ref, types.FrameType):
+            continue
+        if isinstance(ref, dict):
+            key = next((k for k, v in ref.items() if v is obj), None)
+            holder = next(
+                (
+                    type(r).__qualname__
+                    for r in gc.get_referrers(ref)
+                    if getattr(r, "__dict__", None) is ref
+                ),
+                "dict",
+            )
+            names.append(f"{holder}.{key}")
+        else:
+            names.append(type(ref).__qualname__)
+        if len(names) >= 3:
+            break
+    return ",".join(names)
+
+
+def _census(reason: str) -> None:
+    """Log what the worker's GC-tracked heap is made of."""
+    start = time.perf_counter()
+    objs = gc.get_objects()
+    counts = collections.Counter(
+        f"{type(o).__module__}.{type(o).__qualname__}" for o in objs
+    )
+    edges = 0
+    large = []
+    for o in objs:
+        if isinstance(o, (list, tuple, dict, set, frozenset, collections.deque)):
+            n = len(o)
+            edges += n
+            if n >= 50_000:
+                large.append((n, o))
+    large.sort(key=lambda item: -item[0])
+    ignore = {id(objs), id(large), *(id(item) for item in large)}
+    described = []
+    for n, o in large[:5]:
+        first = next(iter(o), None)
+        described.append(
+            (n, type(o).__qualname__, type(first).__qualname__, _owner(o, ignore))
+        )
+    logger.warning(
+        "CT252 stall probe: GC census (%s) at step %d: %d tracked objects, "
+        "%d container entries, frozen %d, counts %s, %.0f ms; top types %s; "
+        "large containers %s",
+        reason,
+        _step_count,
+        len(objs),
+        edges,
+        gc.get_freeze_count(),
+        gc.get_count(),
+        (time.perf_counter() - start) * 1000.0,
+        counts.most_common(15),
+        described,
+    )
+    del objs, large
+
+
+def _maybe_census() -> None:
+    global _census_mtime
+    try:
+        mtime = os.stat(CENSUS_TRIGGER).st_mtime
+    except OSError:
+        return
+    if mtime > _census_mtime:
+        _census_mtime = mtime
+        _census("trigger")
+
+
 THRESHOLD_S = float(os.environ.get("CT252_STALL_PROBE_S", "1.0"))
 _EVENTS: collections.deque = collections.deque(maxlen=768)
 
@@ -78,7 +161,9 @@ _STEP: list = []
 
 def _category(label: str) -> str:
     head = label.split(":")[0]
-    return "kvc_pre" if head == "kvc_pre" else "kvc_post" if head == "kvc_post" else head
+    return (
+        "kvc_pre" if head == "kvc_pre" else "kvc_post" if head == "kvc_post" else head
+    )
 
 
 def _flush_step() -> None:
@@ -165,7 +250,11 @@ def mark(label: str) -> None:
     if label == "step":
         _step_count += 1
         if _step_count == FREEZE_AT_STEP:
+            if CENSUS:
+                _census("before freeze")
             _maybe_freeze_gc()
+        if CENSUS:
+            _maybe_census()
         _flush_step()
         _check_allocator()
     event = torch.cuda.Event(enable_timing=True)
