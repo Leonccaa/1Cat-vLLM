@@ -476,7 +476,18 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
+        _ct252_t0 = time.perf_counter()
         scheduler_output = self.scheduler.schedule()
+        _ct252_sched_s = time.perf_counter() - _ct252_t0
+        if _ct252_sched_s >= 0.3:
+            logger.warning(
+                "CT252 stall probe: scheduler.schedule took %.2f s "
+                "(%d tokens, %d running, %d waiting)",
+                _ct252_sched_s,
+                scheduler_output.total_num_scheduled_tokens,
+                len(self.scheduler.running),
+                len(self.scheduler.waiting),
+            )
         if profile_ddtree_engine:
             profile_schedule_ms = (time.perf_counter() - profile_part_t0) * 1000.0
             profile_part_t0 = time.perf_counter()
@@ -505,9 +516,16 @@ class EngineCore:
         # during the model execution.
         self._process_aborts_queue()
         profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
+        _ct252_t0 = time.perf_counter()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        _ct252_upd_s = time.perf_counter() - _ct252_t0
+        if _ct252_upd_s >= 0.3:
+            logger.warning(
+                "CT252 stall probe: scheduler.update_from_output took %.2f s",
+                _ct252_upd_s,
+            )
         if profile_ddtree_engine:
             profile_update_ms = (time.perf_counter() - profile_part_t0) * 1000.0
             logger.info(

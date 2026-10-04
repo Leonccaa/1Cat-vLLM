@@ -72,11 +72,52 @@ def _flush_step() -> None:
     )
 
 
+_ALLOC_KEYS = (
+    "num_alloc_retries",
+    "num_ooms",
+    "num_sync_all_streams",
+    "num_device_alloc",
+    "num_device_free",
+)
+_last_alloc: dict = {}
+_step_count = 0
+
+
+def _check_allocator() -> None:
+    """Log whenever the caching allocator retried, freed or synced all streams."""
+    global _last_alloc
+    stats = torch.cuda.memory_stats()
+    now = {k: stats.get(k, 0) for k in _ALLOC_KEYS}
+    if _last_alloc and any(
+        now[k] != _last_alloc[k]
+        for k in (
+            "num_alloc_retries",
+            "num_ooms",
+            "num_sync_all_streams",
+            "num_device_free",
+        )
+    ):
+        logger.warning(
+            "CT252 stall probe: allocator event at step %d: %s; reserved %.0f MiB, "
+            "allocated %.0f MiB, device alloc/free +%d/+%d",
+            _step_count,
+            {k: now[k] - _last_alloc[k] for k in _ALLOC_KEYS[:3]},
+            stats.get("reserved_bytes.all.current", 0) / 2**20,
+            stats.get("allocated_bytes.all.current", 0) / 2**20,
+            now["num_device_alloc"] - _last_alloc["num_device_alloc"],
+            now["num_device_free"] - _last_alloc["num_device_free"],
+        )
+    _last_alloc = now
+
+
 def mark(label: str) -> None:
+    global _step_count
     if not ENABLED or torch.cuda.is_current_stream_capturing():
         return
     if label == "step":
+        _step_count += 1
         _flush_step()
+        _check_allocator()
     event = torch.cuda.Event(enable_timing=True)
     event.record()
     _EVENTS.append((label, event, time.monotonic()))
