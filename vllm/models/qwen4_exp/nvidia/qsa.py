@@ -351,6 +351,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             qsa_localize_dcp_indices,
         )
 
+        from vllm.v1.worker import ct252_stall_probe as stall_probe
+
+        stall_probe.mark("dcp_in")
         local_indices_buffer = layer.dcp_local_indices_buffer
         partial_output_buffer = layer.dcp_partial_output_buffer
         partial_lse_buffer = layer.dcp_partial_lse_buffer
@@ -373,6 +376,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         )
         group = get_dcp_group()
         gathered_query = group.all_gather(query.contiguous(), dim=1)
+        stall_probe.mark("dcp_ag_done")
         partial_output = partial_output_buffer[: query.shape[0]]
         partial_lse = partial_lse_buffer[: query.shape[0]]
         if partial_output.shape != gathered_query.shape:
@@ -400,6 +404,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             layer._k_scale_float,
             layer._v_scale_float,
         )
+        stall_probe.mark("dcp_grouped_done")
         if grouped_rows < query.shape[0]:
             qsa_sparse_paged_attention(
                 gathered_query[grouped_rows:],
@@ -414,6 +419,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 v_scale=layer._v_scale_float,
                 lse=partial_lse[grouped_rows:],
             )
+        stall_probe.mark("dcp_triton_done")
         merged = cast(
             torch.Tensor,
             self.dcp_combine(
@@ -426,6 +432,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         # Round to the output dtype first, as DCP1's attention output is, then
         # apply the Triton gate DCP1's page4 route uses. This replaces a chain
         # of five elementwise kernels (12.2 us per decode layer on V100).
+        stall_probe.mark("dcp_combine_done")
         output.copy_(merged)
         _qsa_output_gate(output, output_gate.view_as(output))
 

@@ -50,17 +50,25 @@ def _flush_step() -> None:
     if total < STEP_MS or not 0 < num_tokens <= STEP_MAX_TOKENS:
         return
     by_pair = collections.Counter()
+    singles = []
+    layer = "?"
     for (l0, e0), (l1, e1) in zip(items, items[1:]):
+        if l0.startswith("qsa:"):
+            layer = l0[4:].split(".")[0]
         try:
-            by_pair[f"{_category(l0)}>{_category(l1)}"] += e0.elapsed_time(e1)
+            ms = e0.elapsed_time(e1)
         except RuntimeError:
-            pass
+            continue
+        by_pair[f"{_category(l0)}>{_category(l1)}"] += ms
+        singles.append((ms, f"L{layer} {l0}>{l1}"))
+    singles.sort(reverse=True)
     logger.warning(
         "CT252 stall probe: slow mixed step %.0f ms (%d tokens, %d marks): %s",
         total,
         num_tokens,
         len(items),
-        [(k, round(v, 1)) for k, v in by_pair.most_common(8)],
+        [(k, round(v, 1)) for k, v in by_pair.most_common(8)]
+        + [("top", [(round(ms, 1), s) for ms, s in singles[:5]])],
     )
 
 

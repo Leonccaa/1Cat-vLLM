@@ -1667,6 +1667,7 @@ def qsa_select_paged_tokens(
                 block_topk,
                 score_columns,
             )
+        _stall_probe.mark("qsa_topk_done")
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],
@@ -1676,6 +1677,7 @@ def qsa_select_paged_tokens(
             token_topk,
             out[row_slice],
         )
+        _stall_probe.mark("qsa_expand_done")
     return out
 
 
