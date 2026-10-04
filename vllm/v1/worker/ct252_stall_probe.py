@@ -9,6 +9,7 @@ logged, which names the op segment that held the GPU.
 """
 
 import collections
+import gc
 import os
 import time
 
@@ -19,6 +20,53 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 ENABLED = os.environ.get("CT252_STALL_PROBE") == "1"
+GC_FREEZE = os.environ.get("CT252_WORKER_GC_FREEZE") == "1"
+GC_LOG_MS = float(os.environ.get("CT252_GC_LOG_MS", "50"))
+# Steps counted by mark("step") include startup warmup runs; freeze after them.
+FREEZE_AT_STEP = int(os.environ.get("CT252_GC_FREEZE_AT_STEP", "20"))
+_gc_start: dict = {}
+_gc_frozen = False
+
+
+def _gc_callback(phase: str, info: dict) -> None:
+    if phase == "start":
+        _gc_start["t"] = time.perf_counter()
+        return
+    started = _gc_start.pop("t", None)
+    if started is None:
+        return
+    ms = (time.perf_counter() - started) * 1000.0
+    if ms >= GC_LOG_MS:
+        logger.warning(
+            "CT252 stall probe: GC generation %s took %.0f ms "
+            "(collected %s, frozen %d)",
+            info.get("generation"),
+            ms,
+            info.get("collected"),
+            gc.get_freeze_count(),
+        )
+
+
+if ENABLED:
+    gc.callbacks.append(_gc_callback)
+
+
+def _maybe_freeze_gc() -> None:
+    """Freeze the worker's long-lived objects once, as EngineCore does."""
+    global _gc_frozen
+    if _gc_frozen or not GC_FREEZE:
+        return
+    _gc_frozen = True
+    start = time.perf_counter()
+    gc.collect(0)
+    gc.collect(1)
+    gc.collect(2)
+    gc.freeze()
+    logger.warning(
+        "CT252 stall probe: froze %d worker objects in %.0f ms",
+        gc.get_freeze_count(),
+        (time.perf_counter() - start) * 1000.0,
+    )
 THRESHOLD_S = float(os.environ.get("CT252_STALL_PROBE_S", "1.0"))
 _EVENTS: collections.deque = collections.deque(maxlen=768)
 
@@ -116,6 +164,8 @@ def mark(label: str) -> None:
         return
     if label == "step":
         _step_count += 1
+        if _step_count == FREEZE_AT_STEP:
+            _maybe_freeze_gc()
         _flush_step()
         _check_allocator()
     event = torch.cuda.Event(enable_timing=True)
