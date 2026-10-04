@@ -828,6 +828,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             selected,
         )
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
+        from vllm.v1.worker import ct252_stall_probe as stall_probe
+
+        stall_probe.mark("qsa_kv_write")
         impl.do_kv_cache_update(
             self,
             key,
@@ -835,6 +838,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.kv_cache,
             main_metadata.slot_mapping,
         )
+        stall_probe.mark("qsa_kv_written")
         impl.forward_qsa(
             self,
             query,

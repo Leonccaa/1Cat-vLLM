@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import fcntl
+import os
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -27,6 +28,11 @@ from vllm.v1.kv_offload.worker.worker import (
 )
 
 logger = init_logger(__name__)
+
+# CT252 diagnostic: log large offload transfers and their GPU duration.
+_CT252_XFER_LOG = os.environ.get("CT252_STALL_PROBE") == "1"
+_CT252_XFER_MIB = float(os.environ.get("CT252_XFER_LOG_MIB", "64"))
+_CT252_XFER_S = float(os.environ.get("CT252_XFER_LOG_S", "0.2"))
 
 
 @dataclass
@@ -354,6 +360,17 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
+        if _CT252_XFER_LOG and num_transfer_bytes >= _CT252_XFER_MIB * 2**20:
+            logger.warning(
+                "CT252 offload submit job %d %s->%s %.0f MiB in %d ops "
+                "(%d src blocks, %d pending transfers)",
+                job_id,
+                *self.transfer_type,
+                num_transfer_bytes / 2**20,
+                num_copy_ops,
+                num_src_blocks,
+                len(self._transfers),
+            )
         self._transfers.append(
             Transfer(
                 job_id=job_id,
@@ -382,6 +399,18 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 transfer_type=self.transfer_type,
             )
 
+            if _CT252_XFER_LOG and (
+                transfer_time >= _CT252_XFER_S
+                or transfer.num_bytes >= _CT252_XFER_MIB * 2**20
+            ):
+                logger.warning(
+                    "CT252 offload done job %d %s->%s %.0f MiB in %.3f s (%.2f GB/s)",
+                    transfer.job_id,
+                    *self.transfer_type,
+                    transfer.num_bytes / 2**20,
+                    transfer_time,
+                    transfer.num_bytes / max(transfer_time, 1e-9) / 1e9,
+                )
             results.append(result)
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
