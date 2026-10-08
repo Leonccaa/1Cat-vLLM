@@ -286,6 +286,22 @@ def test_qsa_e4m3_page4_routes_large_mixed_batch_below_prefill_boundary(
     )
 
 
+def test_qsa_xqa_page4_workspace_uses_fp32_for_e4m3(monkeypatch):
+    query = torch.empty(3, 6, 256, dtype=torch.float16)
+    monkeypatch.setattr(
+        qsa_ops.torch.cuda,
+        "current_stream",
+        lambda device: SimpleNamespace(cuda_stream=7),
+    )
+    qsa_ops._SM70_QSA_XQA_PAGE4_WORKSPACES.clear()
+
+    e4m3_output, *_ = qsa_ops._qsa_xqa_page4_workspace(query, 9, "fp8_e4m3")
+    fp16_output, *_ = qsa_ops._qsa_xqa_page4_workspace(query, 9, "auto")
+
+    assert e4m3_output.dtype == torch.float32
+    assert fp16_output.dtype == torch.float16
+
+
 @pytest.mark.parametrize(
     ("rows", "kv_cache_dtype"),
     [(49, "fp8_e4m3"), (65, "auto")],
