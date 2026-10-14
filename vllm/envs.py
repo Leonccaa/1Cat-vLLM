@@ -339,6 +339,11 @@ if TYPE_CHECKING:
     VLLM_SM70_SKIP_REJECTED_BATCH_PACKS: bool = False
     VLLM_SM70_GDN_TAIL_COPY: bool = False
     VLLM_SM70_PLE_PREFILL_CONV_CHUNK: bool = False
+    VLLM_SM70_FP16_SKINNY: bool = False
+    VLLM_SM70_FP16_SKINNY_MIN_M: int = 17
+    VLLM_SM70_FP16_SKINNY_MAX_M: int = 48
+    VLLM_SM70_FP16_SKINNY_CONFIG: str | None = None
+    VLLM_SM70_FP16_SKINNY_LM_HEAD: bool = False
     VLLM_SM70_MTP_GDN_DIRECT_OUTPUT: bool = False
     VLLM_SM70_QSA_SHARED_KEY: bool = False
     VLLM_SM70_QSA_COMPACT_TOPK: bool = False
@@ -4234,6 +4239,86 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_FP16_SKINNY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP16_SKINNY", "0"))),
+        description=(
+            "Routes checkpoint-FP16 Qwen3.8 dense projections (GDN qkvz/ba/out, "
+            "QSA qkv/o/indexer, MoE router, shared expert, HC and final mixer, "
+            "MTP fc, PLE key/value) to the SM70 small-M skinny GEMM when the "
+            "row count is within VLLM_SM70_FP16_SKINNY_MIN_M.._MAX_M. The "
+            "kernel reads the original row-major weight once for all rows, "
+            "accumulates in FP32 with fixed-order split-K reductions and rounds "
+            "once to FP16; it is not bitwise equal to cuBLAS. Existing M<=16 "
+            "lanes keep priority. Opt-in experiment."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_FP16_SKINNY_MIN_M": env_var(
+        lambda: int(os.getenv("VLLM_SM70_FP16_SKINNY_MIN_M", "17")),
+        description=(
+            "Smallest row count routed to the SM70 FP16 skinny GEMM when "
+            "VLLM_SM70_FP16_SKINNY=1. The default starts above the existing "
+            "M<=16 FP16 lanes; lower it to also replace cuBLAS fallbacks below "
+            "17 rows (lanes still take precedence where they apply)."
+        ),
+        category="tuning",
+        declared_default="17",
+        effective_default="17",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_FP16_SKINNY_MAX_M": env_var(
+        lambda: int(os.getenv("VLLM_SM70_FP16_SKINNY_MAX_M", "48")),
+        description=(
+            "Largest row count routed to the SM70 FP16 skinny GEMM when "
+            "VLLM_SM70_FP16_SKINNY=1 (clamped to the kernel limit of 48 rows: "
+            "8 requests x MTP4 verify plus graph padding)."
+        ),
+        category="tuning",
+        declared_default="48",
+        effective_default="48",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_FP16_SKINNY_CONFIG": env_var(
+        lambda: os.getenv("VLLM_SM70_FP16_SKINNY_CONFIG"),
+        description=(
+            "Tuning override for the SM70 FP16 skinny GEMM launch plans: "
+            "semicolon-separated 'NxK[@lo-hi]=ng,warps_n,warps_k,splits' or "
+            "'NxK[@lo-hi]=off' entries (per-rank weight shape, optional row "
+            "range). warps_k*splits sets the FP32 K partition and therefore "
+            "the rounding; ng and warps_n only change work assignment. Unset "
+            "uses the built-in per-shape table."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 FP16 linear",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_FP16_SKINNY_LM_HEAD": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_FP16_SKINNY_LM_HEAD", "0"))),
+        description=(
+            "With VLLM_SM70_FP16_SKINNY=1, also routes the Qwen3.8 LM head "
+            "(vocab shard) to the SM70 FP16 skinny GEMM for admitted row "
+            "counts, after the existing SM70 LM-head fast paths. Separate "
+            "switch because the full-vocabulary logits feed sampling."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 FP16 linear",),
         user_visible=False,
     ),
     "VLLM_SM70_PLE_PREFILL_CONV_CHUNK": env_var(

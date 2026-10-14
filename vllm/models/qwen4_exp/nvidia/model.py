@@ -84,6 +84,7 @@ from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
 from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
+from .sm70_fp16_skinny import enable_sm70_fp16_skinny
 
 try:
     from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
@@ -916,6 +917,8 @@ class Qwen4ExpForCausalLM(
         enable_qwen38_sm70_fp16_fused_hc(
             self, self.model_config.dtype, self.vllm_config
         )
+        # Opt-in VLLM_SM70_FP16_SKINNY; after the lanes so they keep priority.
+        enable_sm70_fp16_skinny(self, self.model_config.dtype, self.vllm_config)
         object.__setattr__(self, "_sm70_decode_graph_model", None)
 
     def prepare_sm70_decode_graph_model(self) -> bool:

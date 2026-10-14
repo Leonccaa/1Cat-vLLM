@@ -776,6 +776,10 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             return sm70_out
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if getattr(layer, "_sm70_fp16_skinny_lm_head", False):
+            # Opt-in VLLM_SM70_FP16_SKINNY_LM_HEAD (set by the Qwen3.8 loader);
+            # the op falls back to F.linear outside the admitted rows.
+            return torch.ops.vllm.sm70_fp16_skinny_linear(x, layer.weight, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

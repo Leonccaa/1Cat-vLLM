@@ -22,6 +22,10 @@ import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.sm70_fp16_skinny import (
+    skinny_dual_linear,
+    skinny_linear,
+)
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -296,7 +300,10 @@ def _qwen38_sm70_shared_up(
         torch.ops._C.qwen38_shared_up_batch_sm70_out(out, partial, x, packed)
         logger.info_once("SM70 MTP4 exact shared-expert batch projection enabled.")
         return out
-    gate_up = torch.nn.functional.linear(x, weight)
+    # Opt-in VLLM_SM70_FP16_SKINNY: rows outside the lanes above.
+    gate_up = skinny_linear(x, weight)
+    if gate_up is None:
+        gate_up = torch.nn.functional.linear(x, weight)
     out = gate_up.new_empty((*gate_up.shape[:-1], 160))
     torch.ops._C.silu_and_mul(out, gate_up)
     return out
@@ -388,6 +395,10 @@ def _qwen38_sm70_fp16_gemv(
     shape = (weight.shape[0], weight.shape[1])
     plan = _plan_for(role, shape) if role else _SHAPE_PLANS.get(shape)
     if plan is None or not _runtime_ok(x, weight):
+        # Opt-in VLLM_SM70_FP16_SKINNY covers the rows no lane above admits.
+        out = skinny_linear(x, weight)
+        if out is not None:
+            return out
         return torch.nn.functional.linear(x, weight)
 
     out = torch.empty((1, weight.shape[0]), dtype=x.dtype, device=x.device)
@@ -517,6 +528,12 @@ def _qwen38_sm70_fp16_gdn_input(
         and _runtime_ok(x, qkvz_weight)
         and _runtime_ok(x, ba_weight)
     ):
+        # Opt-in VLLM_SM70_FP16_SKINNY: both projections in one launch, written
+        # straight into contiguous qkv/z/b/a (no split copy).
+        if qkvz_weight.shape == (4096, 2560) and ba_weight.shape == (24, 2560):
+            fused = skinny_dual_linear(x, qkvz_weight, ba_weight, 2560, 12)
+            if fused is not None:
+                return fused
         qkvz = torch.nn.functional.linear(x, qkvz_weight)
         ba = torch.nn.functional.linear(x, ba_weight)
         if _can_fuse_gdn_projection_split(qkvz, ba):

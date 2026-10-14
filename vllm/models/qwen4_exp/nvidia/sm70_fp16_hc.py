@@ -12,6 +12,9 @@ from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.fp16_gemv_silu import Sm70Fp16GemvSiluKernel
+from vllm.model_executor.kernels.linear.sm70_fp16_skinny import (
+    skinny_linear_or_fallback,
+)
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -22,6 +25,7 @@ from .sm70_fp16_gemv import (
     _batch_runtime_contract,
     _exact_runtime_contract,
 )
+from .sm70_fp16_skinny import Sm70Fp16SkinnyLinearMethod
 
 logger = init_logger(__name__)
 
@@ -516,12 +520,13 @@ def _qwen38_sm70_fp16_fused_hc(
         # for prefill and any unsupported runtime shape. This fallback lives
         # inside the opaque op so a prefill-first dynamic compile cannot bake
         # the M > 1 decision into subsequent decode graphs.
-        down_and_injection = torch.nn.functional.linear(x, down_weight)
+        # Opt-in VLLM_SM70_FP16_SKINNY replaces only the two GEMMs.
+        down_and_injection = skinny_linear_or_fallback(x, down_weight)
         lora = torch.ops.vllm.qwen4_exp_hc_silu(
             down_and_injection[..., :_HC_RANK], _HC_COUNT
         )
         injection = down_and_injection[..., _HC_RANK : _HC_RANK + _HC_COUNT]
-        gate = torch.nn.functional.linear(lora, up_weight)
+        gate = skinny_linear_or_fallback(lora, up_weight)
         block = torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, _HC_COUNT)
         return block, injection
     try:
@@ -676,10 +681,15 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
         return None
     # LoRA wrappers and quantized methods must retain their own forward path.
     # Enabling unrelated FP16 projections must never bypass adapter updates.
+    # The opt-in skinny method is the plain FP16 linear with another M>16 GEMM.
     if not all(
         isinstance(layer, LinearBase)
         and type(layer.quant_method)
-        in (UnquantizedLinearMethod, Qwen38SM70FP16LinearMethod)
+        in (
+            UnquantizedLinearMethod,
+            Qwen38SM70FP16LinearMethod,
+            Sm70Fp16SkinnyLinearMethod,
+        )
         for layer in (down_layer, up_layer)
     ):
         return None

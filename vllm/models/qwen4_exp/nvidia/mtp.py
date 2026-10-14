@@ -73,6 +73,7 @@ from .model import (
 )
 from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
 from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
+from .sm70_fp16_skinny import enable_sm70_fp16_skinny
 
 logger = init_logger(__name__)
 
@@ -594,6 +595,8 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         config_dtype = vllm_config.model_config.dtype
         enable_qwen38_sm70_fp16_gemv(self, config_dtype, vllm_config)
         enable_qwen38_sm70_fp16_fused_hc(self, config_dtype, vllm_config)
+        # Opt-in VLLM_SM70_FP16_SKINNY; after the lanes so they keep priority.
+        enable_sm70_fp16_skinny(self, config_dtype, vllm_config)
         object.__setattr__(self, "_sm70_decode_graph_model", None)
 
     def prepare_sm70_decode_graph_model(self) -> bool:
