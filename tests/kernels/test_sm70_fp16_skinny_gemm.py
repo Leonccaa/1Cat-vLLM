@@ -508,7 +508,7 @@ def test_route_admission_and_opaque_op(skinny_env):
     skinny_env(CONFIG=f"{n}x{k}=off")
     assert skinny.skinny_linear(x, w) is None
     # 3D input (MTP fc_hidden layout) is flattened to rows.
-    skinny_env()
+    skinny_env(CONFIG="", MIN_M=17, MAX_M=48)
     x3 = _input(20, 4 * k, seed=8).view(5, 4, k)
     out3 = skinny.skinny_linear(x3, w)
     assert out3.shape == (5, 4, n)
